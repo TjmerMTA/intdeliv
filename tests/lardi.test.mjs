@@ -156,3 +156,14 @@ test('model: accountsNeeded both / roundrobin / dry; token mask', () => {
   assert.equal(maskToken('abcdef123456'), '••••3456');
   assert.ok(isMasked('••••3456'));
 });
+
+test('buildCargoBody: Lardi limits — note ≤ 100, contentName ≤ 50, settings note first', async () => {
+  const { buildCargoBody, LIMITS } = await import('../extension/lib/lardi.js');
+  const load = { dateFrom: '2026-09-24', price: 35000, weight: 16.3, cargo: 'дуже довга назва вантажу '.repeat(5), currency: 'UAH',
+    tags: ['Можл. дозавантаження', 'Зверху', 'Місць вивант.: 2', 'Кільк. палет: 17', 'Швидке вивантаження', 'При розвантаженні', 'Швидка оплата'] };
+  const ctx = { bodyIds: [34], from: { townName: 'Буча', townId: 6019 }, to: { townName: 'Ужгород', townId: 194 }, note: 'Тел. 0671234567' };
+  const b = buildCargoBody(load, ctx);
+  assert.ok(b.note.length <= LIMITS.note, b.note);
+  assert.ok(b.note.startsWith('Тел. 0671234567. Можл. дозавантаження'), b.note);
+  assert.ok(b.contentName.length <= LIMITS.contentName);
+});

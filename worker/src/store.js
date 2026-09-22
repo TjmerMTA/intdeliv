@@ -117,7 +117,7 @@ export class Store {
   /** Легкі рядки черги: {id, queuedAt, updatedAt, dateLast, lardi[]} */
   async queuedLight(limit = 5000) {
     const { results } = await this.db.prepare(
-      "SELECT id, queuedAt, updatedAt, dateLast, lardi FROM loads WHERE status = 'queued' ORDER BY COALESCE(queuedAt, updatedAt) ASC LIMIT ?",
+      "SELECT id, queuedAt, updatedAt, dateLast, lardi FROM loads WHERE status = 'queued' ORDER BY COALESCE(queuedAt, updatedAt) DESC LIMIT ?",
     ).bind(limit).all();
     return (results || []).map((r) => ({ ...r, lardi: parse(r.lardi, []) }));
   }

@@ -75,6 +75,10 @@ const dimsFromLoad = (load) => load.dims || {};
  * @param {object} load
  * @param {{bodyIds:number[], from:object, to:object, paymentUnitId?:number, note?:string}} ctx
  */
+// Ліміти полів Lardi (перевірено 22.09.2026 через помилки валідації)
+export const LIMITS = { note: 100, contentName: 50 };
+const clip = (str, n) => (str.length <= n ? str : str.slice(0, n - 1).replace(/[\s,.;:–-]+$/, '') + '…');
+
 export function buildCargoBody(load, ctx) {
   if (!load.dateFrom) throw new NeedsReviewError('немає дати завантаження');
   if (!load.price) throw new NeedsReviewError('немає ціни');
@@ -99,7 +103,7 @@ export function buildCargoBody(load, ctx) {
   const body = {
     dateFrom: load.dateFrom,
     dateTo: load.dateTo || load.dateFrom,
-    contentName: String(load.cargo).slice(0, 100),
+    contentName: clip(String(load.cargo), LIMITS.contentName),
     cargoBodyTypeIds: ctx.bodyIds,
     sizeMass: load.weight,
     paymentValue: load.price,
@@ -119,12 +123,20 @@ export function buildCargoBody(load, ctx) {
   const prepay = tags.map((t) => String(t).match(/передоплата:\s*(\d+)\s*%/i)).find(Boolean);
   if (prepay) body.paymentPrepay = parseInt(prepay[1], 10);
 
+  // Lardi приймає примітку до 100 символів: спершу текст із налаштувань і ручна примітка, потім теги Della
   const noteParts = [];
+  if (ctx.note) noteParts.push(String(ctx.note).trim());
+  if (load.note) noteParts.push(String(load.note).trim());
   const extraTags = tags.filter((t) => !/^(пдв|довантаження)$/i.test(String(t).trim()) && !/^(дов|шир|вис)=/.test(t));
-  if (extraTags.length) noteParts.push(extraTags.join(', '));
-  if (load.note) noteParts.push(load.note);
-  if (ctx.note) noteParts.push(ctx.note);
-  if (noteParts.length) body.note = noteParts.join('. ').slice(0, 500);
+  let note = noteParts.filter(Boolean).join('. ');
+  let tagSep = note ? '. ' : '';
+  for (const t of extraTags) {
+    const next = note + tagSep + t;
+    if (next.length > LIMITS.note) break;
+    note = next;
+    tagSep = ', ';
+  }
+  if (note) body.note = clip(note, LIMITS.note);
   return body;
 }
 
@@ -310,8 +322,9 @@ function errorText(data) {
   if (!data) return 'порожня відповідь';
   if (typeof data === 'string') return data.slice(0, 300);
   if (data.message) {
-    const details = Array.isArray(data.details || data.errors)
-      ? ' — ' + (data.details || data.errors).map((d) => d.message || d.field || JSON.stringify(d)).join('; ')
+    const list = data.wrongFields || data.details || data.errors;
+    const details = Array.isArray(list)
+      ? ' — ' + list.map((d) => [d.fieldName || d.field, d.message].filter(Boolean).join(': ') || JSON.stringify(d)).join('; ')
       : '';
     return data.message + details;
   }
