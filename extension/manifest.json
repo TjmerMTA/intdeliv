@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "IntDeliv — Della→Lardi",
+  "short_name": "IntDeliv",
+  "version": "1.0.0",
+  "description": "Збирає заявки Della, фільтрує, зберігає у власну базу та автоматично публікує на Lardi-Trans (2 акаунти).",
+  "permissions": ["alarms", "storage", "unlimitedStorage"],
+  "host_permissions": [
+    "https://della.com.ua/*",
+    "https://*.della.com.ua/*",
+    "https://api.lardi-trans.com/*"
+  ],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://intdeliv.siteboosty.com/*",
+        "https://tjmermta.github.io/*",
+        "http://localhost/*",
+        "http://127.0.0.1/*"
+      ],
+      "js": ["bridge.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_title": "IntDeliv — Della→Lardi",
+    "default_popup": "popup.html",
+    "default_icon": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+  },
+  "icons": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+}
