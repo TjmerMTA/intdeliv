@@ -8,8 +8,22 @@ const fmtN = (n) => (n == null || n === '' || isNaN(n) ? '' : nf.format(n));
 const CUR = { UAH: '₴', USD: '$', EUR: '€' };
 const PAGE = 300;
 
-// Сервер (Cloudflare Worker): POST {API}/api/rpc {method, params} → {ok, result|error}
-const DEFAULT_API = 'https://intdeliv.REPLACE.workers.dev';
+// Сервер (GitHub Actions + тунель): POST {API}/api/rpc {method, params} → {ok, result|error}
+// Адреса тунелю змінюється при кожному перезапуску (~6 год) — беремо її з гілки data репозиторію.
+const DISCOVERY = 'https://api.github.com/repos/TjmerMTA/intdeliv/contents/api.json?ref=data';
+let DEFAULT_API = '';
+let discoveredAt = 0;
+async function discover(force = false) {
+if (!force && DEFAULT_API) return DEFAULT_API;
+if (Date.now() - discoveredAt < 30000 && DEFAULT_API) return DEFAULT_API;
+discoveredAt = Date.now();
+try {
+const r = await fetch(DISCOVERY + '&t=' + Date.now(), { headers: { Accept: 'application/vnd.github.raw+json' }, cache: 'no-store' });
+const j = await r.json();
+if (j && /^https:\/\//.test(j.url)) DEFAULT_API = String(j.url).replace(/\/+$/, '');
+} catch { /* GitHub недоступний — лишаємо стару адресу */ }
+return DEFAULT_API;
+}
 const LS = {
 get(k) { try { return localStorage.getItem(k) || ''; } catch { return ''; } },
 set(k, v) { try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); } catch { /* приватний режим */ } },
@@ -26,6 +40,8 @@ async function rpc(method, params = {}, key = LS.get('intdeliv.key'), timeout = 
 const ac = new AbortController();
 const t = setTimeout(() => ac.abort(), timeout);
 let r;
+if (!LS.get('intdeliv.api')) await discover();
+if (!apiBase()) { clearTimeout(t); setNet(false); throw new Error('Сервер запускається… спробуйте за хвилину'); }
 try {
 r = await fetch(apiBase() + '/api/rpc', {
 method: 'POST', signal: ac.signal,
@@ -34,12 +50,13 @@ body: JSON.stringify({ method, params }),
 });
 } catch (e) {
 setNet(false);
+if (!LS.get('intdeliv.api')) discover(true); // тунель міг змінитись
 throw new Error(e.name === 'AbortError' ? 'Сервер не відповідає (' + method + ')' : 'Немає зв\'язку з сервером');
 } finally { clearTimeout(t); }
 setNet(true);
 if (r.status === 401) throw new AuthError('Невірний ключ доступу');
 const d = await r.json().catch(() => null);
-if (!d) throw new Error('Помилка сервера (' + r.status + ')');
+if (!d) { if (!LS.get('intdeliv.api')) discover(true); throw new Error('Сервер перезапускається… (' + r.status + ')'); }
 if (!d.ok) throw new Error(d.error || 'Помилка сервера');
 return d.result;
 }
@@ -370,7 +387,7 @@ const txt = (name, label, v, ph = '') => `<label class="fld">${label}<input name
 const chk = (name, label, v) => `<label class="chk"><input type="checkbox" name="${name}"${v ? ' checked' : ''}> ${label}</label>`;
 $('#sf').innerHTML = `
 <div class="card"><h3>Сервер</h3><p class="help">Система працює на сервері цілодобово, 24/7, сама по собі: збирає заявки з Della й публікує їх на Lardi, навіть коли цю сторінку закрито, а комп'ютер вимкнено. Ця панель лише показує дані та змінює налаштування.${S.version ? ' Версія: ' + esc(S.version) + '.' : ''}</p>
-<div class="grid"><label class="fld wide">Адреса сервера<input name="api" value="${esc(demo ? '' : apiBase())}" placeholder="${esc(DEFAULT_API)}"${demo ? ' disabled' : ''}></label></div></div>
+<div class="grid"><label class="fld wide">Адреса сервера<input name="api" value="${esc(demo ? '' : apiBase())}" placeholder="${esc(DEFAULT_API || 'автоматично')}"${demo ? ' disabled' : ''}></label></div></div>
 
 <div class="card"><h3>Della — звідки брати заявки</h3>
 <p class="help">Зробіть пошук на <a href="https://della.com.ua/" target="_blank" rel="noopener">della.com.ua</a> з потрібними фільтрами (країна, області, «прямий замовник», «з вартістю»), натисніть «Знайти» і скопіюйте адресу сторінки з рядка браузера. Одна адреса — один рядок. Якщо порожньо — береться вся Україна, прямий замовник, з вартістю.</p>

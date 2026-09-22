@@ -2,3 +2,8 @@
 node_modules/
 *.zip
 .env
+data/
+.data-wt/
+server.log
+tunnel.log
+*.pid
