@@ -1,0 +1,76 @@
+name: engine
+# Рушій IntDeliv: працює циклом ~5,75 год, розклад кожні 30 хв ставить наступний запуск у чергу,
+# тож він стартує одразу після попереднього. Публічний репозиторій — хвилини Actions безкоштовні.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+concurrency:
+  group: engine
+  cancel-in-progress: false
+permissions:
+  contents: write
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      DB_PATH: data/intdeliv.sqlite
+      DB_KEY: ${{ secrets.DB_KEY }}
+      ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
+      LARDI_TOKEN_1: ${{ secrets.LARDI_TOKEN_1 }}
+      LARDI_TOKEN_2: ${{ secrets.LARDI_TOKEN_2 }}
+      RUN_MINUTES: "340"
+      PORT: "8787"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: cloudflared
+        run: |
+          curl -fsSL -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /usr/local/bin/cloudflared
+      - name: restore db
+        run: bash server/persist.sh restore
+      - name: run
+        run: |
+          node server/run.mjs > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 60); do curl -fs localhost:$PORT/ >/dev/null && break; sleep 1; done
+          URL=""
+          for attempt in 1 2 3; do
+            cloudflared tunnel --no-autoupdate --url http://localhost:$PORT > tunnel.log 2>&1 &
+            echo $! > tunnel.pid
+            for i in $(seq 1 60); do
+              URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
+              [ -n "$URL" ] && break; sleep 1
+            done
+            if [ -n "$URL" ]; then
+              for i in $(seq 1 30); do curl -fs "$URL/" >/dev/null && break 2; sleep 2; done
+            fi
+            kill $(cat tunnel.pid) 2>/dev/null || true; URL=""
+          done
+          [ -n "$URL" ] || { echo "тунель не піднявся"; cat tunnel.log; exit 1; }
+          bash server/persist.sh publish-url "$URL"
+          echo "API: $URL"
+          n=0
+          while kill -0 $(cat server.pid) 2>/dev/null; do
+            sleep 30; n=$((n+1))
+            tail -n 3 server.log
+            # тунель впав — піднімаємо новий і публікуємо адресу
+            if ! kill -0 $(cat tunnel.pid) 2>/dev/null; then
+              cloudflared tunnel --no-autoupdate --url http://localhost:$PORT > tunnel.log 2>&1 &
+              echo $! > tunnel.pid; sleep 15
+              URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
+              [ -n "$URL" ] && bash server/persist.sh publish-url "$URL" || true
+            fi
+            [ $((n % 10)) -eq 0 ] && { bash server/persist.sh save || true; }
+          done
+          echo "сервер завершився"; tail -n 20 server.log
+      - name: final save
+        if: always()
+        run: |
+          kill $(cat server.pid 2>/dev/null) 2>/dev/null || true
+          sleep 3
+          bash server/persist.sh save || true
