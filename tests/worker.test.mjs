@@ -262,3 +262,14 @@ test('sync.now schedules a poll via waitUntil; unknown method → ok:false', asy
   const bad = await h.rpc('nope.nope');
   assert.equal(bad.body.ok, false);
 });
+
+test('loads.list: payment filter (form via json_extract, ПДВ via tag)', async () => {
+  const { Store } = await import('../worker/src/store.js');
+  const st = new Store(new FakeD1(SCHEMA));
+  const base = { source: 'della', status: 'queued', seenAt: 1, firstSeenAt: 1, updatedAt: 1, fromCity: 'Київ', toCity: 'Львів', lardi: [] };
+  await st.putLoad({ ...base, id: 'a', payment: 'Безнал', tags: ['ПДВ'] });
+  await st.putLoad({ ...base, id: 'b', payment: 'Готівка', tags: ['Без ПДВ'] });
+  assert.deepEqual((await st.listLoads({ payment: 'cashless' })).items.map((x) => x.id), ['a']);
+  assert.deepEqual((await st.listLoads({ payment: 'vat' })).items.map((x) => x.id), ['a']);
+  assert.deepEqual((await st.listLoads({ payment: 'novat' })).items.map((x) => x.id), ['b']);
+});

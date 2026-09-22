@@ -75,7 +75,7 @@ $('span', el).textContent = ok ? 'онлайн' : 'немає зв\'язку';
 
 // Стан
 const S = {
-view: 'loads', tab: 'all', f: { fromCity: '', toCity: '', fromRegion: '', toRegion: '', q: '' },
+view: 'loads', tab: 'all', f: { fromCity: '', toCity: '', fromRegion: '', toRegion: '', payment: '', q: '' },
 items: [], filtered: [], shown: PAGE, status: null, settings: null, version: '',
 };
 const TABS = [
@@ -194,22 +194,31 @@ h += chip(a.status || (a.error ? 'error' : a.id ? 'published' : 'queued'), accNa
 if (!h) h = chip(l.status, '', l.statusReason);
 return h;
 }
+// Умови оплати з тегів Della (ПДВ, «При розвантаженні», «За оригіналами»…) показуємо в колонці «Оплата»
+const PAY_TERM = /пдв|оплат|платеж|розвантаженні|завантаженні|оригінал|передоплат|відтермін|рахун/i;
+const payTerms = (l) => (l.tags || []).filter((t) => PAY_TERM.test(t));
+const cargoTags = (l) => (l.tags || []).filter((t) => !PAY_TERM.test(t));
+const PAY_FILTER = {
+cashless: (l) => l.payment === 'Безнал', cash: (l) => l.payment === 'Готівка', card: (l) => l.payment === 'Картка',
+vat: (l) => (l.tags || []).some((t) => /^пдв$/i.test(String(t).trim())), novat: (l) => (l.tags || []).some((t) => /без пдв/i.test(t)),
+};
 function rowHtml(l) {
 const off = isOff(l);
 const cur = CUR[l.currency] || l.currency || '';
 const dist = l.distanceKm ? ` · ${fmtN(l.distanceKm)} км` : '';
 const ppk = l.pricePerKm || (l.price && l.distanceKm ? Math.round(l.price / l.distanceKm) : 0);
-const tags = (l.tags || []).slice(0, 4).map((t) => `<span class="tg">${esc(t)}</span>`).join('');
+const tags = cargoTags(l).slice(0, 4).map((t) => `<span class="tg">${esc(t)}</span>`).join('');
+const terms = payTerms(l);
 const canPub = !off && l.status !== 'published' && l.status !== 'queued';
 const canUnpub = (l.lardi || []).some((a) => a.id && a.status !== 'removed') || l.status === 'published';
 return `<tr class="${off ? 'off' : ''}" data-id="${esc(l.id)}">
 <td data-l="Дата"><div class="d1">${off ? '🚫 ' : ''}${fmtDate(l.dateFrom)}${l.dateTo && l.dateTo !== l.dateFrom ? '–' + fmtDate(l.dateTo) : ''}</div><div class="sub">${esc(l.firstSeenAt ? hhmm(l.firstSeenAt) : '')}${l.edited ? ' · ✎' : ''}</div></td>
-<td class="c-rt" data-l="Маршрут"><div class="rt"><span class="dot">•</span> ${esc(l.fromCity)} → <span class="dot">•</span> ${esc(l.toCity)}</div><div class="sub">${esc(l.fromRegion)} → ${esc(l.toRegion)}${dist}</div></td>
-<td class="c-cg" data-l="Вантаж / авто"><div>${esc(l.cargo)}</div><div class="sub">${esc(l.body)}${l.directCustomer ? ' · прямий замовник' : ''}</div>${tags}</td>
+<td class="c-rt" data-l="Маршрут"><div class="rt"><span class="nw"><span class="dot">•</span> ${esc(l.fromCity)}</span> → <span class="nw"><span class="dot">•</span> ${esc(l.toCity)}</span></div><div class="sub">${esc(l.fromRegion)} → ${esc(l.toRegion)}${dist}</div></td>
+<td class="c-cg" data-l="Вантаж / авто"><div>${esc(l.cargo)}</div><div class="sub">${esc(l.body)}</div>${tags}</td>
 <td class="num" data-l="Вага">${l.weight != null ? esc(fmtN(l.weight)) + ' т' : '—'}</td>
 <td class="num" data-l="Об'єм">${l.volume != null ? esc(fmtN(l.volume)) + ' м³' : '—'}</td>
 <td data-l="Ціна">${l.price ? `<div class="pr">${esc(fmtN(l.price))} ${esc(cur)}</div>${ppk ? `<div class="sub">${esc(fmtN(ppk))} ${esc(cur)}/км</div>` : ''}` : '<span class="muted">—</span>'}</td>
-<td data-l="Оплата">${esc(l.payment || '—')}</td>
+<td class="c-pay" data-l="Оплата">${l.payment || terms.length ? `${l.payment ? `<div>${esc(l.payment)}</div>` : ''}${terms.map((t) => `<div class="sub">${esc(t)}</div>`).join('')}` : '<span class="muted">—</span>'}</td>
 <td class="c-lr" data-l="Lardi">${lardiCell(l)}</td>
 <td class="c-ac"><div class="acts">
 <button class="ib" data-act="edit" title="Редагувати">${ICON.edit}</button>
@@ -231,6 +240,7 @@ if (f.fromCity && !norm(l.fromCity).includes(f.fromCity)) return false;
 if (f.toCity && !norm(l.toCity).includes(f.toCity)) return false;
 if (f.fromRegion && !norm(l.fromRegion).includes(f.fromRegion)) return false;
 if (f.toRegion && !norm(l.toRegion).includes(f.toRegion)) return false;
+if (f.payment && PAY_FILTER[f.payment] && !PAY_FILTER[f.payment](l)) return false;
 if (f.q) {
 const ph = String(l.phone || '').replace(/\D/g, '');
 const hit = norm(l.id).includes(f.q) || (qd.length >= 3 && ph.includes(qd)) || norm(l.company).includes(f.q) ||
@@ -280,7 +290,7 @@ const loadLoadsSoon = debounce(loadLoads, 150);
 async function loadStatus() { try { S.status = await call('status.get'); renderKpis(); } catch (e) { /* тихо */ } }
 async function loadSettings() { try { S.settings = await call('settings.get'); $('#dry').checked = !!S.settings?.lardi?.dryRun; renderBanners(); } catch (e) { toast(e.message, true); } }
 
-$$('.filters input').forEach((inp) => inp.addEventListener('input', () => {
+$$('.filters input, .filters select').forEach((inp) => inp.addEventListener(inp.tagName === 'SELECT' ? 'change' : 'input', () => {
 S.f[inp.dataset.f] = inp.value; S.shown = PAGE;
 applyFilters(); renderRows();   // миттєво локально
 loadLoadsSoon();                // і на сервері (дебаунс 150 мс)

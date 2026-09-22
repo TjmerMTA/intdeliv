@@ -151,6 +151,10 @@ export class Store {
     if (p.toCity) like('toCityLc', p.toCity);
     if (p.fromRegion) like('fromRegionLc', p.fromRegion);
     if (p.toRegion) like('toRegionLc', p.toRegion);
+    const PAY = { cashless: 'Безнал', cash: 'Готівка', card: 'Картка' };
+    if (PAY[p.payment]) { where.push("json_extract(data, '$.payment') = ?"); args.push(PAY[p.payment]); }
+    if (p.payment === 'vat') where.push(`data LIKE '%"ПДВ"%'`);
+    if (p.payment === 'novat') where.push(`data LIKE '%"Без ПДВ"%'`);
     if (p.status && p.status !== 'all') {
       const sts = (Array.isArray(p.status) ? p.status : [p.status]).map(String);
       where.push(`status IN (${sts.map(() => '?').join(',')})`);
