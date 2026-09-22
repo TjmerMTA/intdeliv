@@ -202,6 +202,13 @@ const PAY_FILTER = {
 cashless: (l) => l.payment === 'Безнал', cash: (l) => l.payment === 'Готівка', card: (l) => l.payment === 'Картка',
 vat: (l) => (l.tags || []).some((t) => /^пдв$/i.test(String(t).trim())), novat: (l) => (l.tags || []).some((t) => /без пдв/i.test(t)),
 };
+// Прямого посилання на заявку Della немає (ID шифрується на кожен запит), тож відкриваємо пошук саме цього маршруту місто → місто
+function dellaLink(l) {
+if (/^\d+$/.test(String(l.fromCityId || '')) && /^\d+$/.test(String(l.toCityId || ''))) {
+return `https://della.com.ua/search/a204b0j${l.fromCityId}d204e0t${l.toCityId}flolz1z2z3z4z5z6z7z8z9y1y2y3y4y5y6h0ilk0m1.html`;
+}
+return /^https?:\/\//.test(l.dellaUrl || '') ? l.dellaUrl : '';
+}
 function rowHtml(l) {
 const off = isOff(l);
 const cur = CUR[l.currency] || l.currency || '';
@@ -209,11 +216,12 @@ const dist = l.distanceKm ? ` · ${fmtN(l.distanceKm)} км` : '';
 const ppk = l.pricePerKm || (l.price && l.distanceKm ? Math.round(l.price / l.distanceKm) : 0);
 const tags = cargoTags(l).slice(0, 4).map((t) => `<span class="tg">${esc(t)}</span>`).join('');
 const terms = payTerms(l);
+const dl = dellaLink(l);
 const canPub = !off && l.status !== 'published' && l.status !== 'queued';
 const canUnpub = (l.lardi || []).some((a) => a.id && a.status !== 'removed') || l.status === 'published';
 return `<tr class="${off ? 'off' : ''}" data-id="${esc(l.id)}">
 <td data-l="Дата"><div class="d1">${off ? '🚫 ' : ''}${fmtDate(l.dateFrom)}${l.dateTo && l.dateTo !== l.dateFrom ? '–' + fmtDate(l.dateTo) : ''}</div><div class="sub">${esc(l.firstSeenAt ? hhmm(l.firstSeenAt) : '')}${l.edited ? ' · ✎' : ''}</div></td>
-<td class="c-rt" data-l="Маршрут"><div class="rt"><span class="nw"><span class="dot">•</span> ${esc(l.fromCity)}</span> → <span class="nw"><span class="dot">•</span> ${esc(l.toCity)}</span></div><div class="sub">${esc(l.fromRegion)} → ${esc(l.toRegion)}${dist}</div></td>
+<td class="c-rt" data-l="Маршрут"><div class="rt">${dl ? `<a class="rtl" href="${esc(dl)}" target="_blank" rel="noopener noreferrer" title="Відкрити на Della">` : ''}<span class="nw"><span class="dot">•</span> ${esc(l.fromCity)}</span> → <span class="nw"><span class="dot">•</span> ${esc(l.toCity)}</span>${dl ? '</a>' : ''}</div><div class="sub">${esc(l.fromRegion)} → ${esc(l.toRegion)}${dist}</div></td>
 <td class="c-cg" data-l="Вантаж / авто"><div>${esc(l.cargo)}</div><div class="sub">${esc(l.body)}</div>${tags}</td>
 <td class="num" data-l="Вага">${l.weight != null ? esc(fmtN(l.weight)) + ' т' : '—'}</td>
 <td class="num" data-l="Об'єм">${l.volume != null ? esc(fmtN(l.volume)) + ' м³' : '—'}</td>
@@ -224,7 +232,7 @@ return `<tr class="${off ? 'off' : ''}" data-id="${esc(l.id)}">
 <button class="ib" data-act="edit" title="Редагувати">${ICON.edit}</button>
 ${canPub ? `<button class="ib" data-act="publish" title="Опублікувати зараз">${ICON.pub}</button>` : ''}
 ${canUnpub ? `<button class="ib" data-act="unpublish" title="Зняти з Lardi">${ICON.unpub}</button>` : ''}
-${/^https?:\/\//.test(l.dellaUrl || '') ? `<a class="ib" href="${esc(l.dellaUrl)}" target="_blank" rel="noopener noreferrer" title="Відкрити на Della">${ICON.link}</a>` : ''}
+${dl ? `<a class="ib" href="${esc(dl)}" target="_blank" rel="noopener noreferrer" title="Відкрити на Della">${ICON.link}</a>` : ''}
 <button class="ib red" data-act="delete" title="Видалити">${ICON.del}</button>
 </div></td></tr>`;
 }

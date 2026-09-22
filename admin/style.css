@@ -146,3 +146,4 @@ body.locked .side,body.locked .main{display:none}
 
 .nw{white-space:nowrap}
 .c-pay .sub{font-size:12px;line-height:1.35}
+.rtl{color:inherit;text-decoration:none}.rtl:hover{color:var(--pri);text-decoration:underline}
