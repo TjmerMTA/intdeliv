@@ -6,38 +6,55 @@ const esc = (v) => (v == null ? '' : String(v)).replace(/[&<>"']/g, (c) => ESC[c
 const nf = new Intl.NumberFormat('uk-UA');
 const fmtN = (n) => (n == null || n === '' || isNaN(n) ? '' : nf.format(n));
 const CUR = { UAH: '₴', USD: '$', EUR: '€' };
-const INSTALL_ZIP = 'https://github.com/TjmerMTA/intdeliv/archive/refs/heads/main.zip';
 const PAGE = 300;
 
-// Міст до розширення
-const pending = new Map();
-let seq = 0;
-let live = false;
-let demo = null; // демо-бекенд, якщо розширення не знайдено
+// Сервер (Cloudflare Worker): POST {API}/api/rpc {method, params} → {ok, result|error}
+const DEFAULT_API = 'https://intdeliv.REPLACE.workers.dev';
+const LS = {
+get(k) { try { return localStorage.getItem(k) || ''; } catch { return ''; } },
+set(k, v) { try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); } catch { /* приватний режим */ } },
+};
+const cleanApi = (u) => String(u || '').trim().replace(/\/+$/, '');
+const urlApi = cleanApi(new URLSearchParams(location.search).get('api'));
+if (/^https?:\/\//.test(urlApi)) LS.set('intdeliv.api', urlApi);
+const apiBase = () => cleanApi(LS.get('intdeliv.api')) || DEFAULT_API;
+let demo = null; // демо-бекенд (лише через «Подивитись демо»)
+let authed = false;
+class AuthError extends Error {}
 
-window.addEventListener('message', (e) => {
-if (e.source !== window) return;
-const d = e.data;
-if (!d || typeof d !== 'object' || !d.__intdeliv) return;
-if (d.__intdeliv === 'res') {
-const p = pending.get(d.id);
-if (!p) return;
-pending.delete(d.id);
-clearTimeout(p.t);
-d.ok ? p.res(d.result) : p.rej(new Error(d.error || 'Помилка розширення'));
-} else if (d.__intdeliv === 'event') onEvent(d.type, d.data);
-else if (d.__intdeliv === 'hello') onHello(d.version);
+async function rpc(method, params = {}, key = LS.get('intdeliv.key'), timeout = 20000) {
+const ac = new AbortController();
+const t = setTimeout(() => ac.abort(), timeout);
+let r;
+try {
+r = await fetch(apiBase() + '/api/rpc', {
+method: 'POST', signal: ac.signal,
+headers: { 'Content-Type': 'application/json', ...(key ? { Authorization: 'Bearer ' + key } : {}) },
+body: JSON.stringify({ method, params }),
 });
-
-function bridge(method, params = {}, timeout = 10000) {
-const id = (crypto.randomUUID && crypto.randomUUID()) || 'r' + Date.now() + '_' + seq++;
-return new Promise((res, rej) => {
-const t = setTimeout(() => { pending.delete(id); rej(new Error('Розширення не відповідає (' + method + ')')); }, timeout);
-pending.set(id, { res, rej, t });
-window.postMessage({ __intdeliv: 'req', id, method, params }, '*');
-});
+} catch (e) {
+setNet(false);
+throw new Error(e.name === 'AbortError' ? 'Сервер не відповідає (' + method + ')' : 'Немає зв\'язку з сервером');
+} finally { clearTimeout(t); }
+setNet(true);
+if (r.status === 401) throw new AuthError('Невірний ключ доступу');
+const d = await r.json().catch(() => null);
+if (!d) throw new Error('Помилка сервера (' + r.status + ')');
+if (!d.ok) throw new Error(d.error || 'Помилка сервера');
+return d.result;
 }
-const call = (method, params) => (live ? bridge(method, params) : demo.call(method, params));
+async function call(method, params) {
+if (demo) return demo.call(method, params);
+try { return await rpc(method, params); } catch (e) { if (e instanceof AuthError) showLogin(e.message); throw e; }
+}
+let netOk = null;
+function setNet(ok) {
+if (netOk === ok) return;
+netOk = ok;
+const el = $('#net');
+el.className = 'net' + (ok ? ' on' : ' off');
+$('span', el).textContent = ok ? 'онлайн' : 'немає зв\'язку';
+}
 
 // Стан
 const S = {
@@ -101,13 +118,7 @@ $('[data-x="1"]', b).focus();
 // Банери
 function renderBanners() {
 let h = '';
-if (!live) {
-h += `<div class="banner warn"><span class="tag-demo">ДЕМО</span><b>Розширення IntDeliv не знайдено</b> — показано демонстраційні дані, дії нічого не змінюють.
-<ol><li>Завантажте архів: <a href="${INSTALL_ZIP}" rel="noopener">intdeliv-main.zip</a> і розпакуйте його.</li>
-<li>Відкрийте <code>chrome://extensions</code> та увімкніть <b>Режим розробника</b> (праворуч угорі).</li>
-<li>Натисніть <b>Завантажити розпаковане</b> і виберіть папку <code>extension</code> з архіву.</li>
-<li>Оновіть цю сторінку.</li></ol></div>`;
-}
+if (demo) h += `<div class="banner warn"><span class="tag-demo">ДЕМО</span>Показано демонстраційні дані — дії нічого не змінюють. <a href="#" data-logout>Вийти з демо</a></div>`;
 if (S.settings?.lardi?.dryRun) h += `<div class="banner info">🧪 <b>Тестовий режим — нічого не публікується.</b> Заявки проходять усі перевірки, але на Lardi не відправляються. Вимкніть перемикач «Тестовий режим», коли будете готові.</div>`;
 if (S.status?.lastError) h += `<div class="banner warn">Остання помилка: ${esc(S.status.lastError)}</div>`;
 $('#banners').innerHTML = h;
@@ -248,7 +259,6 @@ applyFilters();
 renderRows();
 }
 const loadLoadsSoon = debounce(loadLoads, 150);
-const refetchSoon = debounce(() => { if (S.view === 'loads') loadLoads(); }, 800);
 
 async function loadStatus() { try { S.status = await call('status.get'); renderKpis(); } catch (e) { /* тихо */ } }
 async function loadSettings() { try { S.settings = await call('settings.get'); $('#dry').checked = !!S.settings?.lardi?.dryRun; renderBanners(); } catch (e) { toast(e.message, true); } }
@@ -285,7 +295,7 @@ if (!(await confirmBox('Видалити заявку?', `${l.fromCity} → ${l.
 await call('loads.delete', { id, fromLardi: true });
 S.items = S.items.filter((x) => x.id !== id); applyFilters(); renderRows(); toast('Видалено');
 }
-loadStatus();
+loadStatus(); loadLoads();
 } catch (err) { toast(err.message, true); b.disabled = false; }
 });
 
@@ -325,7 +335,7 @@ const p = patch.price ?? l.price, d = patch.distanceKm ?? l.distanceKm;
 patch.pricePerKm = p && d ? Math.round((p / d) * 100) / 100 : null;
 }
 const btn = $('.btn.pri', b); btn.disabled = true;
-try { replaceLoad(await call('loads.update', { id: l.id, patch })); modal.close(); toast('Збережено'); }
+try { replaceLoad(await call('loads.update', { id: l.id, patch })); modal.close(); toast('Збережено'); loadLoads(); loadStatus(); }
 catch (err) { toast(err.message, true); btn.disabled = false; }
 };
 });
@@ -334,7 +344,7 @@ catch (err) { toast(err.message, true); btn.disabled = false; }
 // KPI дії
 $('#sync').addEventListener('click', async (e) => {
 e.target.disabled = true;
-try { await call('sync.now'); toast('Синхронізацію запущено'); setTimeout(loadStatus, 1500); }
+try { await call('sync.now'); toast('Синхронізацію запущено'); setTimeout(() => { loadStatus(); loadLoads(); }, 1500); }
 catch (err) { toast(err.message, true); }
 setTimeout(() => (e.target.disabled = false), 3000);
 });
@@ -344,7 +354,7 @@ try {
 S.settings = await call('settings.set', { lardi: { ...(S.settings?.lardi || {}), dryRun: want } });
 toast(want ? 'Тестовий режим увімкнено' : 'Тестовий режим вимкнено — заявки публікуються на Lardi');
 } catch (err) { toast(err.message, true); e.target.checked = !want; }
-renderBanners(); if (S.view === 'settings') renderSettings();
+renderBanners(); if (S.view === 'settings') renderSettings(); loadStatus();
 });
 
 // Налаштування
@@ -359,6 +369,9 @@ const num = (name, label, v, extra = '') => `<label class="fld">${label}<input n
 const txt = (name, label, v, ph = '') => `<label class="fld">${label}<input name="${name}" value="${esc(v ?? '')}" placeholder="${esc(ph)}"></label>`;
 const chk = (name, label, v) => `<label class="chk"><input type="checkbox" name="${name}"${v ? ' checked' : ''}> ${label}</label>`;
 $('#sf').innerHTML = `
+<div class="card"><h3>Сервер</h3><p class="help">Система працює на сервері цілодобово, 24/7, сама по собі: збирає заявки з Della й публікує їх на Lardi, навіть коли цю сторінку закрито, а комп'ютер вимкнено. Ця панель лише показує дані та змінює налаштування.${S.version ? ' Версія: ' + esc(S.version) + '.' : ''}</p>
+<div class="grid"><label class="fld wide">Адреса сервера<input name="api" value="${esc(demo ? '' : apiBase())}" placeholder="${esc(DEFAULT_API)}"${demo ? ' disabled' : ''}></label></div></div>
+
 <div class="card"><h3>Della — звідки брати заявки</h3>
 <p class="help">Зробіть пошук на <a href="https://della.com.ua/" target="_blank" rel="noopener">della.com.ua</a> з потрібними фільтрами (країна, області, «прямий замовник», «з вартістю»), натисніть «Знайти» і скопіюйте адресу сторінки з рядка браузера. Одна адреса — один рядок. Якщо порожньо — береться вся Україна, прямий замовник, з вартістю.</p>
 <div class="grid"><label class="fld wide">Посилання на пошук Della<textarea name="searchUrls" placeholder="https://della.com.ua/search/a204bd204eflolz1z21z3z4z51z6z7z8z9y1y2y3y4y5y6h0ilk0m1.html">${esc(lines(d.searchUrls))}</textarea></label>
@@ -406,11 +419,13 @@ mode: g('mode') === 'roundrobin' ? 'roundrobin' : 'both', autoPublish: on('autoP
 intervalSeconds: numOr(g('intervalSeconds'), old.lardi?.intervalSeconds ?? 20), dailyLimit: numOr(g('dailyLimit'), 500), note: String(g('note') || '') },
 staleHours: numOr(g('staleHours'), 6),
 };
+const api = cleanApi(g('api'));
+if (!demo && api && api !== apiBase()) { LS.set('intdeliv.api', api); netOk = null; }
 const btn = $('.save-bar .btn', e.target); btn.disabled = true;
 try {
 S.settings = await call('settings.set', patch);
 $('#dry').checked = !!S.settings?.lardi?.dryRun;
-renderSettings(); renderBanners(); renderKpis(); toast('Налаштування збережено');
+renderSettings(); renderBanners(); renderKpis(); toast('Налаштування збережено'); loadStatus();
 } catch (err) { toast(err.message, true); btn.disabled = false; }
 });
 $('#sf').addEventListener('click', async (e) => {
@@ -447,38 +462,71 @@ if (location.hash !== '#' + view) history.replaceState(null, '', '#' + view);
 }
 $$('.nav').forEach((b) => b.addEventListener('click', () => go(b.dataset.view)));
 
-// Події розширення
-function onEvent(type, data) {
-if (!live) return;
-if (type === 'loads.changed') refetchSoon();
-if (type === 'status' && data) { S.status = data; renderKpis(); }
+// Вхід / вихід
+function showLogin(msg) {
+authed = false; demo = null;
+document.body.classList.add('locked');
+$('#login').hidden = false; modal.close();
+$('#l-err').textContent = msg || '';
+$('#l-api').value = LS.get('intdeliv.api');
+$('#l-key').focus();
 }
-let started = false;
-function onHello(version) {
-S.version = version || '';
-if (live) return;
-live = true; demo = null;
-if (started) boot(); // розширення прокинулось пізніше — перейти з демо на живі дані
-}
+$('#lf').addEventListener('submit', async (e) => {
+e.preventDefault();
+const key = $('#l-key').value.trim(), api = cleanApi($('#l-api').value);
+if (!key) return;
+if (api && !/^https?:\/\//.test(api)) { $('#l-err').textContent = 'Адреса має починатися з https://'; return; }
+LS.set('intdeliv.api', api);
+const btn = $('#lf .btn'); btn.disabled = true; $('#l-err').textContent = '';
+try {
+const r = await rpc('ping', {}, key);
+if (r && r.authed === false) throw new AuthError('Невірний ключ доступу');
+LS.set('intdeliv.key', key); $('#l-key').value = '';
+start(r);
+} catch (err) { $('#l-err').textContent = err.message; }
+btn.disabled = false;
+});
+$('#l-demo').addEventListener('click', async (e) => { e.preventDefault(); demo = await makeDemo(); start({ version: 'demo' }); });
+document.addEventListener('click', (e) => {
+if (!e.target.closest('[data-logout]')) return;
+e.preventDefault();
+if (!demo) LS.set('intdeliv.key', '');
+showLogin();
+});
 
 // Старт
+function start(ping) {
+authed = true;
+S.version = ping?.version || '';
+S.items = []; S.status = null; S.settings = null;
+document.body.classList.remove('locked');
+$('#login').hidden = true;
+if (demo) { const n = $('#net'); n.className = 'net'; $('span', n).textContent = 'демо'; netOk = null; }
+boot();
+}
 async function boot() {
-started = true;
-renderBanners();
+renderTabs(); renderBanners();
 await Promise.all([loadSettings(), loadStatus()]);
 go(['settings', 'log'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'loads');
 }
-async function detect() {
-if (live) return true;
-try { const r = await bridge('ping', {}, 1500); S.version = r?.version || ''; live = true; } catch { /* немає */ }
-return live;
-}
-setInterval(() => { if (live && !document.hidden) loadStatus(); }, 30000);
+// Опитування замість пушів
+const visible = () => document.visibilityState === 'visible';
+setInterval(() => { if (authed) loadStatus(); }, 10000);
+setInterval(() => { if (authed && visible() && S.view === 'loads' && $('#modal').hidden) loadLoads(); }, 20000);
+document.addEventListener('visibilitychange', () => { if (authed && visible()) { loadStatus(); if (S.view === 'loads') loadLoads(); } });
 
 (async () => {
 renderTabs();
-if (!(await detect())) demo = await makeDemo();
-boot();
+if (new URLSearchParams(location.search).has('demo')) { demo = await makeDemo(); return start({ version: 'demo' }); }
+if (!LS.get('intdeliv.key')) return showLogin();
+try {
+const r = await rpc('ping');
+if (r && r.authed === false) return showLogin('Ключ більше не дійсний — увійдіть знову');
+start(r);
+} catch (e) {
+if (e instanceof AuthError) return showLogin(e.message);
+start(null); // сервер тимчасово недоступний — показуємо інтерфейс, опитування підхопить
+}
 })();
 
 // Демо-бекенд
@@ -523,7 +571,7 @@ const logs = [['info', 'Зібрано 25 заявок зі сторінки 1, 
 const clone = (x) => JSON.parse(JSON.stringify(x));
 const upd = (id, fn) => { const l = items.find((x) => x.id === id); if (!l) throw new Error('Заявку не знайдено'); fn(l); l.updatedAt = Date.now(); return clone(l); };
 const api = {
-ping: () => ({ version: 'demo' }),
+ping: () => ({ version: 'demo', authed: true }),
 'loads.list': (p) => { const r = items.filter((l) => !p.status || l.status === p.status); return { items: clone(r), total: r.length }; },
 'loads.update': ({ id, patch }) => upd(id, (l) => Object.assign(l, patch)),
 'loads.delete': ({ id }) => { items = items.filter((l) => l.id !== id); return { ok: true }; },

@@ -1,0 +1,17 @@
+name = "intdeliv"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+# Секрет ADMIN_KEY задається командою: npx wrangler secret put ADMIN_KEY (не зберігати у файлах)
+
+[[d1_databases]]
+binding = "DB"
+database_name = "intdeliv"
+database_id = "REPLACE_ME"
+
+[triggers]
+crons = ["* * * * *"]
+
+[observability]
+enabled = true
