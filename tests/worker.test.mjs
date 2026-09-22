@@ -121,7 +121,7 @@ test('poll → loads stored (parallel pages, browser headers, dedupe), dryRun ma
   const h = setup();
   await setSettings(h, { lardi: { accounts: [{ name: 'A', token: 'tokAAAA1111', enabled: true }, { name: 'B', token: 'tokBBBB2222', enabled: true }] } });
   const out = await h.engine().runCycle();
-  assert.equal(h.calls.della.length, 4, 'pagesPerPoll=4 pages fetched');
+  assert.equal(h.calls.della.length, 3, 'pagesPerPoll=3 pages fetched');
   assert.match(h.calls.della[0].headers['User-Agent'], /Mozilla\/5\.0/);
   assert.match(h.calls.della[0].headers['Accept-Language'], /^uk/);
   assert.ok(h.calls.della.some((c) => /r25l25\.html$/.test(c.url)));
@@ -164,10 +164,10 @@ test('lock prevents overlapping runs; poll respects pollSeconds', async () => {
   h.clock.t += 56000; // замок протух
   const r = await e.runCycle();
   assert.ok(r.poll);
-  h.clock.t += 60000; // 60 с < 90 с
+  h.clock.t += 30000; // 30 с < 60 с
   const r2 = await e.runCycle();
   assert.equal(r2.poll, undefined);
-  h.clock.t += 60000;
+  h.clock.t += 30000;
   assert.ok((await e.runCycle()).poll);
 });
 
