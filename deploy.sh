@@ -15,4 +15,4 @@ git config --local --add credential.https://github.com.helper ""
 git config --local --add credential.https://github.com.helper osxkeychain
 git push -f -q https://github.com/TjmerMTA/intdeliv.git gh-pages
 rm -rf "$TMP"
-[ -f admin/CNAME ] && dig +short intdeliv.siteboosty.com @ns65.domaincontrol.com | grep -qi github && echo "OK: https://intdeliv.siteboosty.com/" || echo "OK: https://tjmermta.github.io/intdeliv/"
+dig +short intdeliv.siteboosty.com @ns65.domaincontrol.com | grep -qi github && echo "OK: https://intdeliv.siteboosty.com/" || echo "OK: https://tjmermta.github.io/intdeliv/"
