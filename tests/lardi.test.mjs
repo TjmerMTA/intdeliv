@@ -31,7 +31,7 @@ test('buildCargoBody maps load → Lardi body', () => {
   assert.equal(b.paymentCurrencyId, 2);
   assert.equal(b.paymentUnitId, 1);
   assert.deepEqual(b.paymentForms, [{ id: 4, vat: true }]);
-  assert.equal(b.groupage, true);
+  assert.equal(b.groupage, undefined); // groupage вимагає упаковку й габарити — не ставимо
   assert.equal(b.paymentPrepay, 50);
   assert.equal(b.sizeLength, 13.6);
   assert.deepEqual(b.waypointListSource, [{ countrySign: 'UA', townName: 'Київ', townId: 137, areaId: 23 }]);
@@ -164,6 +164,8 @@ test('buildCargoBody: Lardi limits — note ≤ 100, contentName ≤ 50, setting
   const ctx = { bodyIds: [34], from: { townName: 'Буча', townId: 6019 }, to: { townName: 'Ужгород', townId: 194 }, note: 'Тел. 0671234567' };
   const b = buildCargoBody(load, ctx);
   assert.ok(b.note.length <= LIMITS.note, b.note);
-  assert.ok(b.note.startsWith('Тел. 0671234567. Можл. дозавантаження'), b.note);
+  assert.ok(!/0671234567/.test(b.note), 'phone-like settings note dropped: ' + b.note);
+  assert.ok((b.note.match(/\d/g) || []).length <= LIMITS.noteDigits, b.note);
+  assert.equal(b.groupage, undefined);
   assert.ok(b.contentName.length <= LIMITS.contentName);
 });

@@ -37,8 +37,12 @@ export const BODY_RULES = {
   'відкрита': { patterns: ['борт', 'платформ'], fallback: [] },
   'бортова': { patterns: ['борт'], fallback: [] },
   'платформа': { patterns: ['платформ'], fallback: [] },
-  'самоскид': { patterns: ['самоскид', 'самосвал'], fallback: [] },
-  'зерновоз': { patterns: ['зерновоз'], fallback: [] },
+  'самоскид': { patterns: ['самоскид', 'самосвал'], fallback: [33] },
+  'зерновоз': { patterns: ['зерновоз'], fallback: [26] },
+  'зерновоз-самоскид': { patterns: ['зерновоз', 'самоскид'], fallback: [26, 33] },
+  'металовіз': { patterns: ['металовоз', 'ломовоз'], fallback: [69] },
+  'металовіз (ломовіз)': { patterns: ['металовоз', 'ломовоз'], fallback: [69] },
+  'ломовіз': { patterns: ['металовоз', 'ломовоз'], fallback: [69] },
   'цистерна': { patterns: ['цистерн'], fallback: [] },
   'мікроавтобус': { patterns: ['мікроавт', 'микроавт', 'бус'], fallback: [] },
   'цільномет': { patterns: ['цільномет', 'цельномет'], fallback: [] },
@@ -76,7 +80,7 @@ const dimsFromLoad = (load) => load.dims || {};
  * @param {{bodyIds:number[], from:object, to:object, paymentUnitId?:number, note?:string}} ctx
  */
 // Ліміти полів Lardi (перевірено 22.09.2026 через помилки валідації)
-export const LIMITS = { note: 100, contentName: 50 };
+export const LIMITS = { note: 100, contentName: 50, noteDigits: 6 }; // >6 цифр у примітці Lardi вважає телефоном
 const clip = (str, n) => (str.length <= n ? str : str.slice(0, n - 1).replace(/[\s,.;:–-]+$/, '') + '…');
 
 export function buildCargoBody(load, ctx) {
@@ -119,20 +123,23 @@ export function buildCargoBody(load, ctx) {
   if (d.width) body.sizeWidth = d.width;
   if (d.height) body.sizeHeight = d.height;
   if (formId) body.paymentForms = [{ id: formId, vat }];
-  if (tags.some((t) => /^довантаження$/i.test(String(t).trim()))) body.groupage = true;
+  // groupage не ставимо: з ним Lardi вимагає упаковку й усі габарити, яких у Della часто немає; «Довантаження» йде в примітку
   const prepay = tags.map((t) => String(t).match(/передоплата:\s*(\d+)\s*%/i)).find(Boolean);
   if (prepay) body.paymentPrepay = parseInt(prepay[1], 10);
 
-  // Lardi приймає примітку до 100 символів: спершу текст із налаштувань і ручна примітка, потім теги Della
-  const noteParts = [];
-  if (ctx.note) noteParts.push(String(ctx.note).trim());
-  if (load.note) noteParts.push(String(load.note).trim());
-  const extraTags = tags.filter((t) => !/^(пдв|довантаження)$/i.test(String(t).trim()) && !/^(дов|шир|вис)=/.test(t));
-  let note = noteParts.filter(Boolean).join('. ');
+  // Lardi приймає примітку до 100 символів і не більше 6 цифр: спершу текст із налаштувань і ручна примітка, потім теги Della
+  const digits = (x) => (x.match(/\d/g) || []).length;
+  const fits = (x) => x.length <= LIMITS.note && digits(x) <= LIMITS.noteDigits;
+  const extraTags = tags.filter((t) => !/^(пдв)$/i.test(String(t).trim()) && !/^(дов|шир|вис)=/.test(t) && !/^,/.test(t));
+  let note = '';
+  for (const part of [ctx.note, load.note].map((x) => String(x || '').trim()).filter(Boolean)) {
+    const next = note ? note + '. ' + part : part;
+    if (fits(next)) note = next;
+  }
   let tagSep = note ? '. ' : '';
   for (const t of extraTags) {
     const next = note + tagSep + t;
-    if (next.length > LIMITS.note) break;
+    if (!fits(next)) continue;
     note = next;
     tagSep = ', ';
   }
