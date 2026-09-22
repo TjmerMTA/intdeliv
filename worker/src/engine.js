@@ -9,6 +9,7 @@ import {
 import { Store } from './store.js';
 
 export const VERSION = '1.1.0-worker';
+export const ARCHIVE_DAYS = 30;
 
 export const DEFAULT_SEARCH_URL = 'https://della.com.ua/search/a204bd204eflolz1z21z3z4z51z6z7z8z9y1y2y3y4y5y6h0ilk0m1.html';
 
@@ -214,6 +215,7 @@ export class Engine {
       autoPublish: s.lardi.autoPublish,
       mode: s.lardi.mode,
       version: VERSION,
+      archiveDays: ARCHIVE_DAYS,
     };
   }
 
@@ -347,8 +349,7 @@ export class Engine {
   async enqueue(id, manual) {
     const now = this.now();
     return this.store.updateLoad(id, (l) => {
-      if (l.status === 'deleted') return null;
-      if (!manual && l.status !== 'new') return null;
+      if (!manual && l.status !== 'new') return null; // вручну можна повернути й з архіву
       return {
         ...l,
         status: 'queued',
@@ -484,10 +485,7 @@ export class Engine {
     if (!live.length) {
       return this.store.updateLoad(id, (l) => ({ ...l, lardi: (l.lardi || []).map((e) => (e.status === 'dry' || e.status === 'queued' ? { ...e, status: 'removed' } : e)) }));
     }
-    if (s.lardi.dryRun) {
-      await this.log('info', `DRY RUN: would remove from Lardi: ${describe(load)}`);
-      return load;
-    }
+    // тестовий режим лише не публікує; вже реальні публікації знімаємо завжди
     const results = {};
     for (const e of live) {
       const client = this.clientFor(s, e.account);
@@ -537,6 +535,8 @@ export class Engine {
       n++;
     }
     if (n) await this.log('info', `Неактуальні: ${n}`);
+    const purged = await this.store.purgeArchive(this.now() - ARCHIVE_DAYS * 86400e3);
+    if (purged) await this.log('info', `Архів: видалено назавжди ${purged} заявок, старших за ${ARCHIVE_DAYS} днів`);
     return n;
   }
 
@@ -608,6 +608,66 @@ Engine.prototype.handlers = {
     const l = await this.store.updateLoad(id, (x) => ({ ...x, status: 'inactive', inactiveKind: 'manual', statusReason: 'знято вручну', updatedAt: this.now() }));
     if (!l) throw new Error('заявку не знайдено');
     return l;
+  },
+
+  /** Зупинити все: вимкнути автопублікацію, очистити чергу; remove — ще й зняти всі публікації з Lardi. */
+  async 'lardi.stopAll'({ remove = false } = {}) {
+    await this.setSettings({ lardi: { autoPublish: false } });
+    const now = this.now();
+    let dequeued = 0;
+    for (const q of await this.store.queuedLight(100000)) {
+      const l = await this.store.updateLoad(q.id, (x) => (x.status !== 'queued' ? null : {
+        ...x, status: (x.lardi || []).some((e) => e.status === 'published') ? 'published' : 'new',
+        statusReason: 'публікацію зупинено', queuedAt: null, updatedAt: now,
+      }));
+      if (l && l.statusReason === 'публікацію зупинено') dequeued++;
+    }
+    await this.log('info', `Публікацію зупинено вручну, знято з черги: ${dequeued}`);
+    if (!remove) return { dequeued, removed: 0, failed: 0 };
+
+    const s = await this.getSettings();
+    const rows = await this.store.publishedLight();
+    const byAcc = new Map(); // account → [[loadId, lardiId]]
+    for (const r of rows) for (const e of r.lardi) {
+      if (e.id && e.status === 'published') (byAcc.get(e.account) || byAcc.set(e.account, []).get(e.account)).push([r.id, e.id]);
+    }
+    const ok = new Set(); // `${loadId}:${account}`
+    let failed = 0;
+    for (const [acc, pairs] of byAcc) {
+      const client = this.clientFor(s, acc);
+      if (!client) { failed += pairs.length; await this.log('error', `Немає токена акаунта ${acc + 1} — ${pairs.length} заявок не знято`); continue; }
+      for (let i = 0; i < pairs.length; i += 50) {
+        const part = pairs.slice(i, i + 50);
+        try {
+          await client.throwToBasket(part.map((x) => x[1]));
+          for (const [id] of part) ok.add(`${id}:${acc}`);
+        } catch (err) {
+          failed += part.length;
+          await this.log('error', `Не вдалося зняти з Lardi пакет із ${part.length}: ${err.message}`);
+        }
+      }
+    }
+    let removed = 0;
+    for (const r of rows) {
+      const hit = r.lardi.some((e) => ok.has(`${r.id}:${e.account}`));
+      if (!hit) continue;
+      removed++;
+      await this.store.updateLoad(r.id, (l) => {
+        const lardi = (l.lardi || []).map((e) => (ok.has(`${l.id}:${e.account}`) && e.status === 'published'
+          ? { ...e, status: 'removed', removedAt: now, error: undefined } : e));
+        const still = lardi.some((e) => e.status === 'published');
+        return { ...l, lardi, ...(still || l.status === 'deleted' ? {} : { status: 'inactive', inactiveKind: 'manual', statusReason: 'знято вручну (усі)' }), updatedAt: now };
+      });
+    }
+    await this.log('info', `Знято з Lardi всі публікації: ${removed} заявок${failed ? `, помилок: ${failed}` : ''}`);
+    return { dequeued, removed, failed };
+  },
+
+  async 'lardi.resume'() {
+    await this.setSettings({ lardi: { autoPublish: true } });
+    await this.log('info', 'Автопублікацію відновлено вручну');
+    this.waitUntil(this.runCycle({ forcePoll: true }));
+    return { ok: true };
   },
 
   async 'settings.get'() { return maskSettings(await this.getSettings()); },

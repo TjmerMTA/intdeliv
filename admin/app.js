@@ -83,14 +83,14 @@ const TABS = [
 ['active', 'Активні', (c) => sum(c, ['new', 'queued', 'published', 'needs_review', 'error'])],
 ['published', 'Опубліковані', (c) => sum(c, ['published'])],
 ['needs_review', 'Перевірити', (c) => sum(c, ['needs_review'])],
-['inactive', 'Неактуальні', (c) => sum(c, ['inactive', 'deleted'])],
+['archive', 'Архів · 30 днів', (c) => sum(c, ['inactive', 'deleted'])],
 ];
 const TAB_MATCH = {
 all: (s) => s !== 'deleted',
 active: (s) => !['inactive', 'deleted'].includes(s),
 published: (s) => s === 'published',
 needs_review: (s) => s === 'needs_review',
-inactive: (s) => s === 'inactive' || s === 'deleted',
+archive: (s) => s === 'inactive' || s === 'deleted',
 };
 function sum(c, keys) { return keys.reduce((a, k) => a + (c?.[k] || 0), 0); }
 const isOff = (l) => l.status === 'inactive' || l.status === 'deleted';
@@ -112,6 +112,8 @@ if (s < 3600) return Math.floor(s / 60) + ' хв тому';
 if (s < 86400) return Math.floor(s / 3600) + ' год тому';
 return Math.floor(s / 86400) + ' дн тому';
 }
+const ARCHIVE_MS = 30 * 86400e3;
+function fmtDay(t) { const d = new Date(t); return String(d.getDate()).padStart(2, '0') + '.' + String(d.getMonth() + 1).padStart(2, '0'); }
 function fmtDate(d) { const m = /^(\d{4})-(\d\d)-(\d\d)/.exec(d || ''); return m ? m[3] + '.' + m[2] : esc(d); }
 const hhmm = (ts) => new Date(ts).toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit' });
 
@@ -154,7 +156,10 @@ $('#k-q').textContent = fmtN(st.queue ?? 0);
 $('#k-sync').textContent = rel(st.lastPollAt);
 const r = $('#k-run');
 r.classList.toggle('on', !!st.running);
-$('span', r).textContent = st.running ? 'Збір працює' : 'Зупинено';
+const on = st.autoPublish !== false;
+r.classList.toggle('on', on);
+$('span', r).textContent = on ? 'Публікація працює' : 'Публікацію зупинено';
+const pb = $('#pause'); pb.textContent = on ? 'Зупинити публікацію' : 'Відновити публікацію'; pb.classList.toggle('pri', !on);
 renderTabs();
 renderBanners();
 }
@@ -217,10 +222,10 @@ const ppk = l.pricePerKm || (l.price && l.distanceKm ? Math.round(l.price / l.di
 const tags = cargoTags(l).slice(0, 4).map((t) => `<span class="tg">${esc(t)}</span>`).join('');
 const terms = payTerms(l);
 const dl = dellaLink(l);
-const canPub = !off && l.status !== 'published' && l.status !== 'queued';
+const canPub = l.status !== 'published' && l.status !== 'queued';
 const canUnpub = (l.lardi || []).some((a) => a.id && a.status !== 'removed') || l.status === 'published';
 return `<tr class="${off ? 'off' : ''}" data-id="${esc(l.id)}">
-<td data-l="Дата"><div class="d1">${off ? '🚫 ' : ''}${fmtDate(l.dateFrom)}${l.dateTo && l.dateTo !== l.dateFrom ? '–' + fmtDate(l.dateTo) : ''}</div><div class="sub">${esc(l.firstSeenAt ? hhmm(l.firstSeenAt) : '')}${l.edited ? ' · ✎' : ''}</div></td>
+<td data-l="Дата"><div class="d1">${off ? '🚫 ' : ''}${fmtDate(l.dateFrom)}${l.dateTo && l.dateTo !== l.dateFrom ? '–' + fmtDate(l.dateTo) : ''}</div><div class="sub">${esc(l.firstSeenAt ? hhmm(l.firstSeenAt) : '')}${l.edited ? ' · ✎' : ''}</div>${off && l.updatedAt ? `<div class="sub" title="${esc(l.statusReason || '')}">в архіві до ${esc(fmtDay(l.updatedAt + ARCHIVE_MS))}</div>` : ''}</td>
 <td class="c-rt" data-l="Маршрут"><div class="rt">${dl ? `<a class="rtl" href="${esc(dl)}" target="_blank" rel="noopener noreferrer" title="Відкрити на Della">` : ''}<span class="nw"><span class="dot">•</span> ${esc(l.fromCity)}</span> → <span class="nw"><span class="dot">•</span> ${esc(l.toCity)}</span>${dl ? '</a>' : ''}</div><div class="sub">${esc(l.fromRegion)} → ${esc(l.toRegion)}${dist}</div></td>
 <td class="c-cg" data-l="Вантаж / авто"><div>${esc(l.cargo)}</div><div class="sub">${esc(l.body)}</div>${tags}</td>
 <td class="num" data-l="Вага">${l.weight != null ? esc(fmtN(l.weight)) + ' т' : '—'}</td>
@@ -230,7 +235,7 @@ return `<tr class="${off ? 'off' : ''}" data-id="${esc(l.id)}">
 <td class="c-lr" data-l="Lardi">${lardiCell(l)}</td>
 <td class="c-ac"><div class="acts">
 <button class="ib" data-act="edit" title="Редагувати">${ICON.edit}</button>
-${canPub ? `<button class="ib" data-act="publish" title="Опублікувати зараз">${ICON.pub}</button>` : ''}
+${canPub ? `<button class="ib" data-act="publish" title="${off ? 'Повернути з архіву й опублікувати' : 'Опублікувати зараз'}">${ICON.pub}</button>` : ''}
 ${canUnpub ? `<button class="ib" data-act="unpublish" title="Зняти з Lardi">${ICON.unpub}</button>` : ''}
 ${dl ? `<a class="ib" href="${esc(dl)}" target="_blank" rel="noopener noreferrer" title="Відкрити на Della">${ICON.link}</a>` : ''}
 <button class="ib red" data-act="delete" title="Видалити">${ICON.del}</button>
@@ -285,6 +290,7 @@ const my = ++loadSeq;
 const p = { limit: 5000, offset: 0 };
 for (const k in S.f) if (S.f[k].trim()) p[k] = S.f[k].trim();
 if (S.tab === 'published' || S.tab === 'needs_review') p.status = S.tab;
+if (S.tab === 'archive') p.status = ['inactive', 'deleted'];
 try {
 const r = await call('loads.list', p);
 if (my !== loadSeq) return;
@@ -326,7 +332,7 @@ if (act === 'edit') return editLoad(l);
 if (act === 'publish') { b.disabled = true; replaceLoad(await call('loads.publish', { id })); toast('Поставлено в чергу на публікацію'); }
 if (act === 'unpublish') { b.disabled = true; replaceLoad(await call('loads.unpublish', { id })); toast('Знято з Lardi'); }
 if (act === 'delete') {
-if (!(await confirmBox('Видалити заявку?', `${l.fromCity} → ${l.toCity}, ${l.cargo}. Якщо вона опублікована — буде знята з Lardi.`))) return;
+if (!(await confirmBox('Видалити заявку?', `${l.fromCity} → ${l.toCity}, ${l.cargo}. Якщо вона опублікована — буде знята з Lardi. Заявка ще 30 днів зберігатиметься в «Архіві».`))) return;
 await call('loads.delete', { id, fromLardi: true });
 S.items = S.items.filter((x) => x.id !== id); applyFilters(); renderRows(); toast('Видалено');
 }
@@ -382,6 +388,26 @@ e.target.disabled = true;
 try { await call('sync.now'); toast('Синхронізацію запущено'); setTimeout(() => { loadStatus(); loadLoads(); }, 1500); }
 catch (err) { toast(err.message, true); }
 setTimeout(() => (e.target.disabled = false), 3000);
+});
+$('#pause').addEventListener('click', async (e) => {
+const on = S.status?.autoPublish !== false;
+if (on && !(await confirmBox('Зупинити публікацію?', 'Нові заявки з Della перестануть публікуватися на Lardi, черга очиститься. Уже опубліковані залишаться на Lardi — щоб зняти і їх, натисніть «Зняти все з Lardi».', 'Зупинити'))) return;
+e.target.disabled = true;
+try {
+if (on) { const r = await call('lardi.stopAll', { remove: false }); toast(`Публікацію зупинено${r?.dequeued ? ', знято з черги: ' + r.dequeued : ''}`); }
+else { await call('lardi.resume'); toast('Публікацію відновлено'); }
+} catch (err) { toast(err.message, true); }
+e.target.disabled = false; loadSettings(); loadStatus(); loadLoads();
+});
+$('#unpub-all').addEventListener('click', async (e) => {
+const n = S.status?.counts?.published || 0;
+if (!(await confirmBox('Зняти все з Lardi?', `Публікацію буде зупинено, черга очиститься, а всі опубліковані заявки (${n}) буде знято з Lardi. Вони перейдуть в «Архів» і зберігатимуться там 30 днів — звідти будь-яку можна повернути.`, 'Зняти все'))) return;
+e.target.disabled = true; toast('Знімаю з Lardi… це може зайняти хвилину');
+try {
+const r = await call('lardi.stopAll', { remove: true });
+toast(`Знято з Lardi: ${r?.removed ?? 0}${r?.failed ? ', не вдалося: ' + r.failed + ' (див. Журнал)' : ''}`, !!r?.failed);
+} catch (err) { toast(err.message, true); }
+e.target.disabled = false; loadSettings(); loadStatus(); loadLoads();
 });
 $('#dry').addEventListener('change', async (e) => {
 const want = e.target.checked;
@@ -614,8 +640,10 @@ ping: () => ({ version: 'demo', authed: true }),
 'loads.unpublish': ({ id }) => upd(id, (l) => { l.status = 'inactive'; l.statusReason = 'Знято вручну'; l.lardi = l.lardi.map((a) => ({ ...a, status: 'removed' })); }),
 'settings.get': () => clone(settings),
 'settings.set': (p) => { for (const k in p) settings[k] = typeof p[k] === 'object' && !Array.isArray(p[k]) ? { ...settings[k], ...p[k] } : p[k]; return clone(settings); },
-'status.get': () => ({ running: true, lastPollAt: now - 70e3, counts: counts(), today: { collected: 187, published: [142, 139] }, queue: items.filter((l) => l.status === 'queued').length }),
+'status.get': () => ({ running: true, autoPublish: settings.lardi.autoPublish, lastPollAt: now - 70e3, counts: counts(), today: { collected: 187, published: [142, 139] }, queue: items.filter((l) => l.status === 'queued').length }),
 'sync.now': () => ({ started: true }),
+'lardi.stopAll': ({ remove }) => { settings.lardi.autoPublish = false; let removed = 0; if (remove) items.forEach((l) => { if (l.status === 'published') { l.status = 'inactive'; l.statusReason = 'знято вручну (усі)'; l.lardi = l.lardi.map((a) => ({ ...a, status: 'removed' })); removed++; } }); return { dequeued: 0, removed, failed: 0 }; },
+'lardi.resume': () => { settings.lardi.autoPublish = true; return { ok: true }; },
 'lardi.test': ({ accountIndex }) => ({ ok: true, name: settings.lardi.accounts[accountIndex]?.name || 'Демо' }),
 'log.list': () => clone(logs),
 };

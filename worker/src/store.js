@@ -122,6 +122,21 @@ export class Store {
     return (results || []).map((r) => ({ ...r, lardi: parse(r.lardi, []) }));
   }
 
+  /** Легкі рядки з живими публікаціями на Lardi: {id, lardi[]} */
+  async publishedLight(limit = 20000) {
+    const { results } = await this.db.prepare(
+      `SELECT id, lardi FROM loads WHERE lardi LIKE '%"status":"published"%' LIMIT ?`,
+    ).bind(limit).all();
+    return (results || []).map((r) => ({ ...r, lardi: parse(r.lardi, []) }))
+      .filter((r) => r.lardi.some((e) => e.id && e.status === 'published'));
+  }
+
+  /** Архів: неактуальні/видалені, не змінювані довше за before — видалити назавжди. */
+  async purgeArchive(before) {
+    const r = await this.db.prepare("DELETE FROM loads WHERE status IN ('inactive','deleted') AND updatedAt < ?").bind(before).run();
+    return Number(r?.meta?.changes ?? r?.changes ?? 0) || 0;
+  }
+
   async countByStatus(statuses) {
     const { results } = await this.db.prepare('SELECT status, COUNT(*) AS n FROM loads GROUP BY status').all();
     const out = {};

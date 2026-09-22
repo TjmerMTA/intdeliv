@@ -202,6 +202,26 @@ test('publish (dryRun off) in "both" mode to 2 accounts, interval spacing within
   assert.equal(r.body.result.status, 'inactive');
   const thr = h.calls.lardi.filter((c) => c.path === '/proposals/my/basket/throw');
   assert.equal(thr.length, 2);
+  // зупинити все + зняти всі публікації, навіть у тестовому режимі
+  await setSettings(h, { lardi: { dryRun: true } });
+  const all = (await h.rpc('lardi.stopAll', { remove: true })).body.result;
+  assert.equal(all.removed, items.length - 1);
+  assert.equal(all.failed, 0);
+  const thr2 = h.calls.lardi.filter((c) => c.path === '/proposals/my/basket/throw').slice(2);
+  assert.equal(thr2.length, 2, 'один пакет на акаунт');
+  assert.equal(thr2[0].body.cargoIds.length, items.length - 1);
+  assert.equal((await h.rpc('loads.list', { status: 'published' })).body.result.items.length, 0);
+  const arch = (await h.rpc('loads.list', { status: ['inactive', 'deleted'] })).body.result.items;
+  assert.equal(arch.length, items.length);
+  const st2 = (await h.rpc('status.get')).body.result;
+  assert.equal(st2.autoPublish, false);
+  assert.equal(st2.queue, 0);
+  // архів чиститься через 30 днів
+  h.clock.t += 31 * 86400e3;
+  await h.engine().staleCheck(); // старі — назавжди геть; черга, що стала неактуальною щойно, лишається в архіві
+  const left = new Set((await h.rpc('loads.list', { status: ['inactive', 'deleted'] })).body.result.items.map((l) => l.id));
+  assert.ok(arch.every((l) => !left.has(l.id)));
+  assert.equal(left.size, 10);
 });
 
 test('dailyLimit per account is respected', async () => {
