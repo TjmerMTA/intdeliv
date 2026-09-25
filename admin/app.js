@@ -37,11 +37,12 @@ let authed = false;
 class AuthError extends Error {}
 
 async function rpc(method, params = {}, key = LS.get('intdeliv.key'), timeout = 20000) {
+for (;;) {
+if (!LS.get('intdeliv.api')) await discover();
+if (!apiBase()) { if (await waitForReconnect()) continue; throw new Error('Сервер запускається… спробуйте за хвилину'); }
 const ac = new AbortController();
 const t = setTimeout(() => ac.abort(), timeout);
 let r;
-if (!LS.get('intdeliv.api')) await discover();
-if (!apiBase()) { clearTimeout(t); setNet(false); throw new Error('Сервер запускається… спробуйте за хвилину'); }
 try {
 r = await fetch(apiBase() + '/api/rpc', {
 method: 'POST', signal: ac.signal,
@@ -49,28 +50,73 @@ headers: { 'Content-Type': 'application/json', ...(key ? { Authorization: 'Beare
 body: JSON.stringify({ method, params }),
 });
 } catch (e) {
-setNet(false);
-if (!LS.get('intdeliv.api')) discover(true); // тунель міг змінитись
+clearTimeout(t);
+if (await waitForReconnect()) continue;
 throw new Error(e.name === 'AbortError' ? 'Сервер не відповідає (' + method + ')' : 'Немає зв\'язку з сервером');
-} finally { clearTimeout(t); }
+}
+clearTimeout(t);
 setNet(true);
 if (r.status === 401) throw new AuthError('Невірний ключ доступу');
 const d = await r.json().catch(() => null);
-if (!d) { if (!LS.get('intdeliv.api')) discover(true); throw new Error('Сервер перезапускається… (' + r.status + ')'); }
+if (!d) { if (await waitForReconnect()) continue; throw new Error('Сервер перезапускається… (' + r.status + ')'); }
 if (!d.ok) throw new Error(d.error || 'Помилка сервера');
 return d.result;
+}
 }
 async function call(method, params) {
 if (demo) return demo.call(method, params);
 try { return await rpc(method, params); } catch (e) { if (e instanceof AuthError) showLogin(e.message); throw e; }
 }
 let netOk = null;
-function setNet(ok) {
-if (netOk === ok) return;
-netOk = ok;
+function setNet(state, label) {
+const cls = state === true ? 'on' : state === false ? 'off' : state === 'warn' ? 'warn' : '';
+const changed = netOk !== state;
+netOk = state;
 const el = $('#net');
-el.className = 'net' + (ok ? ' on' : ' off');
-$('span', el).textContent = ok ? 'онлайн' : 'немає зв\'язку';
+if (changed) el.className = 'net' + (cls ? ' ' + cls : '');
+$('span', el).textContent = label || (state === true ? 'онлайн' : state === false ? 'немає зв\'язку' : '…');
+}
+
+// Тунель перезапускається раз на кілька годин (~1–2 хв простою) — тихо перепробовуємо,
+// а не одразу показуємо помилку; заразом перечитуємо api.json без кешу і, якщо адреса
+// змінилась, перемикаємось на неї навіть якщо стара була збережена вручну.
+const RECONNECT_STEP_MS = 10000, RECONNECT_MAX_MS = 180000, RECONNECT_MSG = 'Сервер перезапускається, підключаюсь…';
+let reconnectPromise = null;
+function waitForReconnect() {
+if (!reconnectPromise) reconnectPromise = doReconnect().finally(() => { reconnectPromise = null; });
+return reconnectPromise;
+}
+function showConnHint(text) {
+const el = $('#l-wait');
+if (!el) return;
+el.hidden = !text;
+el.textContent = text || '';
+}
+async function doReconnect() {
+const started = Date.now();
+setNet('warn', RECONNECT_MSG);
+showConnHint(RECONNECT_MSG);
+while (Date.now() - started < RECONNECT_MAX_MS) {
+await new Promise((res) => setTimeout(res, RECONNECT_STEP_MS));
+const fresh = await discover(true);
+if (fresh && cleanApi(LS.get('intdeliv.api')) !== fresh) LS.set('intdeliv.api', fresh);
+if (!apiBase()) continue;
+try {
+const ac = new AbortController();
+const t = setTimeout(() => ac.abort(), 6000);
+await fetch(apiBase() + '/api/rpc', {
+method: 'POST', signal: ac.signal,
+headers: { 'Content-Type': 'application/json' },
+body: JSON.stringify({ method: 'ping', params: {} }),
+}).finally(() => clearTimeout(t));
+setNet(true);
+showConnHint('');
+return true;
+} catch { /* сервер ще не піднявся — пробуємо ще раз */ }
+}
+setNet(false);
+showConnHint('');
+return false;
 }
 
 // Стан
@@ -529,6 +575,7 @@ authed = false; demo = null;
 document.body.classList.add('locked');
 $('#login').hidden = false; modal.close();
 $('#l-err').textContent = msg || '';
+showConnHint('');
 $('#l-api').value = LS.get('intdeliv.api');
 $('#l-key').focus();
 }
@@ -543,8 +590,9 @@ try {
 const r = await rpc('ping', {}, key);
 if (r && r.authed === false) throw new AuthError('Невірний ключ доступу');
 LS.set('intdeliv.key', key); $('#l-key').value = '';
+showConnHint('');
 start(r);
-} catch (err) { $('#l-err').textContent = err.message; }
+} catch (err) { showConnHint(''); $('#l-err').textContent = err.message; }
 btn.disabled = false;
 });
 $('#l-demo').addEventListener('click', async (e) => { e.preventDefault(); demo = await makeDemo(); start({ version: 'demo' }); });
@@ -580,13 +628,15 @@ document.addEventListener('visibilitychange', () => { if (authed && visible()) {
 renderTabs();
 if (new URLSearchParams(location.search).has('demo')) { demo = await makeDemo(); return start({ version: 'demo' }); }
 if (!LS.get('intdeliv.key')) return showLogin();
+// показуємо інтерфейс одразу, не чекаючи на пінг — rpc() сам тихо перепробує з'єднання,
+// якщо сервер саме перезапускається, і опитування (loadStatus/loadSettings) підхопить дані
+start(null);
 try {
 const r = await rpc('ping');
 if (r && r.authed === false) return showLogin('Ключ більше не дійсний — увійдіть знову');
-start(r);
+S.version = r?.version || '';
 } catch (e) {
-if (e instanceof AuthError) return showLogin(e.message);
-start(null); // сервер тимчасово недоступний — показуємо інтерфейс, опитування підхопить
+if (e instanceof AuthError) showLogin(e.message);
 }
 })();
 
