@@ -133,34 +133,134 @@ setNet(false);
 return false;
 }
 
-// Діагностика для екрана входу: чому не вдається підключитись — щоб не висіти мовчки.
-// Сервер віддає CORS і на GET / ({name:'intdeliv'}) — це простий запит без preflight.
-async function probeServer(base) {
-try {
-const j = await fetchT(base + '/?t=' + Date.now(), { cache: 'no-store' }, 8000, (r) => r.json());
-return j?.name === 'intdeliv' ? 'ok' : 'foreign';
-} catch (e) {
-if (e.name === 'AbortError') return 'timeout';
-// cors-запит упав: якщо no-cors проходить — відповідає хтось інший (сторінка блокування антивірусу або помилка Cloudflare)
-try { await fetchT(base + '/?t=' + Date.now(), { cache: 'no-store', mode: 'no-cors' }, 8000); return 'intercepted'; } catch { return 'blocked'; }
+// Діагностика з'єднання (кнопка на екрані входу + автозапуск, коли сервер не відповідає).
+// Результат лише на екрані й у «Скопіювати звіт» — нікуди не відправляється.
+// Час до помилки підказує причину: миттєва відмова ≈ розширення/антивірус або DNS, довгий таймаут ≈ мережа мовчки відкидає.
+const DIAG_TIMEOUT_MS = 12000, DIAG_INSTANT_MS = 50, DIAG_FAST_MS = 1500;
+function browserName(ua = navigator.userAgent) {
+const m = /Edg\w*\/(\d+)/.exec(ua) || /OPR\/(\d+)/.exec(ua) || /YaBrowser\/(\d+)/.exec(ua) || /Firefox\/(\d+)/.exec(ua) || /Chrome\/(\d+)/.exec(ua) || /Version\/(\d+).*Safari/.exec(ua);
+const name = !m ? 'невідомий браузер' : /^Edg/.test(m[0]) ? 'Edge' : /^OPR/.test(m[0]) ? 'Opera' : /^Ya/.test(m[0]) ? 'Yandex' : /^Firefox/.test(m[0]) ? 'Firefox' : /^Chrome/.test(m[0]) ? 'Chrome' : 'Safari';
+const os = /Windows NT/.test(ua) ? 'Windows' : /Android/.test(ua) ? 'Android' : /iPhone|iPad/.test(ua) ? 'iOS' : /Mac OS X/.test(ua) ? 'macOS' : /Linux/.test(ua) ? 'Linux' : '';
+return name + (m ? ' ' + m[1] : '') + (os ? ' · ' + os : '');
 }
+const timeoutErr = () => Object.assign(new Error('таймаут'), { name: 'AbortError' });
+// одна проба → {ok, ms, note}; ms — від старту до відповіді або до помилки
+async function probe(run) {
+const t0 = performance.now();
+const ms = () => Math.round(performance.now() - t0);
+try { const note = await run(); return { ok: true, ms: ms(), note: note || '' }; }
+catch (e) { return { ok: false, ms: ms(), note: e.name === 'AbortError' ? 'таймаут' : e.message === 'ліміт' ? 'ліміт запитів' : 'відмова' }; }
 }
-async function diagnose() {
-await discover(true);
-const base = apiBase();
-const gh = discoverWhy || 'ok';
-if (!base) {
-return { code: 'gh=' + gh, text: gh === 'limit'
-? 'GitHub тимчасово обмежив запити з вашої мережі, тож адресу сервера не отримати. Спробуйте за 10–60 хв або з іншого інтернету (наприклад, мобільного).'
-: 'GitHub недоступний — не вдається дізнатися адресу сервера. Перевірте інтернет; якщо ввімкнено VPN або антивірус із веб-захистом — спробуйте без них.' };
+const getT = (url, opts, read) => fetchT(url + (url.includes('?') ? '&' : '?') + 't=' + Date.now(), { cache: 'no-store', ...opts }, DIAG_TIMEOUT_MS, read);
+function imgT(src) {
+return new Promise((res, rej) => {
+const i = new Image();
+const t = setTimeout(() => { i.onload = i.onerror = null; i.src = ''; rej(timeoutErr()); }, DIAG_TIMEOUT_MS);
+i.onload = () => { clearTimeout(t); res('завантажено'); };
+i.onerror = () => { clearTimeout(t); rej(new Error('onerror')); };
+i.src = src + '?t=' + Date.now();
+});
 }
-const srv = await probeServer(base);
-const code = 'gh=' + gh + ', srv=' + srv;
-if (srv === 'ok') return { code, base, text: 'Сервер відповідає, але вхід поки не пройшов. Якщо це триває довше хвилини — запит блокує антивірус або розширення браузера; спробуйте інший браузер.' };
-if (srv === 'timeout') return { code, base, text: 'Сервер не відповідає — можливо, саме перезапускається (1–2 хв). Продовжую спроби.' };
-return { code, base, text: (gh === 'ok' ? 'Браузер або антивірус блокує з\'єднання з сервером: GitHub відкривається, а сервер — ні. ' : 'Немає з\'єднання ні з сервером, ні з GitHub — перевірте інтернет. ')
-+ 'Якщо стоїть AVG/Avast — додайте *.trycloudflare.com у винятки веб-захисту або відкрийте адмінку в іншому браузері.' };
+const traceNote = (txt) => { const m = Object.fromEntries(String(txt).split('\n').map((l) => l.split('='))); return [m.colo && 'вузол ' + m.colo, m.loc, m.warp === 'on' && 'WARP'].filter(Boolean).join(', '); };
+const DIAG_ROWS = [
+['raw', 'GitHub raw (адреса сервера)'], ['api', 'GitHub API (запасний)'], ['cf', 'Cloudflare — контроль'],
+['dns', 'DNS імені сервера (dns.google)'], ['edge', 'Cloudflare для імені сервера'], ['ping', 'Сервер: ping (fetch)'],
+['nocors', 'Сервер: no-cors до кореня'], ['img', 'Сервер: картинка'],
+];
+let diagRun = null; // {res, host, verdict, at}
+function runDiag() {
+if (diagRun?.pending) return diagRun.pending;
+const res = {}; let host = '';
+const d = { res, get host() { return host; }, at: new Date(), verdict: '', pending: true };
+diagRun = d;
+const set = (k, p) => p.then((r) => { res[k] = r; renderDiag(); return r; });
+d.pending = (async () => {
+renderDiag();
+let fromGh = '';
+const pick = (j) => { if (!fromGh && j && /^https:\/\//.test(j.url)) fromGh = String(j.url).replace(/\/+$/, ''); };
+await Promise.all([
+set('raw', probe(async () => { const j = await getT(DISCOVERY[0][0].replace(/\?t=$/, ''), {}, (r) => r.json()); pick(j); return j?.url ? 'адреса є' : 'без адреси'; })),
+set('api', probe(async () => {
+const j = await getT(DISCOVERY[1][0].replace(/&t=$/, ''), { headers: DISCOVERY[1][1] }, async (r) => { const left = r.headers.get('x-ratelimit-remaining'); if (left === '0') throw new Error('ліміт'); return { ...(await r.json()), left }; });
+pick(j); return 'лишилось запитів: ' + (j.left ?? '?');
+})),
+set('cf', probe(async () => traceNote(await getT('https://www.cloudflare.com/cdn-cgi/trace', {}, (r) => r.text())))),
+]);
+const base = fromGh || apiBase();
+host = base ? new URL(base).host : '';
+if (host) {
+await Promise.all([
+set('dns', probe(async () => {
+const j = await getT('https://dns.google/resolve?type=A&name=' + encodeURIComponent(host), {}, (r) => r.json());
+const ips = (j.Answer || []).filter((a) => a.type === 1).map((a) => a.data);
+if (!ips.length) { d.nx = true; return j.Status === 3 ? 'імені немає (NXDOMAIN)' : 'без адрес'; }
+return ips.join(', ');
+})),
+set('edge', probe(async () => traceNote(await getT(base + '/cdn-cgi/trace', {}, (r) => r.text())) || 'відповів')),
+set('ping', probe(async () => {
+const j = await getT(base + '/api/rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ method: 'ping', params: {} }) }, (r) => r.json());
+if (!j?.ok) throw new Error('bad'); return 'версія ' + (j.result?.version || '?');
+})),
+set('nocors', probe(async () => { await getT(base + '/', { mode: 'no-cors' }); return 'відповідь отримана'; })),
+set('img', probe(() => imgT(base + '/'))),
+]);
 }
+d.verdict = diagVerdict(res, host, d.nx);
+d.pending = null;
+renderDiag();
+return d;
+})();
+return d.pending;
+}
+function diagVerdict(r, host, nx) {
+const ok = (k) => r[k]?.ok;
+if (ok('ping')) return 'З\'єднання з сервером працює — мережа не заважає. Якщо вхід не проходить, перевірте ключ або оновіть сторінку (Ctrl+F5).';
+if (!ok('raw') && !ok('api') && !ok('cf')) return 'Немає інтернету або мережа блокує все, крім цієї сторінки.';
+if (!host) return r.api?.note === 'ліміт запитів' ? 'GitHub не віддає адресу сервера (ліміт запитів з вашої мережі) — спробуйте за годину або з іншого інтернету.' : 'GitHub недоступний — не вдається дізнатися адресу сервера (блокує мережа або антивірус).';
+if (nx) return 'Адреса сервера ще не активна — сервер перезапускається, спробуйте за 2–3 хв.';
+if (ok('edge') || ok('nocors')) return 'Мережа до сервера пропускає, але сервер не відповідає як слід — він перезапускається або запит блокує розширення/антивірус браузера.';
+const srv = ['edge', 'nocors', 'ping'].map((k) => r[k]).filter(Boolean);
+const worst = Math.max(...srv.map((x) => x.ms));
+const where = '*.' + host.split('.').slice(-2).join('.');
+if (!ok('cf')) return 'Мережа блокує з\'єднання з Cloudflare загалом (і з сервером теж).';
+if (srv.every((x) => x.note === 'таймаут')) return 'Мережа блокує з\'єднання: запити до ' + where + ' мовчки зникають (провайдер, роутер або веб-щит антивірусу), а інші сайти Cloudflare працюють.';
+if (worst < DIAG_INSTANT_MS) return 'Блокує розширення/антивірус браузера: запит до ' + where + ' зупиняється миттєво, ще до мережі. Спробуйте інший браузер без розширень.';
+if (worst < DIAG_FAST_MS) return 'Не резолвиться DNS провайдера (або блокує антивірус): ' + (ok('dns') ? 'ім\'я ' + where + ' в інтернеті існує, але ' : '') + 'цей комп\'ютер одразу отримує відмову.';
+return 'Мережа або антивірус скидає з\'єднання з ' + where + ', а інші сайти Cloudflare працюють.';
+}
+function diagReport(d = diagRun) {
+if (!d) return '';
+const pad = (s, n) => (s + ' '.repeat(n)).slice(0, n);
+const lines = DIAG_ROWS.map(([k, label]) => { const x = d.res[k]; return pad(label, 32) + (x ? pad(x.ok ? 'OK' : 'ПОМИЛКА', 8) + pad(x.ms + ' мс', 9) + x.note : '—'); });
+const ver = new URL(import.meta.url).searchParams.get('v') || 'dev';
+return ['IntDeliv — діагностика з\'єднання', d.at.toLocaleString('uk-UA') + ' (UTC' + (d.at.getTimezoneOffset() > 0 ? '-' : '+') + Math.abs(d.at.getTimezoneOffset() / 60) + ')',
+'Браузер: ' + browserName() + ' · онлайн: ' + (navigator.onLine ? 'так' : 'ні') + ' · сторінка v=' + ver,
+'Сервер: ' + (d.host || 'адресу не отримано'), '', ...lines, '', 'Висновок: ' + (d.verdict || 'перевіряю…')].join('\n');
+}
+function renderDiag() {
+const el = $('#l-diag'); const d = diagRun;
+if (!el || !d) return;
+el.hidden = false;
+el.innerHTML = `<div class="dg-h"><b>Діагностика з'єднання</b><span class="muted">${esc(browserName())}</span></div>
+<table class="dg">${DIAG_ROWS.map(([k, label]) => { const x = d.res[k]; const st = !x ? (d.pending ? '<span class="muted">…</span>' : '<span class="muted">—</span>') : x.ok ? '<b class="ok">OK</b>' : '<b class="bad">помилка</b>';
+return `<tr><td>${esc(label)}</td><td>${st}</td><td class="n">${x ? esc(x.ms + ' мс') : ''}</td><td class="muted">${esc(x?.note || '')}</td></tr>`; }).join('')}</table>
+<div class="dg-v">${d.verdict ? '<b>Висновок:</b> ' + esc(d.verdict) : '<span class="muted">Перевіряю… до ' + DIAG_TIMEOUT_MS * 2 / 1000 + ' с</span>'}</div>
+<div class="dg-f"><button type="button" class="btn" data-dg="copy"${d.pending ? ' disabled' : ''}>Скопіювати звіт</button><button type="button" class="btn" data-dg="again"${d.pending ? ' disabled' : ''}>Повторити</button><span class="muted" data-dg-msg>Звіт нікуди не надсилається — скопіюйте й перешліть.</span></div>`;
+}
+async function copyText(text) {
+try { await navigator.clipboard.writeText(text); return true; } catch { /* немає доступу до буфера — старий спосіб */ }
+const ta = document.createElement('textarea'); ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+document.body.append(ta); ta.select();
+let ok = false; try { ok = document.execCommand('copy'); } catch { /* ignore */ }
+ta.remove(); return ok;
+}
+$('#l-diag').addEventListener('click', async (e) => {
+const b = e.target.closest('[data-dg]'); if (!b) return;
+if (b.dataset.dg === 'again') return runDiag();
+const msg = $('[data-dg-msg]', e.currentTarget); // currentTarget після await уже null
+const ok = await copyText(diagReport());
+msg.textContent = ok ? 'Скопійовано — вставте в повідомлення власнику.' : 'Не вдалося скопіювати — виділіть текст вручну.';
+});
 
 // Стан
 const S = {
@@ -619,6 +719,7 @@ document.body.classList.add('locked');
 $('#login').hidden = false; modal.close();
 $('#l-err').textContent = msg || '';
 showConnHint('');
+$('#l-diag').hidden = true;
 $('#l-api').value = LS.get('intdeliv.api');
 $('#l-key').focus();
 }
@@ -636,9 +737,10 @@ const tickHint = () => showConnHint((diag ? 'Продовжую спроби' : 
 tickHint();
 const ticker = setInterval(tickHint, 1000);
 const diagT = setTimeout(async () => {
-const d = await diagnose();
-if (!btn.disabled) return; // вхід уже завершився
-diag = d; showDiag(d); tickHint();
+diag = true; tickHint();
+$('#l-err').textContent = 'Сервер не відповідає — перевіряю з\'єднання…';
+const d = await runDiag();
+if (btn.disabled) $('#l-err').textContent = d.verdict; // вхід ще триває — показуємо причину
 }, LOGIN_DIAG_MS);
 try {
 const r = await rpc('ping', {}, key);
@@ -652,11 +754,7 @@ else $('#l-err').insertAdjacentHTML('beforeend', '<br>Спроби зупине�
 clearInterval(ticker); clearTimeout(diagT); showConnHint('');
 btn.disabled = false;
 });
-function showDiag(d) {
-$('#l-err').innerHTML = esc(d.text)
-+ (d.base ? ` <a href="${esc(d.base)}/" target="_blank" rel="noopener">Перевірити сервер</a> (має відкритись текст {"name":"intdeliv"…}; сторінка антивірусу = блокування)` : '')
-+ `<br><span class="muted">Код для підтримки: ${esc(d.code)}</span>`;
-}
+$('#l-diag-run').addEventListener('click', (e) => { e.preventDefault(); runDiag(); });
 $('#l-demo').addEventListener('click', async (e) => { e.preventDefault(); demo = await makeDemo(); start({ version: 'demo' }); });
 document.addEventListener('click', (e) => {
 if (!e.target.closest('[data-logout]')) return;
