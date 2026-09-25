@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IntDeliv — заявки Della → Lardi</title>
+<meta name="description" content="Автоперенос заявок Della на Lardi: база вантажів, фільтри, автопублікація на два акаунти.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css?v=0f2f05f-1790338106">
+</head>
+<body class="locked">
+<section id="login" class="login" hidden>
+<form id="lf" class="l-box" autocomplete="on">
+<div class="logo">ID</div>
+<h1>IntDeliv</h1>
+<p class="muted">Заявки Della → Lardi</p>
+<label class="fld">Ключ доступу<input id="l-key" type="password" autocomplete="current-password" required></label>
+<details><summary>Адреса сервера</summary><label class="fld"><input id="l-api" type="url" placeholder="https://….workers.dev" autocomplete="off"></label></details>
+<div id="l-wait" class="l-wait" role="status" hidden></div>
+<div id="l-err" class="l-err" role="alert"></div>
+<button class="btn pri">Увійти</button>
+<div class="l-links"><a href="#" id="l-diag-run">Діагностика з'єднання</a><a href="#" id="l-demo">Подивитись демо</a></div>
+<div id="l-diag" class="l-diag" hidden></div>
+</form>
+</section>
+<nav class="side" aria-label="Розділи">
+<div class="logo" title="IntDeliv">ID</div>
+<button class="nav on" data-view="loads" title="Заявки">
+<svg viewBox="0 0 24 24"><path d="M3 7h11v9H3zM14 10h4l3 3v3h-7z"/><circle cx="7" cy="17.5" r="1.8"/><circle cx="17" cy="17.5" r="1.8"/></svg>
+</button>
+<button class="nav" data-view="settings" title="Налаштування">
+<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1 7 17M17 7l2.1-2.1"/></svg>
+</button>
+<button class="nav" data-view="log" title="Журнал">
+<svg viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6z"/><path d="M9 11h7M9 15h7M9 7h4"/></svg>
+</button>
+<button class="nav out" data-logout title="Вийти" aria-label="Вийти">
+<svg viewBox="0 0 24 24"><path d="M10 4H5v16h5M14 8l4 4-4 4M18 12H9"/></svg>
+</button>
+</nav>
+
+<main class="main">
+<div id="banners"></div>
+
+<header class="kpis">
+<div class="kpi"><span class="k-l">Зібрано сьогодні</span><b id="k-col">—</b></div>
+<div class="kpi"><span class="k-l">Опубліковано сьогодні</span><b id="k-pub">—</b></div>
+<div class="kpi"><span class="k-l">У черзі</span><b id="k-q">—</b></div>
+<div class="kpi"><span class="k-l">Остання синхронізація</span><b id="k-sync">—</b></div>
+<div class="kpi-act">
+<span id="net" class="net"><i></i><span>…</span></span>
+<span id="k-run" class="run"><i></i><span>—</span></span>
+<label class="sw" title="У тестовому режимі нічого не публікується на Lardi">
+<input type="checkbox" id="dry"><span class="sw-t"></span><span>Тестовий режим</span>
+</label>
+<button class="btn" id="pause" title="Вимкнути автопублікацію й очистити чергу">Зупинити публікацію</button>
+<button class="btn dan" id="unpub-all" title="Зняти всі опубліковані заявки з Lardi">Зняти все з Lardi</button>
+<button class="btn pri" id="sync">Синхронізувати зараз</button>
+</div>
+</header>
+
+<section id="v-loads" class="view">
+<div class="filters">
+<input data-f="fromCity" placeholder="Із міста" autocomplete="off">
+<input data-f="toCity" placeholder="До міста" autocomplete="off">
+<input data-f="fromRegion" placeholder="Із області" autocomplete="off">
+<input data-f="toRegion" placeholder="До області" autocomplete="off">
+<select data-f="payment" aria-label="Оплата"><option value="">Оплата: будь-яка</option><option value="cashless">Безнал</option><option value="cash">Готівка</option><option value="card">Картка</option><option value="vat">З ПДВ</option><option value="novat">Без ПДВ</option></select>
+<input data-f="q" placeholder="Телефон / ID" autocomplete="off">
+</div>
+<div class="tabs" id="tabs" role="tablist"></div>
+<div class="tbl-wrap">
+<table class="tbl">
+<thead><tr><th>Дата</th><th>Маршрут</th><th>Вантаж / авто</th><th>Вага</th><th>Об'єм</th><th>Ціна</th><th>Оплата</th><th>Lardi</th><th></th></tr></thead>
+<tbody id="rows"></tbody>
+</table>
+<div id="empty" class="empty" hidden>Немає заявок за цими фільтрами</div>
+<div class="more-wrap"><button class="btn" id="more" hidden>Показати ще</button><span id="shown" class="muted"></span></div>
+</div>
+</section>
+
+<section id="v-settings" class="view" hidden>
+<form id="sf" class="sf" autocomplete="off"></form>
+</section>
+
+<section id="v-log" class="view" hidden>
+<div class="log-head"><h2>Журнал</h2><span class="muted">оновлюється кожні 5 с</span></div>
+<div id="log" class="log"></div>
+</section>
+</main>
+
+<div id="modal" class="modal" hidden><div class="m-box" role="dialog" aria-modal="true"><div id="m-body"></div></div></div>
+<div id="toast" class="toast" hidden></div>
+<script type="module" src="app.js?v=0f2f05f-1790338106"></script>
+</body>
+</html>
