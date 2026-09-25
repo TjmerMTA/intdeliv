@@ -165,7 +165,7 @@ const traceNote = (txt) => { const m = Object.fromEntries(String(txt).split('\n'
 const DIAG_ROWS = [
 ['raw', 'GitHub raw (адреса сервера)'], ['api', 'GitHub API (запасний)'], ['cf', 'Cloudflare — контроль'],
 ['dns', 'DNS імені сервера (dns.google)'], ['edge', 'Cloudflare для імені сервера'], ['ping', 'Сервер: ping (fetch)'],
-['nocors', 'Сервер: no-cors до кореня'], ['img', 'Сервер: картинка'],
+['nocors', 'Сервер: no-cors до кореня'], ['img', 'Картинка з імені сервера'],
 ];
 let diagRun = null; // {res, host, verdict, at}
 function runDiag() {
@@ -202,7 +202,7 @@ const j = await getT(base + '/api/rpc', { method: 'POST', headers: { 'Content-Ty
 if (!j?.ok) throw new Error('bad'); return 'версія ' + (j.result?.version || '?');
 })),
 set('nocors', probe(async () => { await getT(base + '/', { mode: 'no-cors' }); return 'відповідь отримана'; })),
-set('img', probe(() => imgT(base + '/'))),
+set('img', probe(() => imgT(base + '/cdn-cgi/images/cf-icon-ok.png'))), // справжня картинка з краю Cloudflare
 ]);
 }
 d.verdict = diagVerdict(res, host, d.nx);
