@@ -10,18 +10,34 @@ const PAGE = 300;
 
 // Сервер (GitHub Actions + тунель): POST {API}/api/rpc {method, params} → {ok, result|error}
 // Адреса тунелю змінюється при кожному перезапуску (~6 год) — беремо її з гілки data репозиторію.
-const DISCOVERY = 'https://api.github.com/repos/TjmerMTA/intdeliv/contents/api.json?ref=data';
+// Спершу raw.githubusercontent.com (без ліміту, простий GET без preflight), api.github.com — лише запасний:
+// він дає 60 запитів/год на IP, а за спільним IP провайдера (CGNAT) ліміт може вичерпати хтось інший.
+const DISCOVERY = [
+['https://raw.githubusercontent.com/TjmerMTA/intdeliv/data/api.json?t=', {}],
+['https://api.github.com/repos/TjmerMTA/intdeliv/contents/api.json?ref=data&t=', { Accept: 'application/vnd.github.raw+json' }],
+];
 let DEFAULT_API = '';
 let discoveredAt = 0;
+let discoverWhy = ''; // '' — GitHub відповів; 'limit' — ліміт api.github.com; 'down' — GitHub недоступний
+// fetch з таймаутом, що покриває і читання тіла (read) — інакше завислий потік тримає вхід без кінця
+async function fetchT(url, opts = {}, ms = 8000, read = (r) => r) {
+const ac = new AbortController();
+const t = setTimeout(() => ac.abort(), ms);
+try { return await read(await fetch(url, { ...opts, signal: ac.signal })); } finally { clearTimeout(t); }
+}
 async function discover(force = false) {
 if (!force && DEFAULT_API) return DEFAULT_API;
 if (Date.now() - discoveredAt < 30000 && DEFAULT_API) return DEFAULT_API;
 discoveredAt = Date.now();
+discoverWhy = 'down';
+for (const [url, headers] of DISCOVERY) {
 try {
-const r = await fetch(DISCOVERY + '&t=' + Date.now(), { headers: { Accept: 'application/vnd.github.raw+json' }, cache: 'no-store' });
-const j = await r.json();
-if (j && /^https:\/\//.test(j.url)) DEFAULT_API = String(j.url).replace(/\/+$/, '');
-} catch { /* GitHub недоступний — лишаємо стару адресу */ }
+const j = await fetchT(url + Date.now(), { headers, cache: 'no-store' }, 8000,
+(r) => (r.headers.get('x-ratelimit-remaining') === '0' ? { limit: true } : r.json()));
+if (j?.limit) { discoverWhy = 'limit'; continue; }
+if (j && /^https:\/\//.test(j.url)) { DEFAULT_API = String(j.url).replace(/\/+$/, ''); discoverWhy = ''; break; }
+} catch { /* це джерело недоступне — пробуємо наступне */ }
+}
 return DEFAULT_API;
 }
 const LS = {
@@ -54,10 +70,10 @@ clearTimeout(t);
 if (await waitForReconnect()) continue;
 throw new Error(e.name === 'AbortError' ? 'Сервер не відповідає (' + method + ')' : 'Немає зв\'язку з сервером');
 }
-clearTimeout(t);
 setNet(true);
-if (r.status === 401) throw new AuthError('Невірний ключ доступу');
-const d = await r.json().catch(() => null);
+if (r.status === 401) { clearTimeout(t); throw new AuthError('Невірний ключ доступу'); }
+const d = await r.json().catch(() => null); // таймаут t діє і на тіло відповіді
+clearTimeout(t);
 if (!d) { if (await waitForReconnect()) continue; throw new Error('Сервер перезапускається… (' + r.status + ')'); }
 if (!d.ok) throw new Error(d.error || 'Помилка сервера');
 return d.result;
@@ -81,6 +97,7 @@ $('span', el).textContent = label || (state === true ? 'онлайн' : state ==
 // а не одразу показуємо помилку; заразом перечитуємо api.json без кешу і, якщо адреса
 // змінилась, перемикаємось на неї навіть якщо стара була збережена вручну.
 const RECONNECT_STEP_MS = 10000, RECONNECT_MAX_MS = 180000, RECONNECT_MSG = 'Сервер перезапускається, підключаюсь…';
+const LOGIN_DIAG_MS = 25000;
 let reconnectPromise = null;
 function waitForReconnect() {
 if (!reconnectPromise) reconnectPromise = doReconnect().finally(() => { reconnectPromise = null; });
@@ -95,7 +112,6 @@ el.textContent = text || '';
 async function doReconnect() {
 const started = Date.now();
 setNet('warn', RECONNECT_MSG);
-showConnHint(RECONNECT_MSG);
 while (Date.now() - started < RECONNECT_MAX_MS) {
 await new Promise((res) => setTimeout(res, RECONNECT_STEP_MS));
 const fresh = await discover(true);
@@ -110,13 +126,40 @@ headers: { 'Content-Type': 'application/json' },
 body: JSON.stringify({ method: 'ping', params: {} }),
 }).finally(() => clearTimeout(t));
 setNet(true);
-showConnHint('');
 return true;
 } catch { /* сервер ще не піднявся — пробуємо ще раз */ }
 }
 setNet(false);
-showConnHint('');
 return false;
+}
+
+// Діагностика для екрана входу: чому не вдається підключитись — щоб не висіти мовчки.
+// Сервер віддає CORS і на GET / ({name:'intdeliv'}) — це простий запит без preflight.
+async function probeServer(base) {
+try {
+const j = await fetchT(base + '/?t=' + Date.now(), { cache: 'no-store' }, 8000, (r) => r.json());
+return j?.name === 'intdeliv' ? 'ok' : 'foreign';
+} catch (e) {
+if (e.name === 'AbortError') return 'timeout';
+// cors-запит упав: якщо no-cors проходить — відповідає хтось інший (сторінка блокування антивірусу або помилка Cloudflare)
+try { await fetchT(base + '/?t=' + Date.now(), { cache: 'no-store', mode: 'no-cors' }, 8000); return 'intercepted'; } catch { return 'blocked'; }
+}
+}
+async function diagnose() {
+await discover(true);
+const base = apiBase();
+const gh = discoverWhy || 'ok';
+if (!base) {
+return { code: 'gh=' + gh, text: gh === 'limit'
+? 'GitHub тимчасово обмежив запити з вашої мережі, тож адресу сервера не отримати. Спробуйте за 10–60 хв або з іншого інтернету (наприклад, мобільного).'
+: 'GitHub недоступний — не вдається дізнатися адресу сервера. Перевірте інтернет; якщо ввімкнено VPN або антивірус із веб-захистом — спробуйте без них.' };
+}
+const srv = await probeServer(base);
+const code = 'gh=' + gh + ', srv=' + srv;
+if (srv === 'ok') return { code, base, text: 'Сервер відповідає, але вхід поки не пройшов. Якщо це триває довше хвилини — запит блокує антивірус або розширення браузера; спробуйте інший браузер.' };
+if (srv === 'timeout') return { code, base, text: 'Сервер не відповідає — можливо, саме перезапускається (1–2 хв). Продовжую спроби.' };
+return { code, base, text: (gh === 'ok' ? 'Браузер або антивірус блокує з\'єднання з сервером: GitHub відкривається, а сервер — ні. ' : 'Немає з\'єднання ні з сервером, ні з GitHub — перевірте інтернет. ')
++ 'Якщо стоїть AVG/Avast — додайте *.trycloudflare.com у винятки веб-захисту або відкрийте адмінку в іншому браузері.' };
 }
 
 // Стан
@@ -586,15 +629,34 @@ if (!key) return;
 if (api && !/^https?:\/\//.test(api)) { $('#l-err').textContent = 'Адреса має починатися з https://'; return; }
 LS.set('intdeliv.api', api);
 const btn = $('#lf .btn'); btn.disabled = true; $('#l-err').textContent = '';
+// одразу показуємо, що йде підключення, а через LOGIN_DIAG_MS без відповіді — причину, а не мовчазну бліду кнопку
+const t0 = Date.now();
+let diag = null;
+const tickHint = () => showConnHint((diag ? 'Продовжую спроби' : 'Підключаюсь до сервера') + '… ' + Math.round((Date.now() - t0) / 1000) + ' с');
+tickHint();
+const ticker = setInterval(tickHint, 1000);
+const diagT = setTimeout(async () => {
+const d = await diagnose();
+if (!btn.disabled) return; // вхід уже завершився
+diag = d; showDiag(d); tickHint();
+}, LOGIN_DIAG_MS);
 try {
 const r = await rpc('ping', {}, key);
 if (r && r.authed === false) throw new AuthError('Невірний ключ доступу');
 LS.set('intdeliv.key', key); $('#l-key').value = '';
-showConnHint('');
 start(r);
-} catch (err) { showConnHint(''); $('#l-err').textContent = err.message; }
+} catch (err) {
+if (err instanceof AuthError || !diag) $('#l-err').textContent = err.message;
+else $('#l-err').insertAdjacentHTML('beforeend', '<br>Спроби зупинено — натисніть «Увійти», щоб повторити.');
+}
+clearInterval(ticker); clearTimeout(diagT); showConnHint('');
 btn.disabled = false;
 });
+function showDiag(d) {
+$('#l-err').innerHTML = esc(d.text)
++ (d.base ? ` <a href="${esc(d.base)}/" target="_blank" rel="noopener">Перевірити сервер</a> (має відкритись текст {"name":"intdeliv"…}; сторінка антивірусу = блокування)` : '')
++ `<br><span class="muted">Код для підтримки: ${esc(d.code)}</span>`;
+}
 $('#l-demo').addEventListener('click', async (e) => { e.preventDefault(); demo = await makeDemo(); start({ version: 'demo' }); });
 document.addEventListener('click', (e) => {
 if (!e.target.closest('[data-logout]')) return;
