@@ -22,6 +22,10 @@ jobs:
       LARDI_TOKEN_2: ${{ secrets.LARDI_TOKEN_2 }}
       RUN_MINUTES: "340"
       PORT: "8787"
+      # постійна адреса (варіант 1, docs/postoyannyi-adres.md): задати секрет CF_TUNNEL_TOKEN і змінну API_URL;
+      # поки секрету немає — як і раніше quick tunnel *.trycloudflare.com
+      CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+      API_URL: ${{ vars.API_URL }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -40,12 +44,8 @@ jobs:
           for i in $(seq 1 60); do curl -fs localhost:$PORT/ >/dev/null && break; sleep 1; done
           URL=""
           for attempt in 1 2 3; do
-            cloudflared tunnel --no-autoupdate --url http://localhost:$PORT > tunnel.log 2>&1 &
-            echo $! > tunnel.pid
-            for i in $(seq 1 60); do
-              URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
-              [ -n "$URL" ] && break; sleep 1
-            done
+            bash server/tunnel.sh start
+            URL=$(bash server/tunnel.sh url 60 || true)
             if [ -n "$URL" ]; then
               for i in $(seq 1 30); do curl -fs "$URL/" >/dev/null && break 2; sleep 2; done
             fi
@@ -58,12 +58,11 @@ jobs:
           while kill -0 $(cat server.pid) 2>/dev/null; do
             sleep 30; n=$((n+1))
             tail -n 3 server.log
-            # тунель впав — піднімаємо новий і публікуємо адресу
+            # тунель впав — піднімаємо новий і публікуємо адресу (постійна адреса не змінюється — публікувати нічого)
             if ! kill -0 $(cat tunnel.pid) 2>/dev/null; then
-              cloudflared tunnel --no-autoupdate --url http://localhost:$PORT > tunnel.log 2>&1 &
-              echo $! > tunnel.pid; sleep 15
-              URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
-              [ -n "$URL" ] && bash server/persist.sh publish-url "$URL" || true
+              bash server/tunnel.sh start || true
+              NEW=$(bash server/tunnel.sh url 15 || true)
+              [ -n "$NEW" ] && [ "$NEW" != "$URL" ] && { URL=$NEW; bash server/persist.sh publish-url "$URL" || true; }
             fi
             [ $((n % 10)) -eq 0 ] && { bash server/persist.sh save || true; }
           done
