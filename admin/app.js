@@ -666,7 +666,7 @@ hid.textContent = 'Приховано заявок: ' + fmtN(c.hiddenBlack || 0)
 $('#c-add .btn').textContent = S.cList === 'black' ? 'В чорний список' : 'В обрані';
 const rows = c.items.filter((x) => x.list === S.cList);
 $('#c-rows').innerHTML = rows.map((x) => `<tr data-cid="${esc(x.id)}">
-<td data-l="Замовник"><b>${esc(x.label || '—')}</b></td>
+<td data-l="Замовник"><b>${esc(x.label || '—')}</b>${x.list === 'black' && x.live ? `<div class="c-sweep" title="Не вдалося зняти одразу (Lardi не відповідав) — рушій повторює кожні 10 хв">на Lardi ще ${esc(fmtN(x.live))} — знімаємо</div>` : ''}</td>
 <td data-l="Ключі">${(x.keys || []).map((k) => `<span class="key">${esc(keyLabel(k))}</span>`).join('')}</td>
 <td data-l="Додано" class="num">${esc(new Date(x.createdAt).toLocaleDateString('uk-UA'))}</td>
 <td data-l="Нотатка"><input class="note-in" data-note value="${esc(x.note || '')}" placeholder="—" aria-label="Нотатка"></td>
@@ -1084,6 +1084,10 @@ if (c) { c.list = list; return c; }
 const n = { id: custSeq++, list, label, note: '', keys: [key], createdAt: Date.now() };
 customers.push(n); return n;
 };
+// заготовлені: обраний і два в чорному списку — у Вінниці зняття з Lardi ще не пройшло (на Lardi ще 1 — знімаємо)
+demoAdd('white', dKey(items[0]), items[0].company).note = 'стабільно платить, пріоритет';
+demoAdd('black', dKey(items[2]), '+380 67 123 6789').note = 'не оплатив рейс';
+Object.assign(demoAdd('black', 'tel:380509998877', '050 999 88 77'), { note: 'додано вручну', createdAt: now - 3 * 86400e3 });
 let settings = { della: { searchUrls: ['https://della.com.ua/search/a204bd204eflolz1z21z3z4z51z6z7z8z9y1y2y3y4y5y6h0ilk0m1.html'], pollSeconds: 90, pagesPerPoll: 4 },
 filters: { minPrice: 8000, directOnly: true, bodies: [], fromRegions: [], toRegions: [], excludeRegions: [], stopWords: ['металобрухт'], maxAgeHours: 24 },
 lardi: { accounts: [{ name: 'Кілик В.', token: '••••4821', enabled: true, state: 'ok' }, { name: 'Друге Ларді', token: '', enabled: true, state: 'pending' }],
@@ -1102,7 +1106,7 @@ const r = visible().filter((l) => (!sts || sts.includes(l.status)) && (!p.fav ||
 .sort((a, b) => (listOf(b) === 'white') - (listOf(a) === 'white') || b.seenAt - a.seenAt);
 return { items: r.map(withFav), total: r.length };
 },
-'customers.list': () => ({ items: clone(customers).map((c) => ({ ...c, loads: items.filter((l) => c.keys.includes(dKey(l))).length, live: items.filter((l) => c.keys.includes(dKey(l)) && l.status === 'published').length })), hiddenBlack: items.filter((l) => listOf(l) === 'black').length }),
+'customers.list': () => ({ items: clone(customers).map((c) => ({ ...c, loads: items.filter((l) => c.keys.includes(dKey(l))).length, live: items.filter((l) => c.keys.includes(dKey(l))).reduce((n, l) => n + l.lardi.filter((e) => e.id && e.status === 'published').length, 0) })), hiddenBlack: items.filter((l) => listOf(l) === 'black').length }),
 'customers.preview': (p) => {
 const l = p.loadId && items.find((x) => x.id === p.loadId);
 const key = l ? dKey(l) : p.keys ? p.keys[0] : p.text && /\d{9}/.test(p.text.replace(/\D/g, '')) ? 'tel:380' + p.text.replace(/\D/g, '').slice(-9) : p.text ? 'name:' + p.text.toLowerCase() : null;

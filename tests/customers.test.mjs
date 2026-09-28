@@ -5,7 +5,7 @@ import { customerKeys, phoneKey, normCompany, parseCustomerInput, weakKeys } fro
 import { parseDellaSearch } from '../extension/lib/della.js';
 import { Store } from '../worker/src/store.js';
 import { D1Database } from '../server/d1-sqlite.mjs';
-import { setup, live, withCompanies, HTML, SCHEMA } from './helpers/harness.mjs';
+import { setup, live, withCompanies, HTML, SCHEMA, TOK_B } from './helpers/harness.mjs';
 
 const A = { code: 'A1', name: 'ТОВ «Альфа»' }; // 10 заявок фікстури проходять фільтри
 const B = { code: 'B2', name: 'Бета Транс' }; // 6 заявок
@@ -295,4 +295,76 @@ test('міграція: стара схема без custKeys і таблиць 
   assert.equal((await st.listLoads({ status: 'all', limit: 5000 })).total, 1234 - 13);
   const fresh = new D1Database(':memory:', { schemaPath: SCHEMA });
   assert.equal(await new Store(fresh).migrate(), 0, 'порожня нова база');
+});
+
+// 15
+test('добір зняття: 503 на одному акаунті — другий знято одразу, решту знімає наступний прохід staleCheck, без дублів', async () => {
+  const h = setup({ html: AB });
+  await live(h);
+  await h.engine().runCycle();
+  const pubB = (await h.list({ status: 'published' })).items.filter((l) => l.dellaCompanyId === 'B2');
+  assert.ok(pubB.length > 0);
+  const idsOn = (acc) => pubB.flatMap((l) => l.lardi.filter((e) => e.account === acc).map((e) => e.id)).sort();
+  h.lardiDownFor.add(TOK_B);
+  const r = await h.call('customers.add', { list: 'black', text: 'della:B2' });
+  assert.equal(r.affected.removed, pubB.length, 'акаунт A знято');
+  assert.equal(r.affected.failed, pubB.length, 'акаунт B — 503');
+  const black = () => h.call('customers.list', { list: 'black' }).then((x) => x.items[0]);
+  assert.equal((await black()).live, pubB.length, 'на Lardi ще N — лише публікації B');
+
+  // B досі лежить: прохід пробує лише B, A повторно не знімає
+  let n = h.throws().length;
+  await h.engine().staleCheck();
+  assert.ok(h.throws().length > n, 'спроба була');
+  assert.ok(h.throws().slice(n).every((c) => c.token === TOK_B), 'A не чіпаємо');
+  assert.equal((await black()).live, pubB.length);
+  assert.ok((await h.call('log.list', {})).some((x) => x.level === 'error' && /Добір зняття: «B»/.test(x.msg)));
+
+  // B піднявся: наступний прохід знімає залишок
+  h.lardiDownFor.clear();
+  n = h.throws().length;
+  await h.engine().staleCheck();
+  const done = h.throws().slice(n);
+  assert.ok(done.every((c) => c.token === TOK_B));
+  assert.deepEqual(done.flatMap((c) => c.body.cargoIds).sort(), idsOn(1), 'знято саме залишок на B, по одному разу');
+  assert.equal((await black()).live, 0);
+  const own = (await h.list({ customer: (await black()).id, status: 'all' })).items;
+  assert.ok(own.every((l) => l.lardi.every((e) => e.status !== 'published' && !e.error)));
+  assert.ok((await h.call('log.list', {})).some((x) => /Добір зняття з Lardi: знято/.test(x.msg)));
+
+  n = h.throws().length;
+  await h.engine().staleCheck();
+  assert.equal(h.throws().length, n, 'нічого не знімається двічі');
+});
+
+// 16
+test('добір зняття: ліміт за прохід, неактуальні (не чорні) теж, видалені — ні', async () => {
+  const h = setup({ html: AB });
+  await live(h);
+  await h.engine().runCycle();
+  const pub = (await h.list({ status: 'published' })).items;
+  const [manual, gone] = pub.filter((l) => l.dellaCompanyId === 'B2');
+  h.lardiDown = true;
+  await h.call('customers.add', { list: 'black', text: 'della:A1' });
+  await h.call('loads.unpublish', { id: manual.id });
+  await h.call('loads.delete', { id: gone.id });
+  h.lardiDown = false;
+  const pubA = pub.filter((l) => l.dellaCompanyId === 'A1');
+  const want = [...pubA, manual].flatMap((l) => l.lardi.map((e) => e.id)).sort();
+
+  const e = h.engine();
+  await e.ready();
+  const s = await e.getSettings();
+  const got = [];
+  for (let pass = 0; pass < 20; pass++) {
+    const n = h.throws().length;
+    const r = await e.sweepLardi(s, 3);
+    const ids = h.throws().slice(n).flatMap((c) => c.body.cargoIds);
+    assert.ok(ids.length <= 3, `прохід ${pass}: не більше ліміту`);
+    assert.equal(r.removed, ids.length);
+    got.push(...ids);
+    if (!ids.length) break;
+  }
+  assert.deepEqual(got.sort(), want, 'усі чорні й неактуальні, кожна рівно раз');
+  assert.ok(!got.some((id) => gone.lardi.some((x) => x.id === id)), 'видалену без зняття не чіпаємо');
 });

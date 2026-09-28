@@ -28,12 +28,13 @@ export function withCompanies(html, pick) {
 }
 
 /**
- * Токени Lardi: 'tok…' — дійсні, будь-які інші — 401. h.lardiDown = true — basket/throw відповідає 503.
+ * Токени Lardi: 'tok…' — дійсні, будь-які інші — 401. h.lardiDown = true — basket/throw відповідає 503;
+ * h.lardiDownFor — множина токенів, для яких basket/throw відповідає 503 (збій одного акаунта).
  */
 export function setup({ html = HTML, env: extraEnv = {} } = {}) {
   const clock = { t: T0 };
   const calls = { della: [], lardi: [] };
-  const h = { clock, calls, html, lardiDown: false };
+  const h = { clock, calls, html, lardiDown: false, lardiDownFor: new Set() };
   let nextId = 1000;
   const fetch = async (url, init = {}) => {
     const u = new URL(url);
@@ -56,7 +57,7 @@ export function setup({ html = HTML, env: extraEnv = {} } = {}) {
       if (path === '/references/payment/units') return ok([{ id: 1, name: 'за рейс' }]);
       if (path === '/references/areas') return ok([]);
       if (path === '/proposals/my/add/cargo' && method === 'POST') return ok({ id: nextId++ });
-      if (path === '/proposals/my/basket/throw') return h.lardiDown ? new Response('{"message":"down"}', { status: 503 }) : ok({ result: 'OK' });
+      if (path === '/proposals/my/basket/throw') return h.lardiDown || h.lardiDownFor.has(token) ? new Response('{"message":"down"}', { status: 503 }) : ok({ result: 'OK' });
       if (path === '/proposals/my/cargoes/published') return ok({ content: [], paginator: { totalSize: 3 } });
       return new Response('{"message":"not found"}', { status: 404 });
     }

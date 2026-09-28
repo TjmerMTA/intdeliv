@@ -42,6 +42,7 @@ export const BROWSER_HEADERS = {
 
 const RUN_BUDGET_MS = 25000;
 const STALE_EVERY_MS = 10 * 60e3;
+export const SWEEP_LIMIT = 100; // публікацій за один прохід добору зняття
 const clone = (o) => JSON.parse(JSON.stringify(o));
 
 // ---------- час за Києвом (Worker працює в UTC, Della — київські дати) ----------
@@ -682,6 +683,8 @@ export class Engine {
     const today = kyivDay(this.now());
     // якщо збір ще жодного разу не вдався — «не видно в Della» не рахуємо
     const seenBefore = lastOk ? lastOk - staleMs : -1;
+    // спершу добір того, що не вдалося зняти раніше; щойно неактуальні знімаються в markInactive нижче
+    await this.sweepLardi(s);
     const cands = await this.store.staleCandidates(['new', 'queued', 'published', 'needs_review', 'error'], today, seenBefore, 200);
     let n = 0;
     for (const c of cands) {
@@ -693,6 +696,59 @@ export class Engine {
     const purged = await this.store.purgeArchive(this.now() - ARCHIVE_DAYS * 86400e3);
     if (purged) await this.log('info', `Архів: видалено назавжди ${purged} заявок, старших за ${ARCHIVE_DAYS} днів`);
     return n;
+  }
+
+  /**
+   * Добір зняття з Lardi: неактуальні й чорні заявки з живими публікаціями (попереднє зняття впало — 503, мережа).
+   * Не більше limit публікацій за прохід, пакетами по акаунтах; акаунт зі збоєм у цьому проході далі не чіпаємо.
+   * Знята публікація стає removed — повторно не знімається.
+   */
+  async sweepLardi(s, limit = SWEEP_LIMIT) {
+    // заявок беремо із запасом: публікації акаунтів без токена пропускаються й не мають забирати ліміт
+    const rows = await this.store.pendingRemovals(limit * 10);
+    const byAcc = new Map(); // account → [[loadId, lardiId]]
+    const seen = new Set();
+    for (const r of rows) {
+      for (const e of r.lardi) {
+        if (seen.size >= limit) break;
+        const k = `${e.account}:${e.id}`;
+        if (!e.id || e.status !== 'published' || seen.has(k) || !this.clientFor(s, e.account)) continue;
+        seen.add(k);
+        (byAcc.get(e.account) || byAcc.set(e.account, []).get(e.account)).push([r.id, e.id]);
+      }
+    }
+    if (!seen.size) return { removed: 0, failed: 0 };
+    const res = new Map(); // `${loadId}:${account}` → null (знято) | помилка
+    let removed = 0; let failed = 0;
+    for (const [acc, pairs] of byAcc) {
+      const client = this.clientFor(s, acc);
+      for (let i = 0; i < pairs.length; i += 50) {
+        const part = pairs.slice(i, i + 50);
+        try {
+          await client.throwToBasket(part.map((x) => x[1]));
+          for (const [id] of part) res.set(`${id}:${acc}`, null);
+          removed += part.length;
+        } catch (err) {
+          for (const [id] of pairs.slice(i)) res.set(`${id}:${acc}`, err.message);
+          failed += pairs.length - i;
+          await this.log('error', `Добір зняття: «${this.accName(s, acc)}» — не вдалося зняти ${pairs.length - i}: ${err.message}`);
+          break;
+        }
+      }
+    }
+    const now = this.now();
+    for (const id of new Set([...res.keys()].map((k) => k.slice(0, k.lastIndexOf(':'))))) {
+      await this.store.updateLoad(id, (l) => ({
+        ...l,
+        lardi: (l.lardi || []).map((e) => {
+          const k = `${id}:${e.account}`;
+          if (e.status !== 'published' || !res.has(k)) return e;
+          return res.get(k) === null ? { ...e, status: 'removed', removedAt: now, error: undefined } : { ...e, error: res.get(k) };
+        }),
+      }));
+    }
+    if (removed) await this.log('info', `Добір зняття з Lardi: знято ${removed}${failed ? `, лишилось ${failed}` : ''}`);
+    return { removed, failed };
   }
 
   // ---------- RPC ----------

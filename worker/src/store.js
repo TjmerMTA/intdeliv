@@ -159,6 +159,19 @@ export class Store {
       .filter((r) => r.lardi.some((e) => e.id && e.status === 'published'));
   }
 
+  /**
+   * Добір зняття: неактуальні та чорні (не видалені) заявки, у яких лишилися живі публікації на Lardi
+   * (зняття раніше не вдалося). Найдавніше змінені — першими. {id, lardi[]}
+   */
+  async pendingRemovals(limit = 100) {
+    const { results } = await this.db.prepare(
+      `SELECT id, lardi FROM loads WHERE lardi LIKE '%"status":"published"%' AND status <> 'deleted'
+       AND (status = 'inactive' OR ${IS_BLACK}) ORDER BY updatedAt ASC LIMIT ?`,
+    ).bind(limit).all();
+    return (results || []).map((r) => ({ ...r, lardi: parse(r.lardi, []) }))
+      .filter((r) => r.lardi.some((e) => e.id && e.status === 'published'));
+  }
+
   /** Архів: неактуальні/видалені, не змінювані довше за before — видалити назавжди. */
   async purgeArchive(before) {
     const r = await this.db.prepare("DELETE FROM loads WHERE status IN ('inactive','deleted') AND updatedAt < ?").bind(before).run();
@@ -286,7 +299,8 @@ export class Store {
     const out = [];
     for (const c of results || []) {
       const row = await this.db.prepare(
-        `SELECT COUNT(*) AS n, SUM(CASE WHEN lardi LIKE '%"status":"published"%' THEN 1 ELSE 0 END) AS live
+        `SELECT COUNT(*) AS n, SUM((SELECT COUNT(*) FROM json_each(loads.lardi) j WHERE json_extract(j.value, '$.status') = 'published'
+           AND json_extract(j.value, '$.id') IS NOT NULL)) AS live
          FROM loads WHERE ${OF_CUSTOMER} AND status <> 'deleted'`,
       ).bind(c.id).first();
       out.push({ ...c, keys: await this.keysOf(c.id), loads: Number(row && row.n) || 0, live: Number(row && row.live) || 0 });
