@@ -7,7 +7,10 @@ import { fileURLToPath } from 'node:url';
 import { startServer } from '../server/run.mjs';
 import { D1Database } from '../server/d1-sqlite.mjs';
 
-const HTML = readFileSync(fileURLToPath(new URL('./fixtures/della-search.html', import.meta.url)), 'utf8');
+const RAW = readFileSync(fileURLToPath(new URL('./fixtures/della-search.html', import.meta.url)), 'utf8');
+// сервер живе за реальним годинником, а дати у фікстурі — 22.09: переносимо дати завантаження на сьогодні
+const DD_MM = new Date().toLocaleDateString('uk-UA', { day: '2-digit', month: '2-digit', timeZone: 'Europe/Kyiv' });
+const HTML = RAW.replace(/(class="date_add">)([^<]*)/g, (m, a, d) => a + d.replace(/\d{2}\.\d{2}/g, DD_MM));
 const ORIGIN = 'https://intdeliv.siteboosty.com';
 const TOKEN = 'tok-secret-123456';
 

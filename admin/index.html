@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>IntDeliv — заявки Della → Lardi</title>
-<meta name="description" content="Автоперенос заявок Della на Lardi: база вантажів, фільтри, автопублікація на два акаунти.">
+<meta name="description" content="Автоперенос заявок Della на Lardi: база вантажів, фільтри, обрані й чорний список замовників, автопублікація на кілька акаунтів.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -30,6 +30,9 @@
 <div class="logo" title="IntDeliv">ID</div>
 <button class="nav on" data-view="loads" title="Заявки">
 <svg viewBox="0 0 24 24"><path d="M3 7h11v9H3zM14 10h4l3 3v3h-7z"/><circle cx="7" cy="17.5" r="1.8"/><circle cx="17" cy="17.5" r="1.8"/></svg>
+</button>
+<button class="nav" data-view="customers" title="Замовники: обрані й чорний список">
+<svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.6-3.6 3.3-6 6.5-6s5.9 2.4 6.5 6"/><path d="m17.5 4.5 1.1 2.3 2.4.3-1.8 1.7.5 2.4-2.2-1.2-2.2 1.2.5-2.4-1.8-1.7 2.4-.3z"/></svg>
 </button>
 <button class="nav" data-view="settings" title="Налаштування">
 <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1 7 17M17 7l2.1-2.1"/></svg>
@@ -69,7 +72,9 @@
 <input data-f="fromRegion" placeholder="Із області" autocomplete="off">
 <input data-f="toRegion" placeholder="До області" autocomplete="off">
 <select data-f="payment" aria-label="Оплата"><option value="">Оплата: будь-яка</option><option value="cashless">Безнал</option><option value="cash">Готівка</option><option value="card">Картка</option><option value="vat">З ПДВ</option><option value="novat">Без ПДВ</option></select>
-<input data-f="q" placeholder="Телефон / ID" autocomplete="off">
+<select data-f="account" aria-label="Lardi"><option value="">Lardi: будь-який</option><option value="none">Не опубліковано</option></select>
+<input data-f="q" placeholder="Телефон / ID / компанія" autocomplete="off">
+<label class="chk fav-f" title="Лише заявки обраних замовників"><input type="checkbox" data-f="fav"> Обрані ★</label>
 </div>
 <div class="tabs" id="tabs" role="tablist"></div>
 <div class="tbl-wrap">
@@ -79,6 +84,21 @@
 </table>
 <div id="empty" class="empty" hidden>Немає заявок за цими фільтрами</div>
 <div class="more-wrap"><button class="btn" id="more" hidden>Показати ще</button><span id="shown" class="muted"></span></div>
+</div>
+</section>
+
+<section id="v-customers" class="view" hidden>
+<div class="log-head"><h2>Замовники</h2><span class="muted">обрані — завжди вгорі й публікуються першими; чорний список — не показуються й не публікуються</span></div>
+<div class="tabs" id="c-tabs" role="tablist"></div>
+<div class="tbl-wrap c-wrap">
+<form id="c-add" class="c-add" autocomplete="off">
+<input name="text" placeholder="Телефон, ЄДРПОУ або назва компанії" required>
+<input name="note" placeholder="Нотатка (необов'язково)">
+<button class="btn pri">Додати</button>
+</form>
+<div id="c-hidden" class="c-hidden muted" hidden></div>
+<table class="tbl ctbl"><thead><tr><th>Замовник</th><th>Ключі</th><th>Додано</th><th>Нотатка</th><th>Заявок у базі</th><th>На Lardi зараз</th><th></th></tr></thead><tbody id="c-rows"></tbody></table>
+<div id="c-empty" class="empty" hidden></div>
 </div>
 </section>
 

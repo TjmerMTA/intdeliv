@@ -69,7 +69,7 @@ body.locked .side,body.locked .main{display:none}
 .btn.pri:hover{background:var(--pri-h)}
 .btn.dan{background:var(--err);border-color:var(--err);color:#fff}
 .btn:disabled{opacity:.55;cursor:default}
-.filters{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-bottom:12px}
+.filters{display:grid;grid-template-columns:repeat(4,minmax(0,1fr)) repeat(2,minmax(0,.8fr)) minmax(0,1.2fr) auto;gap:10px;margin-bottom:12px;align-items:center}
 .filters input,.filters select,.sf input,.sf select,.sf textarea,.m-box input,.m-box select{width:100%;border:1px solid var(--line);border-radius:8px;padding:9px 11px;background:var(--card);outline:0}
 .filters input:focus,.sf input:focus,.sf textarea:focus,.sf select:focus,.m-box input:focus,.m-box select:focus{border-color:var(--pri);box-shadow:0 0 0 3px #1a73e81f}
 .tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:0;overflow-x:auto;scrollbar-width:none}
@@ -157,3 +157,36 @@ body.locked .side,body.locked .main{display:none}
 .nw{white-space:nowrap}
 .c-pay .sub{font-size:12px;line-height:1.35}
 .rtl{color:inherit;text-decoration:none}.rtl:hover{color:var(--pri);text-decoration:underline}
+
+/* обрані / чорний список */
+.fav-f{white-space:nowrap}
+.star{color:#f5a623;margin-right:2px}
+.tbl tr.fav td:first-child{box-shadow:inset 3px 0 0 #f5a623}
+.ib.fav-on{color:#f5a623}
+.ib:disabled{opacity:.35;cursor:not-allowed}.ib:disabled:hover{background:none;color:var(--mut)}
+.cust{font-size:12px;color:#4a5462;margin-top:3px}
+.c-wrap{border-top:1px solid var(--line);border-radius:var(--r);margin-top:0}
+.c-add{display:grid;grid-template-columns:2fr 2fr auto;gap:10px;padding:12px;border-bottom:1px solid var(--line)}
+.c-add input{width:100%;border:1px solid var(--line);border-radius:8px;padding:9px 11px;outline:0}
+.c-add input:focus{border-color:var(--pri);box-shadow:0 0 0 3px #1a73e81f}
+.c-hidden{padding:10px 12px;border-bottom:1px solid var(--line)}
+.c-sweep{margin-top:3px;font-size:12px;color:var(--warn)}
+.key{display:inline-block;font-size:11.5px;background:var(--bg);border-radius:5px;padding:1px 6px;margin:0 4px 3px 0;font-family:ui-monospace,Menlo,monospace}
+.note-in{width:100%;border:1px solid transparent;border-radius:6px;padding:5px 7px;background:none;min-width:120px}
+.note-in:hover,.note-in:focus{border-color:var(--line);background:var(--card);outline:0}
+.lnk{background:none;border:0;color:var(--pri);cursor:pointer;padding:0;font-weight:500}
+.warnline{background:var(--warn-b);color:#7a3e00;border-radius:8px;padding:8px 10px;margin-top:10px}
+.pubs{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:6px}.pubs td{padding:4px 6px;border-bottom:1px solid var(--line)}
+.toast .t-act{margin-left:12px;background:none;border:0;color:#8ab4f8;font-weight:500;cursor:pointer}
+/* акаунти Lardi */
+.accs{display:flex;flex-direction:column;gap:10px}
+.acc-card{border:1px solid var(--line);border-radius:var(--r);padding:12px}
+.acc-top{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.acc-top b{font-weight:500}
+.acc-stats{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12.5px;color:var(--mut);margin-top:8px}
+.acc-stats b{color:var(--tx);font-weight:500}
+.acc-acts{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;align-items:center}
+.acc-card .res{font-size:12.5px}
+.acc-card.pending{border-style:dashed}
+details.arch summary{cursor:pointer;color:var(--mut);font-size:12.5px;margin-top:6px}
+@media (max-width:760px){.c-add{grid-template-columns:1fr}.acc-top,.log-head{flex-wrap:wrap}.ctbl td.c-ac .acts{flex-wrap:wrap}}

@@ -13,7 +13,8 @@ CREATE TABLE IF NOT EXISTS loads (
   phoneDigits TEXT,
   search TEXT,                -- id, вантаж, компанія, телефон, міста, id Lardi — lowercase
   lardi TEXT,                 -- JSON масиву публікацій (легкий, для черги)
-  data TEXT NOT NULL          -- JSON повного Load
+  data TEXT NOT NULL,         -- JSON повного Load
+  custKeys TEXT               -- ключі замовника «|phone:…|name:…|» (стара база: колонку додає Store.migrate)
 );
 CREATE INDEX IF NOT EXISTS loads_status ON loads(status);
 CREATE INDEX IF NOT EXISTS loads_seenAt ON loads(seenAt);
@@ -48,3 +49,20 @@ CREATE TABLE IF NOT EXISTS counters (
   n INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (day, key)
 );
+
+-- Чорний / білий список замовників. Замовник = набір ключів; ключ належить рівно одному замовнику (одному списку).
+CREATE TABLE IF NOT EXISTS customers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  list TEXT NOT NULL CHECK (list IN ('black', 'white')),
+  label TEXT,                 -- як показувати: компанія / телефон
+  note TEXT,
+  createdAt INTEGER NOT NULL,
+  updatedAt INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS customer_keys (
+  key TEXT PRIMARY KEY,       -- della:… | edrpou:… | tel:380… | name:…
+  customerId INTEGER NOT NULL,
+  list TEXT NOT NULL          -- копія customers.list для швидкого фільтра заявок
+);
+CREATE INDEX IF NOT EXISTS customer_keys_list ON customer_keys(list);
+CREATE INDEX IF NOT EXISTS customer_keys_customer ON customer_keys(customerId);
