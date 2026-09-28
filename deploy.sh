@@ -16,7 +16,7 @@ git init -q -b gh-pages
 git add -A
 git commit -qm "deploy $(date '+%Y-%m-%d %H:%M')"
 git config --local --add credential.https://github.com.helper ""
-git config --local --add credential.https://github.com.helper osxkeychain
+git config --local --add credential.https://github.com.helper "!gh auth git-credential"
 git push -f -q https://github.com/TjmerMTA/intdeliv.git gh-pages
 rm -rf "$TMP"
 dig +short intdeliv.siteboosty.com @ns65.domaincontrol.com | grep -qi github && echo "OK: https://intdeliv.siteboosty.com/" || echo "OK: https://tjmermta.github.io/intdeliv/"
