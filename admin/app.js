@@ -264,8 +264,9 @@ msg.textContent = ok ? 'Скопійовано — вставте в повід�
 
 // Стан
 const S = {
-view: 'loads', tab: 'all', f: { fromCity: '', toCity: '', fromRegion: '', toRegion: '', payment: '', q: '' },
+view: 'loads', tab: 'all', f: { fromCity: '', toCity: '', fromRegion: '', toRegion: '', payment: '', account: '', q: '', fav: false },
 items: [], filtered: [], shown: PAGE, status: null, settings: null, version: '',
+cList: 'white', customers: null, accDraft: null,
 };
 const TABS = [
 ['all', 'Усі', (c) => sum(c, ['new', 'queued', 'published', 'needs_review', 'error', 'inactive'])],
@@ -287,10 +288,14 @@ const isOff = (l) => l.status === 'inactive' || l.status === 'deleted';
 // Утиліти UI
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
 let toastT;
-function toast(msg, err) {
+function toast(msg, err, action) {
 const el = $('#toast');
 el.textContent = msg; el.className = 'toast' + (err ? ' err' : ''); el.hidden = false;
-clearTimeout(toastT); toastT = setTimeout(() => (el.hidden = true), err ? 5000 : 2500);
+if (action) {
+const b = document.createElement('button'); b.className = 't-act'; b.textContent = action.label;
+b.onclick = () => { el.hidden = true; action.run(); }; el.append(b);
+}
+clearTimeout(toastT); toastT = setTimeout(() => (el.hidden = true), err ? 5000 : action ? 6000 : 2500);
 }
 function rel(ts) {
 if (!ts) return 'ще не було';
@@ -313,9 +318,9 @@ close() { $('#modal').hidden = true; $('#m-body').innerHTML = ''; },
 $('#modal').addEventListener('mousedown', (e) => { if (e.target.id === 'modal') modal.close(); });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('#modal').hidden) modal.close(); });
 
-function confirmBox(title, text, okLabel = 'Видалити') {
+function confirmBox(title, text, okLabel = 'Видалити', warn = '') {
 return new Promise((resolve) => {
-modal.open(`<h3>${esc(title)}</h3><p>${esc(text)}</p><div class="m-foot"><button class="btn" data-x="0">Скасувати</button><button class="btn dan" data-x="1">${esc(okLabel)}</button></div>`,
+modal.open(`<h3>${esc(title)}</h3><p>${esc(text)}</p>${warn ? `<div class="warnline">${esc(warn)}</div>` : ''}<div class="m-foot"><button class="btn" data-x="0">Скасувати</button><button class="btn dan" data-x="1">${esc(okLabel)}</button></div>`,
 (b) => {
 b.addEventListener('click', (e) => { const x = e.target.closest('[data-x]'); if (!x) return; modal.close(); resolve(x.dataset.x === '1'); });
 $('[data-x="1"]', b).focus();
@@ -339,8 +344,10 @@ const st = S.status;
 if (!st) return;
 $('#k-col').textContent = fmtN(st.today?.collected ?? 0);
 const pub = st.today?.published || [];
-$('#k-pub').innerHTML = pub.length ? pub.map((n, i) => `<span title="${esc(accName(i))}">${esc(fmtN(n))}</span>`).join(' <span class="muted">/</span> ') : '0';
-$('#k-pub').title = pub.map((n, i) => accName(i) + ': ' + n).join(', ');
+const accs = S.settings?.lardi?.accounts || [];
+const shown = pub.map((n, i) => [n, i]).filter(([n, i]) => n || (!accs[i]?.archived && accs[i]?.state !== 'pending'));
+$('#k-pub').innerHTML = shown.length ? shown.map(([n, i]) => `<span title="${esc(accName(i))}">${esc(fmtN(n))}</span>`).join(' <span class="muted">/</span> ') : '0';
+$('#k-pub').title = shown.map(([n, i]) => accName(i) + ': ' + n).join(', ');
 $('#k-q').textContent = fmtN(st.queue ?? 0);
 $('#k-sync').textContent = rel(st.lastPollAt);
 const r = $('#k-run');
@@ -403,6 +410,14 @@ return `https://della.com.ua/search/a204b0j${l.fromCityId}d204e0t${l.toCityId}fl
 }
 return /^https?:\/\//.test(l.dellaUrl || '') ? l.dellaUrl : '';
 }
+// Чи є в заявці дані про замовника (як customerKeys на сервері, спрощено) — інакше кнопки списків неактивні
+const hasCustomer = (l) => !!(l.dellaCompanyId || String(l.edrpou || '').replace(/\D/g, '').length >= 8
+|| String(l.phone || '').replace(/\D/g, '').length >= 9 || String(l.company || '').replace(/[^\p{L}\p{N}]/gu, '').length >= 4);
+const NO_CUST = 'Немає даних про замовника — впишіть телефон або компанію в редагуванні заявки';
+function custLine(l) {
+const parts = [l.company, l.phone, l.edrpou ? 'ЄДРПОУ ' + l.edrpou : ''].filter(Boolean);
+return parts.length ? `<div class="cust">${l.fav ? '<span class="star">★</span>' : ''}${esc(parts.join(' · '))}</div>` : '';
+}
 function rowHtml(l) {
 const off = isOff(l);
 const cur = CUR[l.currency] || l.currency || '';
@@ -413,9 +428,10 @@ const terms = payTerms(l);
 const dl = dellaLink(l);
 const canPub = l.status !== 'published' && l.status !== 'queued';
 const canUnpub = (l.lardi || []).some((a) => a.id && a.status !== 'removed') || l.status === 'published';
-return `<tr class="${off ? 'off' : ''}" data-id="${esc(l.id)}">
+const hc = hasCustomer(l);
+return `<tr class="${off ? 'off' : ''}${l.fav ? ' fav' : ''}" data-id="${esc(l.id)}">
 <td data-l="Дата"><div class="d1">${off ? '🚫 ' : ''}${fmtDate(l.dateFrom)}${l.dateTo && l.dateTo !== l.dateFrom ? '–' + fmtDate(l.dateTo) : ''}</div><div class="sub">${esc(l.firstSeenAt ? hhmm(l.firstSeenAt) : '')}${l.edited ? ' · ✎' : ''}</div>${off && l.updatedAt ? `<div class="sub" title="${esc(l.statusReason || '')}">в архіві до ${esc(fmtDay(l.updatedAt + ARCHIVE_MS))}</div>` : ''}</td>
-<td class="c-rt" data-l="Маршрут"><div class="rt">${dl ? `<a class="rtl" href="${esc(dl)}" target="_blank" rel="noopener noreferrer" title="Відкрити на Della">` : ''}<span class="nw"><span class="dot">•</span> ${esc(l.fromCity)}</span> → <span class="nw"><span class="dot">•</span> ${esc(l.toCity)}</span>${dl ? '</a>' : ''}</div><div class="sub">${esc(l.fromRegion)} → ${esc(l.toRegion)}${dist}</div></td>
+<td class="c-rt" data-l="Маршрут"><div class="rt">${l.fav ? '<span class="star" title="Обраний замовник">★</span>' : ''}${dl ? `<a class="rtl" href="${esc(dl)}" target="_blank" rel="noopener noreferrer" title="Відкрити на Della">` : ''}<span class="nw"><span class="dot">•</span> ${esc(l.fromCity)}</span> → <span class="nw"><span class="dot">•</span> ${esc(l.toCity)}</span>${dl ? '</a>' : ''}</div><div class="sub">${esc(l.fromRegion)} → ${esc(l.toRegion)}${dist}</div>${custLine(l)}</td>
 <td class="c-cg" data-l="Вантаж / авто"><div>${esc(l.cargo)}</div><div class="sub">${esc(l.body)}</div>${tags}</td>
 <td class="num" data-l="Вага">${l.weight != null ? esc(fmtN(l.weight)) + ' т' : '—'}</td>
 <td class="num" data-l="Об'єм">${l.volume != null ? esc(fmtN(l.volume)) + ' м³' : '—'}</td>
@@ -424,6 +440,8 @@ return `<tr class="${off ? 'off' : ''}" data-id="${esc(l.id)}">
 <td class="c-lr" data-l="Lardi">${lardiCell(l)}</td>
 <td class="c-ac"><div class="acts">
 <button class="ib" data-act="edit" title="Редагувати">${ICON.edit}</button>
+<button class="ib${l.fav ? ' fav-on' : ''}" data-act="fav" title="${hc ? (l.fav ? 'Прибрати з обраних' : 'В обрані — завжди вгорі й публікуються першими') : NO_CUST}"${hc ? '' : ' disabled'}>${l.fav ? '★' : '☆'}</button>
+<button class="ib" data-act="black" title="${hc ? 'В чорний список — не показувати й не публікувати' : NO_CUST}"${hc ? '' : ' disabled'}>🚫</button>
 ${canPub ? `<button class="ib" data-act="publish" title="${off ? 'Повернути з архіву й опублікувати' : 'Опублікувати зараз'}">${ICON.pub}</button>` : ''}
 ${canUnpub ? `<button class="ib" data-act="unpublish" title="Зняти з Lardi">${ICON.unpub}</button>` : ''}
 ${dl ? `<a class="ib" href="${esc(dl)}" target="_blank" rel="noopener noreferrer" title="Відкрити на Della">${ICON.link}</a>` : ''}
@@ -433,7 +451,7 @@ ${dl ? `<a class="ib" href="${esc(dl)}" target="_blank" rel="noopener noreferrer
 
 const norm = (s) => (s == null ? '' : String(s)).toLowerCase().replace(/[’'`ʼ]/g, "'").trim();
 function applyFilters() {
-const f = Object.fromEntries(Object.entries(S.f).map(([k, v]) => [k, norm(v)]));
+const f = Object.fromEntries(Object.entries(S.f).map(([k, v]) => [k, typeof v === 'string' ? norm(v) : v]));
 const qd = f.q.replace(/\D/g, '');
 const m = TAB_MATCH[S.tab];
 S.filtered = S.items.filter((l) => {
@@ -443,9 +461,12 @@ if (f.toCity && !norm(l.toCity).includes(f.toCity)) return false;
 if (f.fromRegion && !norm(l.fromRegion).includes(f.fromRegion)) return false;
 if (f.toRegion && !norm(l.toRegion).includes(f.toRegion)) return false;
 if (f.payment && PAY_FILTER[f.payment] && !PAY_FILTER[f.payment](l)) return false;
+if (S.f.fav && !l.fav) return false;
+if (f.account === 'none' && (l.lardi || []).some((a) => a.status === 'published')) return false;
+if (f.account !== '' && f.account !== 'none' && !(l.lardi || []).some((a) => String(a.account) === f.account && a.status === 'published')) return false;
 if (f.q) {
 const ph = String(l.phone || '').replace(/\D/g, '');
-const hit = norm(l.id).includes(f.q) || (qd.length >= 3 && ph.includes(qd)) || norm(l.company).includes(f.q) ||
+const hit = norm(l.id).includes(f.q) || (qd.length >= 3 && ph.includes(qd)) || norm(l.company).includes(f.q) || String(l.edrpou || '').includes(f.q) ||
 (l.lardi || []).some((a) => a.id && String(a.id).includes(f.q));
 if (!hit) return false;
 }
@@ -477,7 +498,9 @@ let loadSeq = 0;
 async function loadLoads() {
 const my = ++loadSeq;
 const p = { limit: 5000, offset: 0 };
-for (const k in S.f) if (S.f[k].trim()) p[k] = S.f[k].trim();
+for (const k in S.f) {
+if (typeof S.f[k] === 'boolean') { if (S.f[k]) p[k] = true; } else if (S.f[k].trim()) p[k] = S.f[k].trim();
+}
 if (S.tab === 'published' || S.tab === 'needs_review') p.status = S.tab;
 if (S.tab === 'archive') p.status = ['inactive', 'deleted'];
 try {
@@ -491,10 +514,16 @@ renderRows();
 const loadLoadsSoon = debounce(loadLoads, 150);
 
 async function loadStatus() { try { S.status = await call('status.get'); renderKpis(); } catch (e) { /* тихо */ } }
-async function loadSettings() { try { S.settings = await call('settings.get'); $('#dry').checked = !!S.settings?.lardi?.dryRun; renderBanners(); } catch (e) { toast(e.message, true); } }
+async function loadSettings() { try { S.settings = await call('settings.get'); $('#dry').checked = !!S.settings?.lardi?.dryRun; renderBanners(); fillAccountFilter(); } catch (e) { toast(e.message, true); } }
+function fillAccountFilter() {
+const sel = $('select[data-f="account"]'); if (!sel) return;
+const accs = (S.settings?.lardi?.accounts || []).map((a, i) => [a, i]).filter(([a]) => !a.archived);
+sel.innerHTML = '<option value="">Lardi: будь-який</option>' + accs.map(([a, i]) => `<option value="${i}">Lardi: ${esc(a.name || 'Акаунт ' + (i + 1))}</option>`).join('') + '<option value="none">Не опубліковано</option>';
+sel.value = S.f.account;
+}
 
-$$('.filters input, .filters select').forEach((inp) => inp.addEventListener(inp.tagName === 'SELECT' ? 'change' : 'input', () => {
-S.f[inp.dataset.f] = inp.value; S.shown = PAGE;
+$$('.filters input, .filters select').forEach((inp) => inp.addEventListener(inp.tagName === 'SELECT' || inp.type === 'checkbox' ? 'change' : 'input', () => {
+S.f[inp.dataset.f] = inp.type === 'checkbox' ? inp.checked : inp.value; S.shown = PAGE;
 applyFilters(); renderRows();   // миттєво локально
 loadLoadsSoon();                // і на сервері (дебаунс 150 мс)
 }));
@@ -518,6 +547,8 @@ const l = byId(id); if (!l) return;
 const act = b.dataset.act;
 try {
 if (act === 'edit') return editLoad(l);
+if (act === 'fav') return toggleFav(l, b);
+if (act === 'black') return toBlack(l, b);
 if (act === 'publish') { b.disabled = true; replaceLoad(await call('loads.publish', { id })); toast('Поставлено в чергу на публікацію'); }
 if (act === 'unpublish') { b.disabled = true; replaceLoad(await call('loads.unpublish', { id })); toast('Знято з Lardi'); }
 if (act === 'delete') {
@@ -535,7 +566,7 @@ const EDIT_FIELDS = [
 ['fromCity', 'Із міста'], ['fromRegion', 'Із області'], ['toCity', 'До міста'], ['toRegion', 'До області'],
 ['distanceKm', 'Відстань, км', 'number'], ['cargo', 'Вантаж'], ['body', 'Тип кузова'],
 ['weight', 'Вага, т', 'number'], ['volume', "Об'єм, м³", 'number'], ['price', 'Ціна', 'number'],
-['currency', 'Валюта', ['UAH', 'USD', 'EUR']], ['payment', 'Оплата'], ['company', 'Компанія'], ['phone', 'Телефон'],
+['currency', 'Валюта', ['UAH', 'USD', 'EUR']], ['payment', 'Оплата'], ['company', 'Компанія'], ['phone', 'Телефон'], ['edrpou', 'ЄДРПОУ'],
 ['status', 'Статус', ['new', 'queued', 'published', 'needs_review', 'error', 'inactive']],
 ];
 function editLoad(l) {
@@ -546,10 +577,13 @@ const input = Array.isArray(type)
 : `<input name="${k}" type="${type || 'text'}"${type === 'number' ? ' step="any" min="0"' : ''} value="${esc(v)}">`;
 return `<label class="fld">${esc(label)}${input}</label>`;
 }).join('');
+const pubs = (l.lardi || []).length ? `<h4>Публікації на Lardi</h4><table class="pubs">${l.lardi.map((a) => `<tr><td>${esc(accName(a.account))}</td><td>${a.id ? 'Lardi id ' + esc(a.id) : '—'}</td><td>${chip(a.status || (a.error ? 'error' : 'queued'), '', a.error)}</td><td class="muted">${a.publishedAt ? esc(new Date(a.publishedAt).toLocaleString('uk-UA')) : ''}</td></tr>`).join('')}</table>` : '';
+const hc = hasCustomer(l);
 modal.open(`<h3>Редагувати заявку</h3><form id="ef"><div class="grid">${f}
-<label class="fld wide">Мітки (через кому)<input name="tags" value="${esc((l.tags || []).join(', '))}"></label></div>
-<div class="m-foot"><button type="button" class="btn" data-close>Скасувати</button><button class="btn pri">Зберегти</button></div></form>`, (b) => {
+<label class="fld wide">Мітки (через кому)<input name="tags" value="${esc((l.tags || []).join(', '))}"></label></div>${pubs}
+<div class="m-foot"><button type="button" class="btn" data-lst="fav"${hc ? '' : ` disabled title="${esc(NO_CUST)}"`}>${l.fav ? '★ Прибрати з обраних' : '☆ В обрані'}</button><button type="button" class="btn" data-lst="black"${hc ? '' : ` disabled title="${esc(NO_CUST)}"`}>🚫 В чорний список</button><span style="flex:1"></span><button type="button" class="btn" data-close>Скасувати</button><button class="btn pri">Зберегти</button></div></form>`, (b) => {
 $('[data-close]', b).onclick = modal.close;
+$$('[data-lst]', b).forEach((x) => { x.onclick = () => { modal.close(); (x.dataset.lst === 'fav' ? toggleFav : toBlack)(l, x); }; });
 $('#ef', b).onsubmit = async (e) => {
 e.preventDefault();
 const fd = new FormData(e.target); const patch = { edited: true };
@@ -569,6 +603,135 @@ try { replaceLoad(await call('loads.update', { id: l.id, patch })); modal.close(
 catch (err) { toast(err.message, true); btn.disabled = false; }
 };
 });
+}
+
+// Обрані / чорний список
+function keyLabel(k) {
+const [t, v] = [k.slice(0, k.indexOf(':')), k.slice(k.indexOf(':') + 1)];
+if (t === 'tel') return '+' + v.replace(/^(\d{3})(\d{2})(\d{3})(\d{2})(\d{2})$/, '$1 $2 $3 $4 $5');
+if (t === 'edrpou') return 'ЄДРПОУ ' + v;
+if (t === 'della') return 'Della #' + v;
+return '«' + v + '»';
+}
+function blackText(pv) {
+const live = Object.entries(pv.live || {}).map(([n, c]) => `${n}: ${c}`).join(', ');
+return `Замовник «${pv.label}» (${pv.keys.map(keyLabel).join(', ')}). Приховаємо заявок у базі: ${pv.loads}; з Lardi буде знято публікацій: ${pv.liveTotal}${live ? ' (' + live + ')' : ''}. Нові заявки цього замовника з Della не збиратимуться.`;
+}
+const WEAK = 'Замовника визначено лише за назвою — може збігтися з іншою компанією з такою самою назвою.';
+function blackDone(a) {
+return `У чорному списку. Приховано: ${a?.hidden ?? 0}, знято з Lardi: ${a?.removed ?? 0}${a?.failed ? ', не вдалося зняти: ' + a.failed + ' (див. Журнал)' : ''}`;
+}
+async function toBlack(l, b) {
+let pv;
+try { pv = await call('customers.preview', { loadId: l.id }); } catch (e) { return toast(e.message, true); }
+if (!(await confirmBox('Додати в чорний список?', blackText(pv), 'В чорний список', pv.weak ? WEAK : ''))) return;
+if (b) b.disabled = true;
+try { const r = await call('customers.add', { list: 'black', loadId: l.id }); toast(blackDone(r.affected), !!r.affected?.failed); }
+catch (e) { toast(e.message, true); }
+if (b) b.disabled = false;
+loadLoads(); loadStatus(); if (S.customers) loadCustomers();
+}
+async function toggleFav(l, b) {
+if (b) b.disabled = true;
+try {
+const pv = await call('customers.preview', { loadId: l.id });
+if (pv.list === 'white') {
+await call('customers.remove', { id: pv.customerId });
+toast('Прибрано з обраних');
+} else {
+const r = await call('customers.add', { list: 'white', loadId: l.id });
+const undo = async () => {
+try { await call(pv.list === 'black' ? 'customers.move' : 'customers.remove', { id: r.customer.id, list: 'black' }); toast('Скасовано'); }
+catch (e) { toast(e.message, true); }
+loadLoads(); loadStatus();
+};
+toast(`«${r.customer.label || 'Замовник'}» — в обраних ★`, false, { label: 'Скасувати', run: undo });
+}
+} catch (e) { toast(e.message, true); }
+if (b) b.disabled = false;
+loadLoads(); loadStatus(); if (S.customers) loadCustomers();
+}
+async function loadCustomers() {
+try { S.customers = await call('customers.list', {}); } catch (e) { toast(e.message, true); return; }
+renderCustomers();
+}
+function renderCustomers() {
+const c = S.customers || { items: [], hiddenBlack: 0 };
+const cnt = (k) => c.items.filter((x) => x.list === k).length;
+$('#c-tabs').innerHTML = [['white', 'Обрані ★'], ['black', 'Чорний список']].map(([k, label]) =>
+`<button class="tab${S.cList === k ? ' on' : ''}" data-cl="${k}">${label}<span class="n">${fmtN(cnt(k))}</span></button>`).join('');
+const hid = $('#c-hidden');
+hid.hidden = S.cList !== 'black';
+hid.textContent = 'Приховано заявок: ' + fmtN(c.hiddenBlack || 0);
+$('#c-add .btn').textContent = S.cList === 'black' ? 'В чорний список' : 'В обрані';
+const rows = c.items.filter((x) => x.list === S.cList);
+$('#c-rows').innerHTML = rows.map((x) => `<tr data-cid="${esc(x.id)}">
+<td data-l="Замовник"><b>${esc(x.label || '—')}</b></td>
+<td data-l="Ключі">${(x.keys || []).map((k) => `<span class="key">${esc(keyLabel(k))}</span>`).join('')}</td>
+<td data-l="Додано" class="num">${esc(new Date(x.createdAt).toLocaleDateString('uk-UA'))}</td>
+<td data-l="Нотатка"><input class="note-in" data-note value="${esc(x.note || '')}" placeholder="—" aria-label="Нотатка"></td>
+<td data-l="Заявок у базі" class="num">${x.loads ? `<button type="button" class="lnk" data-c="loads">${esc(fmtN(x.loads))}</button>` : '0'}</td>
+<td data-l="На Lardi зараз" class="num">${esc(fmtN(x.live))}</td>
+<td class="c-ac"><div class="acts"><button type="button" class="btn" data-c="move">${x.list === 'black' ? 'В обрані' : 'В чорний список'}</button><button type="button" class="btn" data-c="remove">Прибрати</button></div></td></tr>`).join('');
+const em = $('#c-empty');
+em.hidden = rows.length > 0;
+em.textContent = S.cList === 'black'
+? 'Чорний список порожній. Натисніть 🚫 у рядку заявки або впишіть вище телефон, ЄДРПОУ чи назву — заявки такого замовника не показуватимуться й не публікуватимуться на Lardi.'
+: 'Обраних ще немає. Натисніть ☆ у рядку заявки або впишіть замовника вище — його заявки завжди вгорі списку й публікуються першими.';
+}
+$('#c-tabs').addEventListener('click', (e) => { const b = e.target.closest('[data-cl]'); if (!b) return; S.cList = b.dataset.cl; renderCustomers(); });
+$('#c-add').addEventListener('submit', async (e) => {
+e.preventDefault();
+const fd = new FormData(e.target); const text = String(fd.get('text') || '').trim(); const note = String(fd.get('note') || '').trim();
+const list = S.cList; const btn = $('.btn', e.target);
+try {
+if (list === 'black') {
+const pv = await call('customers.preview', { text });
+if (!(await confirmBox('Додати в чорний список?', blackText(pv), 'В чорний список', pv.weak ? WEAK : ''))) return;
+}
+btn.disabled = true;
+const r = await call('customers.add', { list, text, note });
+e.target.reset();
+toast(list === 'black' ? blackDone(r.affected) : `«${r.customer.label}» — в обраних ★`, !!r.affected?.failed);
+} catch (err) { toast(err.message, true); }
+btn.disabled = false; loadCustomers(); loadStatus();
+});
+$('#c-rows').addEventListener('change', async (e) => {
+const inp = e.target.closest('[data-note]'); if (!inp) return;
+try { await call('customers.update', { id: Number(inp.closest('tr').dataset.cid), note: inp.value }); toast('Нотатку збережено'); } catch (err) { toast(err.message, true); }
+});
+$('#c-rows').addEventListener('click', async (e) => {
+const b = e.target.closest('[data-c]'); if (!b) return;
+const id = Number(b.closest('tr').dataset.cid);
+const x = (S.customers?.items || []).find((c) => c.id === id); if (!x) return;
+try {
+if (b.dataset.c === 'loads') return showCustomerLoads(x);
+if (b.dataset.c === 'remove') {
+const txt = x.list === 'black' ? `«${x.label}» прибрати з чорного списку? Актуальні заявки повернуться в роботу (і в чергу публікації), минулі лишаться в Архіві.` : `«${x.label}» прибрати з обраних?`;
+if (!(await confirmBox('Прибрати зі списку?', txt, 'Прибрати'))) return;
+b.disabled = true;
+const r = await call('customers.remove', { id });
+toast(r?.restored ? `Прибрано, повернуто заявок: ${r.restored}` : 'Прибрано зі списку');
+} else {
+const to = x.list === 'black' ? 'white' : 'black';
+if (to === 'black') {
+const pv = await call('customers.preview', { keys: x.keys, label: x.label });
+if (!(await confirmBox('Перенести в чорний список?', blackText(pv), 'В чорний список', pv.weak ? WEAK : ''))) return;
+}
+b.disabled = true;
+const r = await call('customers.move', { id, list: to });
+toast(to === 'black' ? blackDone(r.affected) : `Перенесено в обрані${r.affected?.restored ? ', повернуто заявок: ' + r.affected.restored : ''}`, !!r.affected?.failed);
+}
+} catch (err) { toast(err.message, true); }
+loadCustomers(); loadStatus();
+});
+async function showCustomerLoads(x) {
+let r;
+try { r = await call('loads.list', { customer: x.id, status: 'all', limit: 300 }); } catch (e) { return toast(e.message, true); }
+const items = r?.items || [];
+modal.open(`<h3>${esc(x.label || 'Замовник')} — заявки (${fmtN(r?.total ?? items.length)})</h3>
+<table class="pubs">${items.map((l) => `<tr><td>${fmtDate(l.dateFrom)}</td><td>${esc(l.fromCity)} → ${esc(l.toCity)}</td><td>${l.price ? esc(fmtN(l.price)) + ' ' + esc(CUR[l.currency] || '') : ''}</td><td>${chip(l.status, '', l.statusReason)}</td></tr>`).join('')}</table>
+<div class="m-foot"><button type="button" class="btn" data-close>Закрити</button></div>`, (b) => { $('[data-close]', b).onclick = modal.close; });
 }
 
 // KPI дії
@@ -613,8 +776,7 @@ const list = (a) => (a || []).join(', ');
 function renderSettings() {
 const s = S.settings || {};
 const d = s.della || {}, f = s.filters || {}, L = s.lardi || {};
-const accs = (L.accounts && L.accounts.length ? L.accounts : [{}, {}]).slice(0, 2);
-while (accs.length < 2) accs.push({});
+S.accDraft = (L.accounts && L.accounts.length ? L.accounts : [{}]).map((a) => ({ ...a }));
 const num = (name, label, v, extra = '') => `<label class="fld">${label}<input name="${name}" type="number" min="0" value="${esc(v ?? '')}" ${extra}></label>`;
 const txt = (name, label, v, ph = '') => `<label class="fld">${label}<input name="${name}" value="${esc(v ?? '')}" placeholder="${esc(ph)}"></label>`;
 const chk = (name, label, v) => `<label class="chk"><input type="checkbox" name="${name}"${v ? ' checked' : ''}> ${label}</label>`;
@@ -635,14 +797,11 @@ ${txt('excludeRegions', 'Виключити області', list(f.excludeRegio
 <div class="fld" style="justify-content:flex-end">${chk('directOnly', 'Лише прямий замовник', f.directOnly)}</div></div></div>
 
 <div class="card"><h3>Lardi — куди публікувати</h3>
-<p class="help">Токен API: увійдіть на <a href="https://lardi-trans.com/" target="_blank" rel="noopener">lardi-trans.com</a> → <b>Налаштування → API</b> → створіть/скопіюйте ключ і вставте сюди. Для кожного акаунта свій токен. Збережений токен показано як <code>••••1234</code> — щоб не змінювати, залиште як є.</p>
-${accs.map((a, i) => `<div class="acc" data-acc="${i}">
-${txt('acc' + i + 'name', 'Назва акаунта ' + (i + 1), a.name, 'Акаунт ' + (i + 1))}
-<label class="fld">Токен API${a.token ? ' · збережено ' + esc(a.token) : ''}<input name="acc${i}token" type="password" autocomplete="new-password" value="${esc(a.token || '')}"></label>
-${chk('acc' + i + 'enabled', 'Увімкнено', a.enabled)}
-<button type="button" class="btn" data-test="${i}">Перевірити</button><div class="res muted" id="res${i}"></div></div>`).join('')}
+<p class="help">Токен API: увійдіть на <a href="https://lardi-trans.com/" target="_blank" rel="noopener">lardi-trans.com</a> потрібним акаунтом → <b>Налаштування → API</b> → створіть/скопіюйте ключ і вставте сюди. Для кожного акаунта свій токен. Токен зберігається лише в зашифрованій базі на сервері; тут його видно як <code>••••1234</code> — щоб не змінювати, залиште як є. Акаунт без токена «очікує підключення» й нічого не публікує.</p>
+<div class="accs" id="accs"></div>
+<div class="acc-acts"><button type="button" class="btn" id="acc-add">＋ Додати акаунт</button><span class="muted" id="acc-max"></span></div>
 <div class="grid" style="margin-top:12px">
-<label class="fld">Режим<select name="mode"><option value="both"${L.mode !== 'roundrobin' ? ' selected' : ''}>На обидва акаунти</option><option value="roundrobin"${L.mode === 'roundrobin' ? ' selected' : ''}>По черзі (roundrobin)</option></select></label>
+<label class="fld">Режим<select name="mode"><option value="both"${L.mode !== 'roundrobin' ? ' selected' : ''}>На всі акаунти (дублювати)</option><option value="roundrobin"${L.mode === 'roundrobin' ? ' selected' : ''}>По черзі (roundrobin)</option></select></label>
 ${num('intervalSeconds', 'Пауза між публікаціями, с', L.intervalSeconds)}${num('dailyLimit', 'Ліміт на акаунт за добу', L.dailyLimit ?? 500)}
 ${txt('note', 'Примітка до заявки', L.note)}
 <div class="fld" style="justify-content:flex-end;gap:8px">${chk('autoPublish', 'Автопублікація', L.autoPublish)}${chk('dryRun', 'Тестовий режим (нічого не публікується)', L.dryRun)}</div></div></div>
@@ -651,6 +810,55 @@ ${txt('note', 'Примітка до заявки', L.note)}
 <div class="grid">${num('staleHours', 'Неактуальна після, год', s.staleHours ?? 6)}</div></div>
 
 <div class="save-bar"><button class="btn pri">Зберегти налаштування</button><span class="muted" id="sf-st"></span></div>`;
+renderAccs();
+}
+const MAX_ACCOUNTS = 5;
+const ACC_ST = {
+ok: ['c-ok', 'Підключено'], unchecked: ['c-info', 'Токен не перевірено'], pending: ['c-warn', 'Очікує підключення'],
+invalid: ['c-err', 'Токен відхилено — на паузі'], disabled: ['c-off', 'Вимкнено'],
+};
+function accStateOf(a) {
+if (a.archived || a.enabled === false) return 'disabled';
+if (!a.token) return 'pending';
+return a.state === 'invalid' ? 'invalid' : a.state === 'unchecked' ? 'unchecked' : 'ok';
+}
+// значення полів карток → чернетка (перед перемальовуванням і збереженням)
+function syncAccDraft() {
+const fd = new FormData($('#sf'));
+S.accDraft.forEach((a, i) => {
+if (a.archived || !$(`[data-acc="${i}"]`)) return;
+a.name = String(fd.get('acc' + i + 'name') || '').trim();
+a.token = String(fd.get('acc' + i + 'token') || '').trim();
+a.enabled = fd.get('acc' + i + 'enabled') === 'on';
+});
+}
+function accCard(a, i) {
+const state = accStateOf(a);
+const [cls, label] = ACC_ST[state];
+const st = (S.status?.accounts || [])[i];
+const saved = i < (S.settings?.lardi?.accounts?.length || 0);
+const num = (n) => esc(fmtN(n || 0));
+return `<div class="acc-card ${state}" data-acc="${i}">
+<div class="acc-top"><b>${esc(a.name || 'Акаунт ' + (i + 1))}</b><span class="chip ${cls}">${label}</span>${saved ? '' : '<span class="muted">новий — збережіть</span>'}</div>
+<div class="grid">${txtFld('acc' + i + 'name', 'Назва акаунта', a.name, 'Акаунт ' + (i + 1))}
+<label class="fld">Токен API${a.token ? ' · збережено ' + esc(a.token) : ' · не підключено'}<input name="acc${i}token" type="password" autocomplete="new-password" value="${esc(a.token || '')}" placeholder="вставте токен з Lardi"></label>
+<div class="fld" style="justify-content:flex-end"><label class="chk"><input type="checkbox" name="acc${i}enabled"${a.enabled !== false ? ' checked' : ''}> Увімкнено</label></div></div>
+${st && saved ? `<div class="acc-stats"><span>Сьогодні: <b>${num(st.today?.published)}</b>${st.today?.dry ? ` (тест: ${num(st.today.dry)})` : ''} з ${st.today?.limit ? num(st.today.limit) : '∞'}</span><span>На Lardi зараз: <b>${num(st.live)}</b></span><span>Помилок: <b>${num(st.errors)}</b></span><span>Остання публікація: <b>${st.lastPublishAt ? esc(rel(st.lastPublishAt)) : '—'}</b></span></div>` : ''}
+${a.lastError && state !== 'pending' ? `<div class="res c-err">✗ ${esc(a.lastError)}</div>` : ''}
+<div class="acc-acts"><button type="button" class="btn" data-test="${i}">Перевірити</button>
+${saved && state === 'ok' && S.settings?.lardi?.mode !== 'roundrobin' ? `<button type="button" class="btn" data-backfill="${i}" title="Поставити в чергу актуальні опубліковані заявки, яких на цьому акаунті ще немає">Опублікувати й сюди актуальні заявки</button>` : ''}
+<button type="button" class="btn" data-archive="${i}">Видалити</button><div class="res muted" id="res${i}"></div></div></div>`;
+}
+function txtFld(name, label, v, ph = '') { return `<label class="fld">${label}<input name="${name}" value="${esc(v ?? '')}" placeholder="${esc(ph)}"></label>`; }
+function renderAccs() {
+const box = $('#accs'); if (!box) return;
+const act = S.accDraft.map((a, i) => [a, i]).filter(([a]) => !a.archived);
+const arch = S.accDraft.map((a, i) => [a, i]).filter(([a]) => a.archived);
+box.innerHTML = act.map(([a, i]) => accCard(a, i)).join('')
++ (arch.length ? `<details class="arch"><summary>Видалені акаунти (${arch.length})</summary>${arch.map(([a, i]) => `<div class="acc-acts"><span>${esc(a.name || 'Акаунт ' + (i + 1))}</span><button type="button" class="btn" data-restore="${i}">Повернути</button></div>`).join('')}</details>` : '');
+const full = S.accDraft.length >= MAX_ACCOUNTS;
+$('#acc-add').disabled = full;
+$('#acc-max').textContent = full ? `максимум ${MAX_ACCOUNTS} акаунтів` : '';
 }
 const splitList = (v) => String(v || '').split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
 const numOr = (v, d) => (String(v).trim() === '' || isNaN(Number(v)) ? d : Number(v));
@@ -664,7 +872,8 @@ pollSeconds: numOr(g('pollSeconds'), old.della?.pollSeconds ?? 90), pagesPerPoll
 filters: { minPrice: numOr(g('minPrice'), 8000), directOnly: on('directOnly'), bodies: splitList(g('bodies')),
 fromRegions: splitList(g('fromRegions')), toRegions: splitList(g('toRegions')), excludeRegions: splitList(g('excludeRegions')),
 stopWords: splitList(g('stopWords')), maxAgeHours: numOr(g('maxAgeHours'), old.filters?.maxAgeHours ?? 24) },
-lardi: { accounts: [0, 1].map((i) => ({ name: String(g('acc' + i + 'name') || '').trim(), token: String(g('acc' + i + 'token') || '').trim(), enabled: on('acc' + i + 'enabled') })),
+lardi: { accounts: (syncAccDraft(), S.accDraft).map((a) => (a.archived ? { name: a.name, token: '', enabled: false, archived: true }
+: { name: a.name, token: a.token || '', enabled: a.enabled !== false, ...(a.restore ? { restore: true } : {}) })),
 mode: g('mode') === 'roundrobin' ? 'roundrobin' : 'both', autoPublish: on('autoPublish'), dryRun: on('dryRun'),
 intervalSeconds: numOr(g('intervalSeconds'), old.lardi?.intervalSeconds ?? 20), dailyLimit: numOr(g('dailyLimit'), 500), note: String(g('note') || '') },
 staleHours: numOr(g('staleHours'), 6),
@@ -679,13 +888,41 @@ renderSettings(); renderBanners(); renderKpis(); toast('Налаштування
 } catch (err) { toast(err.message, true); btn.disabled = false; }
 });
 $('#sf').addEventListener('click', async (e) => {
+if (e.target.closest('#acc-add')) {
+syncAccDraft();
+if (S.accDraft.length < MAX_ACCOUNTS) S.accDraft.push({ name: 'Акаунт ' + (S.accDraft.length + 1), token: '', enabled: true });
+renderAccs(); return;
+}
+const ar = e.target.closest('[data-archive]');
+if (ar) {
+const i = Number(ar.dataset.archive); syncAccDraft();
+const a = S.accDraft[i]; const live = (S.status?.accounts || [])[i]?.live || 0;
+if (!(await confirmBox('Видалити акаунт?', `«${a.name || 'Акаунт ' + (i + 1)}» буде вимкнено, а токен стерто. Вже опубліковані з нього заявки (${live}) лишаться на Lardi — зняти їх можна кнопкою «Зняти все з Lardi» до видалення. Акаунт можна повернути, вставивши токен знову.`, 'Видалити'))) return;
+if (i >= (S.settings?.lardi?.accounts?.length || 0)) { S.accDraft.splice(i, 1); renderAccs(); return; } // ще не збережений
+a.archived = true; $('#sf').requestSubmit(); return;
+}
+const rs = e.target.closest('[data-restore]');
+if (rs) { syncAccDraft(); const a = S.accDraft[Number(rs.dataset.restore)]; a.archived = false; a.restore = true; a.enabled = true; renderAccs(); toast('Вставте токен і збережіть'); return; }
+const bf = e.target.closest('[data-backfill]');
+if (bf) {
+const i = Number(bf.dataset.backfill);
+try {
+const pv = await call('lardi.backfill', { accountIndex: i, dryRunOnly: true });
+if (!pv?.candidates) return toast('Немає актуальних заявок, яких бракує на цьому акаунті');
+if (!(await confirmBox('Опублікувати й на цей акаунт?', `У чергу стане ${pv.candidates} актуальних опублікованих заявок, яких на «${accName(i)}» ще немає (обрані — першими, у межах добового ліміту).`, 'Поставити в чергу'))) return;
+const r = await call('lardi.backfill', { accountIndex: i });
+toast(`У черзі: ${r?.queued ?? 0}`); loadStatus();
+} catch (err) { toast(err.message, true); }
+return;
+}
 const b = e.target.closest('[data-test]'); if (!b) return;
 const i = Number(b.dataset.test); const res = $('#res' + i);
-b.disabled = true; res.className = 'res muted'; res.textContent = 'Перевіряю… (спочатку збережіть новий токен)';
+const typed = String($(`[name="acc${i}token"]`)?.value || '').trim();
+b.disabled = true; res.className = 'res muted'; res.textContent = 'Перевіряю…';
 try {
-const r = await call('lardi.test', { accountIndex: i });
+const r = await call('lardi.test', { accountIndex: i, ...(typed && !typed.startsWith('••') ? { token: typed } : {}) });
 res.className = 'res ' + (r?.ok ? 'c-ok' : 'c-err');
-res.textContent = r?.ok ? '✓ Токен працює' + (r.name ? ': ' + r.name : '') : '✗ ' + (r?.error || 'Помилка');
+res.textContent = r?.ok ? '✓ Токен працює' + (r.name ? ': ' + r.name : '') + (typed && !typed.startsWith('••') ? ' — натисніть «Зберегти налаштування»' : '') : '✗ ' + (r?.error || 'Помилка');
 } catch (err) { res.className = 'res c-err'; res.textContent = '✗ ' + err.message; }
 b.disabled = false;
 });
@@ -706,7 +943,8 @@ S.view = view;
 $$('.nav').forEach((b) => b.classList.toggle('on', b.dataset.view === view));
 $$('.view').forEach((v) => (v.hidden = v.id !== 'v-' + view));
 if (view === 'loads') loadLoads();
-if (view === 'settings') { renderSettings(); loadSettings().then(renderSettings); }
+if (view === 'settings') { renderSettings(); Promise.all([loadSettings(), loadStatus()]).then(renderSettings); }
+if (view === 'customers') { renderCustomers(); loadCustomers(); }
 if (view === 'log') loadLog();
 if (location.hash !== '#' + view) history.replaceState(null, '', '#' + view);
 }
@@ -776,7 +1014,7 @@ boot();
 async function boot() {
 renderTabs(); renderBanners();
 await Promise.all([loadSettings(), loadStatus()]);
-go(['settings', 'log'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'loads');
+go(['settings', 'log', 'customers'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'loads');
 }
 // Опитування замість пушів
 const visible = () => document.visibilityState === 'visible';
@@ -828,13 +1066,27 @@ const seen = now - i * 0.7 * H;
 return { id: 'd_' + (0x5f3a91c + i * 7919).toString(16) + 'e2', source: 'della',
 dateFrom: status === 'inactive' ? day(-2) : day(i % 3), fromCity, fromRegion, toCity, toRegion, distanceKm, cargo, body, weight,
 volume: volume || undefined, price, pricePerKm: Math.round(price / distanceKm), currency: 'UAH', payment, tags: TAGS[i % 4],
-directCustomer: i % 4 !== 3, phone: '+38067' + String(1234567 + i * 1111).slice(0, 7), dellaUrl: 'https://della.com.ua/', status, statusReason: status === 'needs_review' ? 'Не вдалося зіставити місто або кузов з Lardi' : status === 'inactive' ? 'Дата завантаження минула' : '',
+directCustomer: i % 4 !== 3, phone: i % 5 === 4 ? undefined : '+38067' + String(1234567 + i * 1111).slice(0, 7),
+company: ['ТОВ «Агроплюс»', 'Логістик-Юг', undefined, 'ФОП Коваль', 'ТОВ «Меблі Захід»'][i % 5], dellaUrl: 'https://della.com.ua/', status, statusReason: status === 'needs_review' ? 'Не вдалося зіставити місто або кузов з Lardi' : status === 'inactive' ? 'Дата завантаження минула' : '',
 lardi: lardi.map(([st, id, err], a) => ({ account: a, status: st, id: id || undefined, error: err })),
 seenAt: seen, firstSeenAt: seen - H, updatedAt: seen };
 });
+// замовник заявки в демо — за телефоном
+const dKey = (l) => (l.phone ? 'tel:' + String(l.phone).replace(/\D/g, '').slice(-12) : null);
+let customers = [];
+let custSeq = 1;
+const listOf = (l) => { const k = dKey(l); const c = k && customers.find((x) => x.keys.includes(k)); return c ? c.list : null; };
+const visible = () => items.filter((l) => listOf(l) !== 'black');
+const withFav = (l) => ({ ...clone(l), ...(listOf(l) === 'white' ? { fav: true } : {}) });
+const demoAdd = (list, key, label) => {
+const c = customers.find((x) => x.keys.includes(key));
+if (c) { c.list = list; return c; }
+const n = { id: custSeq++, list, label, note: '', keys: [key], createdAt: Date.now() };
+customers.push(n); return n;
+};
 let settings = { della: { searchUrls: ['https://della.com.ua/search/a204bd204eflolz1z21z3z4z51z6z7z8z9y1y2y3y4y5y6h0ilk0m1.html'], pollSeconds: 90, pagesPerPoll: 4 },
 filters: { minPrice: 8000, directOnly: true, bodies: [], fromRegions: [], toRegions: [], excludeRegions: [], stopWords: ['металобрухт'], maxAgeHours: 24 },
-lardi: { accounts: [{ name: 'Софія', token: '••••4821', enabled: true }, { name: 'Логістик-2', token: '••••0937', enabled: true }],
+lardi: { accounts: [{ name: 'Кілик В.', token: '••••4821', enabled: true, state: 'ok' }, { name: 'Друге Ларді', token: '', enabled: true, state: 'pending' }],
 mode: 'both', autoPublish: true, dryRun: true, intervalSeconds: 20, dailyLimit: 500, note: '' }, staleHours: 6 };
 const counts = () => items.reduce((c, l) => ((c[l.status] = (c[l.status] || 0) + 1), c), {});
 const logs = [['info', 'Зібрано 25 заявок зі сторінки 1, нових: 3'], ['info', 'Опубліковано на Lardi (Софія): Полтава → Харків'], ['warn', 'needs_review: не знайдено кузов «цільномет» на Lardi'], ['error', 'Lardi 429 — повтор через 30 с']]
@@ -843,18 +1095,53 @@ const clone = (x) => JSON.parse(JSON.stringify(x));
 const upd = (id, fn) => { const l = items.find((x) => x.id === id); if (!l) throw new Error('Заявку не знайдено'); fn(l); l.updatedAt = Date.now(); return clone(l); };
 const api = {
 ping: () => ({ version: 'demo', authed: true }),
-'loads.list': (p) => { const r = items.filter((l) => !p.status || l.status === p.status); return { items: clone(r), total: r.length }; },
+'loads.list': (p) => {
+if (p.customer) { const c = customers.find((x) => x.id === p.customer); const r = items.filter((l) => c && c.keys.includes(dKey(l))); return { items: clone(r), total: r.length }; }
+const sts = p.status ? [].concat(p.status) : null;
+const r = visible().filter((l) => (!sts || sts.includes(l.status)) && (!p.fav || listOf(l) === 'white'))
+.sort((a, b) => (listOf(b) === 'white') - (listOf(a) === 'white') || b.seenAt - a.seenAt);
+return { items: r.map(withFav), total: r.length };
+},
+'customers.list': () => ({ items: clone(customers).map((c) => ({ ...c, loads: items.filter((l) => c.keys.includes(dKey(l))).length, live: items.filter((l) => c.keys.includes(dKey(l)) && l.status === 'published').length })), hiddenBlack: items.filter((l) => listOf(l) === 'black').length }),
+'customers.preview': (p) => {
+const l = p.loadId && items.find((x) => x.id === p.loadId);
+const key = l ? dKey(l) : p.keys ? p.keys[0] : p.text && /\d{9}/.test(p.text.replace(/\D/g, '')) ? 'tel:380' + p.text.replace(/\D/g, '').slice(-9) : p.text ? 'name:' + p.text.toLowerCase() : null;
+if (!key) throw new Error('Немає даних про замовника — впишіть телефон або компанію в редагуванні заявки');
+const own = items.filter((x) => dKey(x) === key);
+const c = customers.find((x) => x.keys.includes(key));
+return { label: (l && (l.company || l.phone)) || p.label || p.text, keys: [key], weak: key.startsWith('name:'), loads: own.length, queued: own.filter((x) => x.status === 'queued').length,
+live: { 'Кілик В.': own.filter((x) => x.status === 'published').length }, liveTotal: own.filter((x) => x.status === 'published').length, list: c ? c.list : null, customerId: c ? c.id : null };
+},
+'customers.add': (p) => {
+const pv = api['customers.preview'](p);
+const c = demoAdd(p.list, pv.keys[0], p.label || pv.label);
+if (p.note) c.note = p.note;
+return { customer: clone(c), affected: p.list === 'black' ? { hidden: pv.loads, removed: pv.liveTotal, failed: 0 } : { restored: 0 } };
+},
+'customers.move': ({ id, list }) => { const c = customers.find((x) => x.id === id); c.list = list; return { customer: clone(c), affected: { hidden: 0, removed: 0, failed: 0, restored: 0 } }; },
+'customers.update': ({ id, note }) => { const c = customers.find((x) => x.id === id); if (note !== undefined) c.note = note; return clone(c); },
+'customers.remove': ({ id }) => { customers = customers.filter((x) => x.id !== id); return { restored: 0 }; },
+'lardi.accounts': () => api['status.get']().accounts,
+'lardi.backfill': ({ dryRunOnly }) => (dryRunOnly ? { candidates: 3 } : { queued: 3 }),
 'loads.update': ({ id, patch }) => upd(id, (l) => Object.assign(l, patch)),
 'loads.delete': ({ id }) => { items = items.filter((l) => l.id !== id); return { ok: true }; },
 'loads.publish': ({ id }) => upd(id, (l) => { l.status = 'queued'; l.lardi = [0, 1].map((a) => ({ account: a, status: settings.lardi.dryRun ? 'dry' : 'queued' })); }),
 'loads.unpublish': ({ id }) => upd(id, (l) => { l.status = 'inactive'; l.statusReason = 'Знято вручну'; l.lardi = l.lardi.map((a) => ({ ...a, status: 'removed' })); }),
 'settings.get': () => clone(settings),
-'settings.set': (p) => { for (const k in p) settings[k] = typeof p[k] === 'object' && !Array.isArray(p[k]) ? { ...settings[k], ...p[k] } : p[k]; return clone(settings); },
-'status.get': () => ({ running: true, autoPublish: settings.lardi.autoPublish, lastPollAt: now - 70e3, counts: counts(), today: { collected: 187, published: [142, 139] }, queue: items.filter((l) => l.status === 'queued').length }),
+'settings.set': (p) => {
+for (const k in p) settings[k] = typeof p[k] === 'object' && !Array.isArray(p[k]) ? { ...settings[k], ...p[k] } : p[k];
+settings.lardi.accounts = settings.lardi.accounts.map((a) => {
+const t = a.archived ? '' : a.token && !String(a.token).startsWith('••') ? '••••' + String(a.token).slice(-4) : a.token || '';
+return { ...a, token: t, state: a.archived || !a.enabled ? 'disabled' : t ? 'ok' : 'pending' };
+});
+return clone(settings);
+},
+'status.get': () => ({ running: true, autoPublish: settings.lardi.autoPublish, lastPollAt: now - 70e3, counts: counts(), today: { collected: 187, published: settings.lardi.accounts.map((a, i) => (i ? 0 : 142)), dry: settings.lardi.accounts.map(() => 0) }, queue: items.filter((l) => l.status === 'queued').length,
+accounts: settings.lardi.accounts.map((a, i) => ({ index: i, name: a.name, enabled: a.enabled, archived: !!a.archived, state: a.archived || !a.enabled ? 'disabled' : a.token ? 'ok' : 'pending', hasToken: !!a.token, today: { published: i ? 0 : 142, dry: 0, limit: settings.lardi.dailyLimit }, live: i ? 0 : 118, errors: i ? 0 : 2, lastPublishAt: i ? undefined : now - 95e3 })) }),
 'sync.now': () => ({ started: true }),
 'lardi.stopAll': ({ remove }) => { settings.lardi.autoPublish = false; let removed = 0; if (remove) items.forEach((l) => { if (l.status === 'published') { l.status = 'inactive'; l.statusReason = 'знято вручну (усі)'; l.lardi = l.lardi.map((a) => ({ ...a, status: 'removed' })); removed++; } }); return { dequeued: 0, removed, failed: 0 }; },
 'lardi.resume': () => { settings.lardi.autoPublish = true; return { ok: true }; },
-'lardi.test': ({ accountIndex }) => ({ ok: true, name: settings.lardi.accounts[accountIndex]?.name || 'Демо' }),
+'lardi.test': ({ accountIndex, token }) => (token || settings.lardi.accounts[accountIndex]?.token ? { ok: true, name: 'токен дійсний (демо)' } : { ok: false, error: 'токен не задано' }),
 'log.list': () => clone(logs),
 };
 return { call: async (m, p = {}) => { if (!api[m]) throw new Error('Невідомий метод ' + m); await new Promise((r) => setTimeout(r, 60)); return api[m](p); } };
