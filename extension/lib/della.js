@@ -235,6 +235,12 @@ export function parseDellaSearch(html, opts = {}) {
     // компания/телефон — видны только в залогиненной сессии (вёрстка может отличаться)
     const company = textOf(inner(c, 'company_name') || inner(c, 'firm_name')) || undefined;
     const phoneM = textOf(c).match(/\+?38\s?\(?0\d{2}\)?[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}/);
+    // стабільний id компанії та ЄДРПОУ — для чорного/білого списку замовників (якщо Della їх показала)
+    // у залогіненій сесії картка має data-company-code / data-company-name (ними ж працює «сховати компанію» Della)
+    // і посилання на профіль /company/<code>/ — перевірено по JS Della 28.09.2026, на анонімній видачі їх немає
+    const firmM = c.match(/data-company-code="([\w-]+)"/i) || c.match(/href="[^"]*\/company\/([\w-]+)\/?"/i);
+    const firmNameM = c.match(/data-company-name="([^"]*)"/i);
+    const edrpouM = textOf(c).match(/(?:ЄДРПОУ|ЕДРПОУ|ІПН)\s*:?\s*(\d{8}(?:\d{2})?)(?!\d)/i);
 
     const load = {
       source: 'della',
@@ -257,8 +263,10 @@ export function parseDellaSearch(html, opts = {}) {
       payment,
       tags,
       directCustomer: /is_zirka_img/.test(c),
-      company,
       phone: phoneM ? phoneM[0] : undefined,
+      dellaCompanyId: firmM ? firmM[1] : undefined,
+      company: company || (firmNameM ? decodeEntities(firmNameM[1]).trim() || undefined : undefined),
+      edrpou: edrpouM ? edrpouM[1] : undefined,
       dellaUrl,
       dellaRequestId: card.rid ? card.rid.slice(0, 32) : undefined,
       dellaDeleted: /\bdeleted\b/.test(card.cls),

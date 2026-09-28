@@ -5,11 +5,14 @@ import { applyFilters } from '../../extension/lib/filters.js';
 import { LardiClient, NeedsReviewError } from '../../extension/lib/lardi.js';
 import {
   STATUSES, applyPatch, maskToken, isMasked, accountsNeeded, upsertLardiEntry, describe,
+  customerKeys, weakKeys, parseCustomerInput,
 } from '../../extension/lib/model.js';
 import { Store } from './store.js';
 
-export const VERSION = '1.1.0-worker';
+export const VERSION = '1.2.0-worker';
 export const ARCHIVE_DAYS = 30;
+export const MAX_ACCOUNTS = 5;
+export const BLACK_REASON = 'чорний список';
 
 export const DEFAULT_SEARCH_URL = 'https://della.com.ua/search/a204bd204eflolz1z21z3z4z51z6z7z8z9y1y2y3y4y5y6h0ilk0m1.html';
 
@@ -74,14 +77,14 @@ export function mergeDefaults(s) {
     lardi: { ...d.lardi, ...(s.lardi || {}) },
     staleHours: s.staleHours ?? d.staleHours,
   };
-  if (!Array.isArray(out.lardi.accounts)) out.lardi.accounts = d.lardi.accounts;
+  if (!Array.isArray(out.lardi.accounts) || !out.lardi.accounts.length) out.lardi.accounts = d.lardi.accounts;
   if (!Array.isArray(out.della.searchUrls) || !out.della.searchUrls.length) out.della.searchUrls = d.della.searchUrls;
   return out;
 }
 
 export function maskSettings(s) {
   const m = clone(s);
-  m.lardi.accounts = m.lardi.accounts.map((a) => ({ ...a, token: maskToken(a.token) }));
+  m.lardi.accounts = m.lardi.accounts.map((a, i) => ({ ...a, index: i, token: maskToken(a.token), hasToken: !!a.token, state: accountState(a) }));
   return m;
 }
 
@@ -94,6 +97,21 @@ const strList = (v) => (Array.isArray(v) ? v : String(v || '').split(/[\n,;]/))
   .map((x) => String(x).trim()).filter(Boolean);
 
 const isReview = (e) => e instanceof NeedsReviewError || (e && e.needsReview);
+const isAuthError = (e) => e && (e.status === 401 || e.status === 403);
+
+/**
+ * Стан акаунта Lardi: disabled (вимкнено/архівний) · pending (немає токена — «Очікує підключення»)
+ * · invalid (Lardi відхилив токен — авто-пауза) · ok.
+ */
+export function accountState(a) {
+  if (!a || a.archived || !a.enabled) return 'disabled';
+  if (!a.token) return 'pending';
+  if (a.state === 'invalid') return 'invalid';
+  return 'ok';
+}
+
+// міграція бази — один раз на з'єднання (Engine створюється на кожен запит)
+const migrations = new WeakMap();
 
 export class Engine {
   /**
@@ -108,6 +126,17 @@ export class Engine {
     this.sleep = opts.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.budgetMs = opts.budgetMs ?? RUN_BUDGET_MS;
     this.store = new Store(env.DB, this.now);
+  }
+
+  /** Міграція схеми (додає колонку й заповнює її) — перед першим зверненням до заявок. */
+  ready() {
+    let p = migrations.get(this.env.DB);
+    if (!p) {
+      p = this.store.migrate().then((n) => { if (n) console.log(`[IntDeliv] migrate: custKeys для ${n} заявок`); });
+      migrations.set(this.env.DB, p);
+      p.catch(() => migrations.delete(this.env.DB));
+    }
+    return p;
   }
 
   waitUntil(p) {
@@ -151,15 +180,23 @@ export class Engine {
     if (patch.lardi) {
       const p = patch.lardi;
       if (Array.isArray(p.accounts)) {
-        next.lardi.accounts = p.accounts.map((a, i) => {
+        // індекс акаунта — ключ у load.lardi[].account і лічильниках: акаунти не видаляються й не переставляються,
+        // «видалити» = archived (вимкнено, токен стерто). Коротший масив (стара адмінка) решту не чіпає.
+        const n = Math.min(MAX_ACCOUNTS, Math.max(cur.lardi.accounts.length, p.accounts.length));
+        next.lardi.accounts = Array.from({ length: n }, (_, i) => {
           const prev = cur.lardi.accounts[i] || {};
-          let token = a && typeof a.token === 'string' ? a.token.trim() : undefined;
-          if (token === undefined || isMasked(token)) token = prev.token || '';
-          return {
-            name: (a && a.name) || prev.name || `Акаунт ${i + 1}`,
-            token,
-            enabled: a && a.enabled !== undefined ? !!a.enabled : (prev.enabled ?? true),
-          };
+          const a = p.accounts[i];
+          if (!a) return { ...prev, name: prev.name || `Акаунт ${i + 1}`, token: prev.token || '', enabled: prev.enabled ?? true };
+          const acc = { ...prev };
+          acc.name = String(a.name || '').trim().slice(0, 60) || prev.name || `Акаунт ${i + 1}`;
+          let token = typeof a.token === 'string' ? a.token.trim() : '';
+          if (!token || isMasked(token)) token = prev.token || ''; // порожнє / маска — не змінювати
+          if (token !== (prev.token || '')) { acc.state = 'unchecked'; delete acc.lastError; delete acc.checkedAt; }
+          acc.token = token;
+          acc.enabled = a.enabled !== undefined ? !!a.enabled : (prev.enabled ?? true);
+          if (a.archived) { acc.archived = true; acc.enabled = false; acc.token = ''; delete acc.state; delete acc.lastError; }
+          else if (a.archived === false || a.restore) delete acc.archived;
+          return acc;
         });
       }
       if (p.mode !== undefined) next.lardi.mode = p.mode === 'roundrobin' ? 'roundrobin' : 'both';
@@ -172,32 +209,114 @@ export class Engine {
     if (patch.staleHours !== undefined) next.staleHours = num(patch.staleHours, cur.staleHours, 1, 240);
 
     await this.store.setKV('settings', next);
+    // новий токен — одразу перевірити (результат — у стані акаунта; сам токен у журнал не пишемо)
+    for (let i = 0; i < next.lardi.accounts.length; i++) {
+      const a = next.lardi.accounts[i];
+      const prev = cur.lardi.accounts[i] || {};
+      if (a.archived && !prev.archived) await this.log('info', `Акаунт Lardi «${a.name}» видалено (вимкнено, токен стерто)`);
+      if (a.token && a.token !== (prev.token || '')) {
+        await this.log('info', `Акаунт Lardi «${a.name}»: збережено новий токен`);
+        await this.checkAccount(i);
+      }
+    }
     if (next.lardi.dryRun !== cur.lardi.dryRun) {
       await this.log('info', next.lardi.dryRun ? 'Увімкнено DRY RUN — на Lardi нічого не публікується' : 'DRY RUN вимкнено — публікація на Lardi увімкнена');
     }
-    return maskSettings(next);
+    return maskSettings(await this.getSettings());
+  }
+
+  /** Перевірити токен акаунта й записати стан (ok / invalid). Повертає результат LardiClient.test(). */
+  async checkAccount(i, tokenOverride) {
+    const s = await this.getSettings();
+    const acc = s.lardi.accounts[i];
+    const tok = tokenOverride || (acc && acc.token);
+    if (!tok) return { ok: false, error: 'токен не задано' };
+    const client = new LardiClient({ token: tok, cache: this.store.cache, fetch: this.fetch, sleep: this.sleep, maxRetries: 1 });
+    let r;
+    let status = 0;
+    try {
+      const data = await client.request('GET', '/proposals/my/cargoes/published', { query: { page: 1, size: 1 } });
+      const total = data && data.paginator ? data.paginator.totalSize : undefined;
+      r = { ok: true, name: total !== undefined ? `токен дійсний, опубліковано вантажів: ${total}` : 'токен дійсний' };
+    } catch (e) {
+      status = e.status || 0;
+      r = { ok: false, error: e.message };
+    }
+    if (acc && !tokenOverride) {
+      await this.patchAccount(i, (a) => (a.token !== tok ? null : {
+        ...a,
+        state: r.ok ? 'ok' : isAuthError({ status }) ? 'invalid' : a.state,
+        lastError: r.ok ? undefined : r.error,
+        checkedAt: this.now(),
+      }));
+    }
+    await this.log(r.ok ? 'info' : 'warn', `Перевірка токена «${(acc && acc.name) || `#${i + 1}`}»: ${r.ok ? r.name : r.error}`);
+    return r;
+  }
+
+  /** Змінити службові поля акаунта (стан, помилка) без settings.set. fn(acc) → новий acc або null. */
+  async patchAccount(i, fn) {
+    const s = await this.getSettings();
+    const acc = s.lardi.accounts[i];
+    if (!acc) return null;
+    const next = fn({ ...acc });
+    if (!next) return acc;
+    for (const k of Object.keys(next)) if (next[k] === undefined) delete next[k];
+    s.lardi.accounts[i] = next;
+    await this.store.setKV('settings', s);
+    return next;
+  }
+
+  accName(s, i) {
+    return (s.lardi.accounts[i] && s.lardi.accounts[i].name) || `#${i + 1}`;
   }
 
   // ---------- stats ----------
 
   async getToday(accountsCount = 2) {
     const c = await this.store.counters(kyivDay(this.now()));
-    const n = Math.max(2, accountsCount);
+    const n = Math.max(1, accountsCount);
     const arr = (p) => Array.from({ length: n }, (_, i) => c[`${p}:${i}`] || 0);
     return { date: kyivDay(this.now()), collected: c.collected || 0, published: arr('published'), dry: arr('dry') };
+  }
+
+  /** Статистика по кожному акаунту Lardi (без токенів). */
+  async accountsStats(sIn) {
+    const s = sIn || (await this.getSettings());
+    const [today, live, errors, lastAt] = await Promise.all([
+      this.getToday(s.lardi.accounts.length),
+      this.store.liveByAccount(),
+      this.store.errorsByAccount(),
+      this.store.getMeta('lastPublishAt', {}),
+    ]);
+    return s.lardi.accounts.map((a, i) => ({
+      index: i,
+      name: a.name || `Акаунт ${i + 1}`,
+      enabled: !!a.enabled,
+      archived: !!a.archived,
+      state: accountState(a),
+      hasToken: !!a.token,
+      today: { published: today.published[i] || 0, dry: today.dry[i] || 0, limit: s.lardi.dailyLimit },
+      live: live[i] || 0,
+      errors: errors[i] || 0,
+      lastPublishAt: (lastAt && lastAt[i]) || undefined,
+      lastError: a.lastError || undefined,
+      checkedAt: a.checkedAt || undefined,
+    }));
   }
 
   bump(key, by = 1) { return this.store.bump(kyivDay(this.now()), key, by); }
 
   async getStatus() {
     const s = await this.getSettings();
-    const [counts, today, lastPollAt, lastError, lastPollOkAt, busy] = await Promise.all([
+    const [counts, today, lastPollAt, lastError, lastPollOkAt, busy, accounts] = await Promise.all([
       this.store.countByStatus(STATUSES),
       this.getToday(s.lardi.accounts.length),
       this.store.getMeta('lastPollAt', null),
       this.store.getMeta('lastError', null),
       this.store.getMeta('lastPollOkAt', null),
       this.store.lockActive(),
+      this.accountsStats(s),
     ]);
     return {
       running: true,
@@ -214,6 +333,7 @@ export class Engine {
       dryRun: s.lardi.dryRun,
       autoPublish: s.lardi.autoPublish,
       mode: s.lardi.mode,
+      accounts,
       version: VERSION,
       archiveDays: ARCHIVE_DAYS,
     };
@@ -226,6 +346,7 @@ export class Engine {
    * @param {{forcePoll?: boolean, skipPoll?: boolean}} o
    */
   async runCycle(o = {}) {
+    await this.ready();
     const start = this.now();
     const deadline = start + this.budgetMs;
     const owner = `${start}-${Math.random().toString(36).slice(2, 8)}`;
@@ -261,7 +382,10 @@ export class Engine {
   // ---------- збір Della ----------
 
   async fetchDella(url) {
-    const res = await this.fetch(url, { headers: BROWSER_HEADERS, redirect: 'follow' });
+    // DELLA_COOKIE — сесія залогіненого акаунта Della (тоді в картках є код компанії). Значення ніде не логується.
+    const cookie = this.env && this.env.DELLA_COOKIE ? String(this.env.DELLA_COOKIE).trim() : '';
+    const headers = cookie ? { ...BROWSER_HEADERS, Cookie: cookie } : BROWSER_HEADERS;
+    const res = await this.fetch(url, { headers, redirect: 'follow' });
     if (!res.ok) throw new Error(`Della ${res.status} для ${url}`);
     return res.text();
   }
@@ -305,8 +429,13 @@ export class Engine {
       }
       const parsed = [...byId.values()];
       seen = parsed.length;
+      const black = await this.store.keysOfList('black');
+      const isBlack = (l) => black.size > 0 && customerKeys(l).some((k) => black.has(k));
       const verdict = new Map();
-      for (const p of parsed) verdict.set(p.id, this.filterVerdict(p, s.filters));
+      for (const p of parsed) {
+        const v = this.filterVerdict(p, s.filters);
+        verdict.set(p.id, v.pass && isBlack(p) ? { pass: false, reason: BLACK_REASON } : v);
+      }
       const res = await this.store.upsertSeen(parsed, (p) => verdict.get(p.id).pass, now);
       const updatedIds = new Set(res.updated.map((u) => u.after.id));
       for (const p of parsed) {
@@ -321,10 +450,12 @@ export class Engine {
       for (const u of res.updated) {
         if (u.after.dellaDeleted && !u.before.dellaDeleted) {
           await this.markInactive(u.after.id, 'видалена на Della', 'deleted_on_della', s);
+        } else if (u.after.status === 'new' && u.before.status === 'inactive' && isBlack(u.after)) {
+          await this.markInactive(u.after.id, BLACK_REASON, 'blacklist', s); // «ожила» в Della, але замовник у чорному списку
         }
       }
       if (s.lardi.autoPublish) {
-        const toQueue = [...res.inserted, ...res.updated.filter((u) => u.after.status === 'new' && u.before.status === 'inactive').map((u) => u.after)];
+        const toQueue = [...res.inserted, ...res.updated.filter((u) => u.after.status === 'new' && u.before.status === 'inactive' && !isBlack(u.after)).map((u) => u.after)];
         for (const l of toQueue) await this.enqueue(l.id, false);
       }
       if (!errors) {
@@ -346,8 +477,19 @@ export class Engine {
 
   // ---------- черга / публікація ----------
 
+  /** Замовник заявки в чорному списку? */
+  async isBlackLoad(load) {
+    const keys = customerKeys(load || {});
+    return keys.length > 0 && (await this.store.listOfKeys(keys)) === 'black';
+  }
+
   async enqueue(id, manual) {
     const now = this.now();
+    const cur = await this.store.getLoad(id);
+    if (cur && (await this.isBlackLoad(cur))) {
+      if (manual) throw new Error('замовник у чорному списку');
+      return null;
+    }
     return this.store.updateLoad(id, (l) => {
       if (!manual && l.status !== 'new') return null; // вручну можна повернути й з архіву
       return {
@@ -419,7 +561,11 @@ export class Engine {
   async publishOne(id, account, s) {
     const load = await this.store.getLoad(id);
     if (!load || load.status !== 'queued') return;
-    const accName = (s.lardi.accounts[account] && s.lardi.accounts[account].name) || `#${account + 1}`;
+    if (await this.isBlackLoad(load)) { // страховка від гонки з додаванням у чорний список
+      await this.markInactive(id, BLACK_REASON, 'blacklist', s);
+      return;
+    }
+    const accName = this.accName(s, account);
 
     if (s.lardi.dryRun) {
       let reason;
@@ -465,6 +611,15 @@ export class Engine {
       if (isReview(e)) {
         await this.store.updateLoad(id, (l) => ({ ...l, status: 'needs_review', statusReason: e.message, updatedAt: this.now() }));
         await this.log('warn', `Потрібна перевірка: ${describe(load)} — ${e.message}`);
+      } else if (isAuthError(e)) {
+        // Lardi відхилив токен — акаунт на паузу (state=invalid), заявка лишається в черзі для інших акаунтів
+        await this.patchAccount(account, (a) => ({ ...a, state: 'invalid', lastError: e.message, checkedAt: this.now() }));
+        await this.store.updateLoad(id, (l) => {
+          const next = upsertLardiEntry(l, { account, status: 'error', error: e.message });
+          const anyLive = (next.lardi || []).some((x) => x.status === 'published');
+          return { ...next, status: anyLive ? 'published' : 'queued', updatedAt: this.now() };
+        });
+        await this.log('error', `Lardi «${accName}» відхилив токен (${e.message}) — акаунт призупинено, введіть новий токен у Налаштуваннях`);
       } else {
         await this.store.updateLoad(id, (l) => {
           const next = upsertLardiEntry(l, { account, status: 'error', error: e.message });
@@ -545,7 +700,85 @@ export class Engine {
   async rpc(method, p = {}) {
     const h = this.handlers[method];
     if (!h) throw new Error(`невідомий метод ${method}`);
+    await this.ready();
     return h.call(this, p || {});
+  }
+
+  // ---------- чорний / білий список ----------
+
+  /** Ключі й підпис замовника з параметрів RPC: {loadId} | {keys[]} | {text} | {phone, edrpou, name, dellaId}. */
+  async resolveCustomer(p = {}) {
+    if (p.loadId) {
+      const l = await this.store.getLoad(p.loadId);
+      if (!l) throw new Error('заявку не знайдено');
+      const keys = customerKeys(l);
+      if (!keys.length) throw new Error('Немає даних про замовника — впишіть телефон або компанію в редагуванні заявки');
+      return { keys, label: l.company || l.phone || l.edrpou || keys[0] };
+    }
+    if (Array.isArray(p.keys) && p.keys.length) {
+      const keys = p.keys.map(String).filter((k) => /^(della|edrpou|tel|name):.+/.test(k));
+      if (!keys.length) throw new Error('невірні ключі');
+      return { keys, label: p.label || keys[0].replace(/^\w+:/, '') };
+    }
+    const f = p.text !== undefined ? parseCustomerInput(p.text) : { phone: p.phone, edrpou: p.edrpou, name: p.name, dellaId: p.dellaId };
+    const keys = customerKeys(f);
+    if (!keys.length) throw new Error('Вкажіть телефон (0XX XXX XX XX), ЄДРПОУ (8 цифр) або назву компанії (від 4 літер)');
+    return { keys, label: f.name || f.phone || f.edrpou || f.dellaId };
+  }
+
+  /** Чорний список: зняти з Lardi живі публікації й приховати заявки. Повторно не знімає вже знятих. */
+  async applyBlack(keys, s) {
+    let hidden = 0; let removed = 0; let failed = 0;
+    for (const r of await this.store.loadsByKeys(keys)) {
+      const live = r.lardi.filter((e) => e.id && e.status === 'published');
+      if (live.length) {
+        const after = await this.removeFromLardi(r.id, s);
+        for (const e of (after && after.lardi) || []) {
+          if (!live.some((x) => x.account === e.account)) continue;
+          if (e.status === 'removed') removed++; else failed++;
+        }
+      }
+      let changed = false;
+      await this.store.updateLoad(r.id, (l) => {
+        if (l.status === 'deleted' || (l.status === 'inactive' && l.inactiveKind === 'blacklist')) return null;
+        changed = true;
+        return { ...l, status: 'inactive', inactiveKind: 'blacklist', statusReason: BLACK_REASON, queuedAt: null, updatedAt: this.now() };
+      });
+      if (changed) hidden++;
+    }
+    return { hidden, removed, failed };
+  }
+
+  /** Після зняття з чорного списку: актуальні — у new (+ черга), минулі — лишаються в архіві. */
+  async restoreUnblocked(s) {
+    const today = kyivDay(this.now());
+    let restored = 0; let archived = 0;
+    for (const id of await this.store.unblockedIds()) {
+      const l = await this.store.updateLoad(id, (x) => {
+        const last = x.dateTo || x.dateFrom;
+        if (last && last < today) return { ...x, inactiveKind: 'date', statusReason: 'дата завантаження минула', updatedAt: this.now() };
+        const next = { ...x, status: 'new', statusReason: 'замовника прибрано з чорного списку', lardi: (x.lardi || []).filter((e) => e.status !== 'removed'), updatedAt: this.now() };
+        delete next.inactiveKind;
+        return next;
+      });
+      if (!l) continue;
+      if (l.status === 'new') {
+        restored++;
+        if (s.lardi.autoPublish) await this.enqueue(id, false);
+      } else archived++;
+    }
+    return { restored, archived };
+  }
+
+  async afterListChange(customer, prevList, s) {
+    if (customer.list === 'black') {
+      const a = await this.applyBlack(customer.keys, s);
+      await this.log('info', `Чорний список: «${customer.label || customer.keys[0]}» — приховано ${a.hidden}, знято з Lardi ${a.removed}${a.failed ? `, не вдалося зняти ${a.failed}` : ''}`);
+      return a;
+    }
+    const a = prevList === 'black' ? await this.restoreUnblocked(s) : { restored: 0 };
+    await this.log('info', `Обрані: «${customer.label || customer.keys[0]}»${a.restored ? `, повернуто з чорного списку ${a.restored}` : ''}`);
+    return a;
   }
 }
 
@@ -560,6 +793,21 @@ Engine.prototype.handlers = {
     const cur = await this.store.getLoad(id);
     if (!cur) throw new Error('заявку не знайдено');
     let next = await this.store.updateLoad(id, (l) => applyPatch(l, patch || {}, this.now()));
+    // правка телефону/компанії/ЄДРПОУ могла ввести заявку в чорний список або вивести з нього
+    const black = await this.isBlackLoad(next);
+    if (black) {
+      if (patch && patch.status === 'queued') throw new Error('замовник у чорному списку');
+      await this.markInactive(id, BLACK_REASON, 'blacklist', s);
+      return this.store.getLoad(id);
+    }
+    if (next.status === 'inactive' && next.inactiveKind === 'blacklist' && !(patch && patch.status)) {
+      await this.store.updateLoad(id, (l) => {
+        const x = { ...l, status: 'new', statusReason: 'замовника прибрано з чорного списку', lardi: (l.lardi || []).filter((e) => e.status !== 'removed'), updatedAt: this.now() };
+        delete x.inactiveKind;
+        return x;
+      });
+      if (s.lardi.autoPublish) await this.enqueue(id, false);
+    }
     if (patch && patch.status === 'inactive') await this.markInactive(id, 'знято вручну', 'manual', s);
     else if (patch && patch.status === 'queued') await this.enqueue(id, true);
     next = await this.store.getLoad(id);
@@ -615,7 +863,7 @@ Engine.prototype.handlers = {
     await this.setSettings({ lardi: { autoPublish: false } });
     const now = this.now();
     let dequeued = 0;
-    for (const q of await this.store.queuedLight(100000)) {
+    for (const q of await this.store.queuedLight(100000, { withBlack: true })) {
       const l = await this.store.updateLoad(q.id, (x) => (x.status !== 'queued' ? null : {
         ...x, status: (x.lardi || []).some((e) => e.status === 'published') ? 'published' : 'new',
         statusReason: 'публікацію зупинено', queuedAt: null, updatedAt: now,
@@ -635,7 +883,7 @@ Engine.prototype.handlers = {
     let failed = 0;
     for (const [acc, pairs] of byAcc) {
       const client = this.clientFor(s, acc);
-      if (!client) { failed += pairs.length; await this.log('error', `Немає токена акаунта ${acc + 1} — ${pairs.length} заявок не знято`); continue; }
+      if (!client) { failed += pairs.length; await this.log('error', `Немає токена акаунта «${this.accName(s, acc)}» — ${pairs.length} заявок не знято`); continue; }
       for (let i = 0; i < pairs.length; i += 50) {
         const part = pairs.slice(i, i + 50);
         try {
@@ -679,13 +927,108 @@ Engine.prototype.handlers = {
     return { started: true };
   },
 
+  /** Перевірити токен (збережений або переданий, не зберігаючи). Для збереженого — оновлює стан акаунта. */
   async 'lardi.test'({ accountIndex = 0, token } = {}) {
+    return this.checkAccount(Number(accountIndex) || 0, token && !isMasked(token) ? String(token).trim() : undefined);
+  },
+
+  /** Статистика по кожному акаунту: [{index,name,enabled,state,hasToken,today,live,errors,lastPublishAt,lastError}] */
+  async 'lardi.accounts'() { return this.accountsStats(); },
+
+  /**
+   * Догін нового акаунта: поставити в чергу актуальні опубліковані заявки, яких на ньому ще немає
+   * (не з чорного списку, обрані першими, не більше залишку добового ліміту). Лише в режимі «на всі акаунти».
+   */
+  async 'lardi.backfill'({ accountIndex, dryRunOnly = false } = {}) {
+    const i = Number(accountIndex);
     const s = await this.getSettings();
-    const acc = s.lardi.accounts[accountIndex];
-    const tok = token && !isMasked(token) ? token : acc && acc.token;
-    if (!tok) return { ok: false, error: 'токен не задано' };
-    const r = await new LardiClient({ token: tok, cache: this.store.cache, fetch: this.fetch, sleep: this.sleep, maxRetries: 1 }).test();
-    await this.log(r.ok ? 'info' : 'warn', `Перевірка токена «${(acc && acc.name) || accountIndex}»: ${r.ok ? r.name : r.error}`);
+    const acc = s.lardi.accounts[i];
+    if (!acc) throw new Error('акаунт не знайдено');
+    if (accountState(acc) !== 'ok') throw new Error('акаунт не підключено або вимкнено — спершу збережіть і перевірте токен');
+    if (s.lardi.mode === 'roundrobin') throw new Error('догін працює лише в режимі «На всі акаунти»');
+    const today = kyivDay(this.now());
+    const counts = await this.getToday(s.lardi.accounts.length);
+    const room = s.lardi.dailyLimit ? Math.max(0, s.lardi.dailyLimit - (counts.published[i] || 0) - (counts.dry[i] || 0)) : Infinity;
+    const cands = (await this.store.backfillCandidates(i, today)).slice(0, room);
+    if (dryRunOnly) return { candidates: cands.length };
+    const now = this.now();
+    let queued = 0;
+    for (const id of cands) {
+      const l = await this.store.updateLoad(id, (x) => (x.status !== 'published' ? null : { ...x, status: 'queued', statusReason: `догін на «${acc.name}»`, queuedAt: now, updatedAt: now }));
+      if (l && l.status === 'queued') queued++;
+    }
+    await this.log('info', `Догін «${acc.name}»: поставлено в чергу ${queued} актуальних заявок`);
+    if (queued) this.waitUntil(this.runCycle({ skipPoll: true }));
+    return { queued };
+  },
+
+  // ---------- замовники ----------
+
+  async 'customers.list'({ list } = {}) {
+    const l = list === 'black' || list === 'white' ? list : undefined;
+    return { items: await this.store.listCustomers(l), hiddenBlack: await this.store.hiddenBlackCount() };
+  },
+
+  /** Лише читання — для діалогу підтвердження. */
+  async 'customers.preview'(p = {}) {
+    const { keys, label } = await this.resolveCustomer(p);
+    const s = await this.getSettings();
+    const rows = await this.store.loadsByKeys(keys);
+    const live = {};
+    let liveTotal = 0;
+    for (const r of rows) {
+      for (const e of r.lardi) {
+        if (!e.id || e.status !== 'published') continue;
+        const n = this.accName(s, e.account);
+        live[n] = (live[n] || 0) + 1;
+        liveTotal++;
+      }
+    }
+    const hits = await this.store.customersByKeys(keys);
+    return {
+      label, keys, weak: weakKeys(keys),
+      loads: rows.length,
+      queued: rows.filter((r) => r.status === 'queued').length,
+      live, liveTotal,
+      list: hits.some((h) => h.list === 'black') ? 'black' : hits.some((h) => h.list === 'white') ? 'white' : null,
+      customerId: hits.length ? hits[0].customerId : null,
+    };
+  },
+
+  async 'customers.add'(p = {}) {
+    const list = p.list === 'black' ? 'black' : p.list === 'white' ? 'white' : null;
+    if (!list) throw new Error('list: black або white');
+    const { keys, label } = await this.resolveCustomer(p);
+    const s = await this.getSettings();
+    const prevLists = await this.store.customersByKeys(keys);
+    const prevList = prevLists.some((h) => h.list === 'black') ? 'black' : null;
+    const { customer } = await this.store.upsertCustomer(list, keys, { label: p.label, fallbackLabel: label, note: p.note });
+    const affected = await this.afterListChange(customer, prevList, s);
+    return { customer, affected };
+  },
+
+  async 'customers.move'({ id, list } = {}) {
+    if (list !== 'black' && list !== 'white') throw new Error('list: black або white');
+    const cur = await this.store.getCustomer(id);
+    if (!cur) throw new Error('замовника не знайдено');
+    const s = await this.getSettings();
+    const customer = await this.store.setCustomerList(cur.id, list);
+    const affected = await this.afterListChange(customer, cur.list, s);
+    return { customer, affected };
+  },
+
+  async 'customers.update'({ id, label, note } = {}) {
+    const c = await this.store.updateCustomer(id, { label, note });
+    if (!c) throw new Error('замовника не знайдено');
+    return c;
+  },
+
+  async 'customers.remove'({ id } = {}) {
+    const c = await this.store.removeCustomer(id);
+    if (!c) throw new Error('замовника не знайдено');
+    const s = await this.getSettings();
+    const r = c.list === 'black' ? await this.restoreUnblocked(s) : { restored: 0, archived: 0 };
+    await this.log('info', `${c.list === 'black' ? 'Чорний список' : 'Обрані'}: прибрано «${c.label || c.keys[0]}»${r.restored ? `, повернуто заявок ${r.restored}` : ''}`);
     return r;
   },
 

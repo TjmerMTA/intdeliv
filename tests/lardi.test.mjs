@@ -148,9 +148,13 @@ test('model: accountsNeeded both / roundrobin / dry; token mask', () => {
   const rr = { lardi: { ...s.lardi, mode: 'roundrobin' } };
   assert.deepEqual(accountsNeeded({ lardi: [] }, rr, 1), [1]);
   assert.deepEqual(accountsNeeded({ lardi: [{ account: 1, id: 5, status: 'published' }] }, rr, 0), []);
+  // акаунт без токена «очікує підключення» — не бере участі навіть у dry-run (не брешемо статистикою)
   const dry = { lardi: { ...s.lardi, dryRun: true } };
-  assert.deepEqual(accountsNeeded({ lardi: [] }, dry), [0, 1, 2]);
-  assert.deepEqual(accountsNeeded({ lardi: [{ account: 0, status: 'dry' }, { account: 1, status: 'dry' }, { account: 2, status: 'dry' }] }, dry), []);
+  assert.deepEqual(accountsNeeded({ lardi: [] }, dry), [0, 1]);
+  assert.deepEqual(accountsNeeded({ lardi: [{ account: 0, status: 'dry' }, { account: 1, status: 'dry' }] }, dry), []);
+  // Lardi відхилив токен (invalid) або акаунт видалено (archived) — пропускаємо
+  const inv = { lardi: { ...s.lardi, accounts: [{ token: 'a', enabled: true, state: 'invalid' }, { token: 'b', enabled: true }, { token: 'c', enabled: true, archived: true }] } };
+  assert.deepEqual(accountsNeeded({ lardi: [] }, inv), [1]);
   // после выключения dry-run dry-записи не считаются публикацией
   assert.deepEqual(accountsNeeded({ lardi: [{ account: 0, status: 'dry' }, { account: 1, status: 'dry' }] }, s), [0, 1]);
   assert.equal(maskToken('abcdef123456'), '••••3456');

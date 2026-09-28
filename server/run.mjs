@@ -2,7 +2,8 @@
 // HTTP → worker.fetch(), кожні 60 с → worker.scheduled(), БД — SQLite-файл через D1-адаптер.
 //
 // ENV: DB_PATH (./data/intdeliv.sqlite), PORT (8787), ADMIN_KEY, RUN_MINUTES (345),
-//      SNAPSHOT_MINUTES (5), LARDI_TOKEN_1 / LARDI_TOKEN_2 (необовʼязково).
+//      SNAPSHOT_MINUTES (5), LARDI_TOKEN_1 / LARDI_TOKEN_2 (необовʼязково),
+//      DELLA_COOKIE (необовʼязково: сесія Della — у картках з'являється код компанії для чорного/білого списку).
 import http from 'node:http';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -75,8 +76,15 @@ export async function startServer({ env: cfg = process.env, fetchImpl, log = def
   mkdirSync(dirname(dbPath), { recursive: true });
   const db = new D1Database(dbPath, { schemaPath: SCHEMA });
   const env = { DB: db, ADMIN_KEY: cfg.ADMIN_KEY || '' };
+  if (cfg.DELLA_COOKIE) env.DELLA_COOKIE = String(cfg.DELLA_COOKIE);
   if (fetchImpl) env.__engineOpts = { fetch: fetchImpl };
   if (!env.ADMIN_KEY) log('warn: ADMIN_KEY is not set — admin RPC will answer 401');
+  log(`della session: ${env.DELLA_COOKIE ? 'cookie set' : 'anonymous'}`);
+  // міграція схеми до першого запиту (лише додає колонку/таблиці — наявні дані не змінюються)
+  const loadsBefore = (await db.prepare('SELECT COUNT(*) AS n FROM loads').first()).n;
+  await makeEngine(env, null).ready();
+  const loadsAfter = (await db.prepare('SELECT COUNT(*) AS n FROM loads').first()).n;
+  log(`migrate: ok, loads ${loadsBefore} → ${loadsAfter}`);
   await injectTokens(env, cfg, log);
 
   const inflight = new Set();

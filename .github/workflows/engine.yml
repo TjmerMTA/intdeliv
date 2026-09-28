@@ -20,6 +20,7 @@ jobs:
       ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
       LARDI_TOKEN_1: ${{ secrets.LARDI_TOKEN_1 }}
       LARDI_TOKEN_2: ${{ secrets.LARDI_TOKEN_2 }}
+      DELLA_COOKIE: ${{ secrets.DELLA_COOKIE }}
       RUN_MINUTES: "340"
       PORT: "8787"
     steps:
