@@ -103,6 +103,7 @@ body.locked .side,body.locked .main{display:none}
 .ib svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .ib.red:hover{color:var(--err)}
 .empty{padding:40px;text-align:center;color:var(--mut)}
+.list-note{background:var(--warn-b);color:#7a3e00;border-bottom:1px solid #f6d7a7;padding:10px 14px;line-height:1.45}
 .more-wrap{display:flex;align-items:center;gap:12px;justify-content:center;padding:12px}
 .more-wrap:has(#more[hidden]){justify-content:flex-end}
 .sf{max-width:900px;display:flex;flex-direction:column;gap:14px}

@@ -52,10 +52,16 @@ let demo = null; // демо-бекенд (лише через «Подивит�
 let authed = false;
 class AuthError extends Error {}
 
-async function rpc(method, params = {}, key = LS.get('intdeliv.key'), timeout = 20000) {
-for (;;) {
+// Збій зв'язку (а не відповідь сервера «помилка»): e.net = true — за ним викликач вирішує, чи шукати сервер заново.
+const netError = (msg) => Object.assign(new Error(msg), { net: true });
+const RPC_TIMEOUT_MS = 20000, RPC_TRIES = 3;
+// tries — скільки разів надсилати запит: після збою зв'язку чекаємо на сервер (waitForReconnect) і пробуємо знову,
+// але не без кінця — інакше повільна відповідь + живий ping крутили б запит вічно, а викликач не дізнався б ні про що.
+async function rpc(method, params = {}, key = LS.get('intdeliv.key'), timeout = RPC_TIMEOUT_MS, tries = RPC_TRIES) {
+for (let n = 1; ; n++) {
+const again = async () => n < tries && (await waitForReconnect());
 if (!LS.get('intdeliv.api')) await discover();
-if (!apiBase()) { if (await waitForReconnect()) continue; throw new Error('Сервер запускається… спробуйте за хвилину'); }
+if (!apiBase()) { if (await again()) continue; throw netError('Сервер запускається… спробуйте за хвилину'); }
 const ac = new AbortController();
 const t = setTimeout(() => ac.abort(), timeout);
 let r;
@@ -67,21 +73,23 @@ body: JSON.stringify({ method, params }),
 });
 } catch (e) {
 clearTimeout(t);
-if (await waitForReconnect()) continue;
-throw new Error(e.name === 'AbortError' ? 'Сервер не відповідає (' + method + ')' : 'Немає зв\'язку з сервером');
+if (await again()) continue;
+throw netError(e.name === 'AbortError' ? 'Сервер не відповідає (' + method + ')' : 'Немає зв\'язку з сервером');
 }
 setNet(true);
 if (r.status === 401) { clearTimeout(t); throw new AuthError('Невірний ключ доступу'); }
 const d = await r.json().catch(() => null); // таймаут t діє і на тіло відповіді
+const late = ac.signal.aborted; // відповідь почалась, але не встигла завантажитись за timeout
 clearTimeout(t);
-if (!d) { if (await waitForReconnect()) continue; throw new Error('Сервер перезапускається… (' + r.status + ')'); }
+if (!d) { if (await again()) continue; throw netError(late ? 'Відповідь сервера не встигла завантажитись (' + method + ')' : 'Сервер перезапускається… (' + r.status + ')'); }
 if (!d.ok) throw new Error(d.error || 'Помилка сервера');
 return d.result;
 }
 }
-async function call(method, params) {
+// opt: {timeout, tries} — для запитів, яким замало типових (див. loadLoads)
+async function call(method, params, opt = {}) {
 if (demo) return demo.call(method, params);
-try { return await rpc(method, params); } catch (e) { if (e instanceof AuthError) showLogin(e.message); throw e; }
+try { return await rpc(method, params, undefined, opt.timeout, opt.tries); } catch (e) { if (e instanceof AuthError) showLogin(e.message); throw e; }
 }
 let netOk = null;
 function setNet(state, label) {
@@ -265,9 +273,18 @@ msg.textContent = ok ? 'Скопійовано — вставте в повід�
 // Стан
 const S = {
 view: 'loads', tab: 'all', f: { fromCity: '', toCity: '', fromRegion: '', toRegion: '', payment: '', account: '', q: '', fav: false },
-items: [], filtered: [], shown: PAGE, status: null, settings: null, version: '',
+items: [], status: null, settings: null, version: '',
 cList: 'white', customers: null, accDraft: null,
 };
+// Список заявок. Сервер віддає одну сторінку (PAGE рядків) за поточною вкладкою й фільтрами та total — скільки їх усього;
+// «Показати ще» дочитує наступну сторінку (offset), фонове оновлення перечитує лише те, що на екрані.
+//   key — поточний запит (вкладка + фільтри); want — скільки рядків користувач хоче бачити;
+//   total / at — відповідь сервера на цей запит (at = 0: ще не відповідав); error — чому не вдалося востаннє;
+//   seq / applied / floor — лічильник запитів: застосовуємо лише найновішу відповідь, старіші за floor відкинуто дією користувача;
+//   busy — запит у польоті (фонове оновлення тоді не стартує); more — дочитується сторінка; retry — іде повтор після збою.
+const LIST_MAX = 5000; // стільки рядків сервер віддає за запит — більше на екрані не тримаємо
+const LIST_TIMEOUT_MS = 60000, LIST_REFRESH_MS = 20000, LIST_RETRY_MS = 5000;
+const L = { key: null, want: PAGE, total: null, at: 0, error: '', seq: 0, applied: 0, floor: 0, busy: 0, more: false, retry: false };
 const TABS = [
 ['all', 'Усі', (c) => sum(c, ['new', 'queued', 'published', 'needs_review', 'error', 'inactive'])],
 ['active', 'Активні', (c) => sum(c, ['new', 'queued', 'published', 'needs_review', 'error'])],
@@ -275,6 +292,8 @@ const TABS = [
 ['needs_review', 'Перевірити', (c) => sum(c, ['needs_review'])],
 ['archive', 'Архів · 30 днів', (c) => sum(c, ['inactive', 'deleted'])],
 ];
+// Вкладка → статуси для сервера (вкладка «Усі» — без статусу: сервер сам відкидає видалені)
+const TAB_STATUS = { active: ['new', 'queued', 'published', 'needs_review', 'error'], published: 'published', needs_review: 'needs_review', archive: ['inactive', 'deleted'] };
 const TAB_MATCH = {
 all: (s) => s !== 'deleted',
 active: (s) => !['inactive', 'deleted'].includes(s),
@@ -450,68 +469,134 @@ ${dl ? `<a class="ib" href="${esc(dl)}" target="_blank" rel="noopener noreferrer
 }
 
 const norm = (s) => (s == null ? '' : String(s)).toLowerCase().replace(/[’'`ʼ]/g, "'").trim();
-function applyFilters() {
-const f = Object.fromEntries(Object.entries(S.f).map(([k, v]) => [k, typeof v === 'string' ? norm(v) : v]));
-const qd = f.q.replace(/\D/g, '');
-const m = TAB_MATCH[S.tab];
-S.filtered = S.items.filter((l) => {
-if (!m(l.status)) return false;
-if (f.fromCity && !norm(l.fromCity).includes(f.fromCity)) return false;
-if (f.toCity && !norm(l.toCity).includes(f.toCity)) return false;
-if (f.fromRegion && !norm(l.fromRegion).includes(f.fromRegion)) return false;
-if (f.toRegion && !norm(l.toRegion).includes(f.toRegion)) return false;
+// Локальний фільтр: умова для заявки за фільтрами f (як S.f). Ним живе перший показ до відповіді сервера і демо-режим;
+// правдою є відповідь сервера — він отримує ті самі фільтри.
+function loadFilter(filters) {
+const f = Object.fromEntries(Object.entries(filters).map(([k, v]) => [k, typeof v === 'string' ? norm(v) : v]));
+const str = (k) => (typeof f[k] === 'string' ? f[k] : '');
+const q = str('q'), qd = q.replace(/\D/g, ''), account = f.account == null ? '' : String(f.account);
+return (l) => {
+if (str('fromCity') && !norm(l.fromCity).includes(str('fromCity'))) return false;
+if (str('toCity') && !norm(l.toCity).includes(str('toCity'))) return false;
+if (str('fromRegion') && !norm(l.fromRegion).includes(str('fromRegion'))) return false;
+if (str('toRegion') && !norm(l.toRegion).includes(str('toRegion'))) return false;
 if (f.payment && PAY_FILTER[f.payment] && !PAY_FILTER[f.payment](l)) return false;
-if (S.f.fav && !l.fav) return false;
-if (f.account === 'none' && (l.lardi || []).some((a) => a.status === 'published')) return false;
-if (f.account !== '' && f.account !== 'none' && !(l.lardi || []).some((a) => String(a.account) === f.account && a.status === 'published')) return false;
-if (f.q) {
+if (f.fav && !l.fav) return false;
+if (account === 'none' && (l.lardi || []).some((a) => a.status === 'published')) return false;
+if (account !== '' && account !== 'none' && !(l.lardi || []).some((a) => String(a.account) === account && a.status === 'published')) return false;
+if (q) {
 const ph = String(l.phone || '').replace(/\D/g, '');
-const hit = norm(l.id).includes(f.q) || (qd.length >= 3 && ph.includes(qd)) || norm(l.company).includes(f.q) || String(l.edrpou || '').includes(f.q) ||
-(l.lardi || []).some((a) => a.id && String(a.id).includes(f.q));
+const hit = norm(l.id).includes(q) || (qd.length >= 3 && ph.includes(qd)) || norm(l.company).includes(q) || String(l.edrpou || '').includes(q) ||
+(l.lardi || []).some((a) => a.id && String(a.id).includes(q));
 if (!hit) return false;
 }
 return true;
-});
+};
 }
-function renderRows() {
-const list = S.filtered;
-const n = Math.min(S.shown, list.length);
-let h = '';
-for (let i = 0; i < n; i++) h += rowHtml(list[i]);
-$('#rows').innerHTML = h;
-$('#empty').hidden = list.length > 0;
-$('#more').hidden = n >= list.length;
-$('#shown').textContent = list.length ? `Показано ${fmtN(n)} з ${fmtN(list.length)}` : '';
-}
-function appendRows() {
-const from = S.shown;
-S.shown += PAGE;
-const to = Math.min(S.shown, S.filtered.length);
-let h = '';
-for (let i = from; i < to; i++) h += rowHtml(S.filtered[i]);
-$('#rows').insertAdjacentHTML('beforeend', h);
-$('#more').hidden = to >= S.filtered.length;
-$('#shown').textContent = `Показано ${fmtN(to)} з ${fmtN(S.filtered.length)}`;
-}
-
-let loadSeq = 0;
-async function loadLoads() {
-const my = ++loadSeq;
-const p = { limit: 5000, offset: 0 };
+// Параметри запиту за поточною вкладкою й фільтрами (без limit/offset)
+function listQuery() {
+const p = {};
 for (const k in S.f) {
 if (typeof S.f[k] === 'boolean') { if (S.f[k]) p[k] = true; } else if (S.f[k].trim()) p[k] = S.f[k].trim();
 }
-if (S.tab === 'published' || S.tab === 'needs_review') p.status = S.tab;
-if (S.tab === 'archive') p.status = ['inactive', 'deleted'];
+if (TAB_STATUS[S.tab]) p.status = TAB_STATUS[S.tab];
+return p;
+}
+function listNote() {
+let el = $('#list-note');
+if (!el) { // сторінка з кешу браузера, ще без цього блока
+el = document.createElement('div'); el.id = 'list-note'; el.className = 'list-note'; el.setAttribute('role', 'status');
+$('#v-loads .tbl-wrap').prepend(el);
+}
+return el;
+}
+function renderRows() {
+const loaded = L.at > 0;
+// сервер уже відповів на цей запит — показуємо рівно його рядки; ще ні — те, що вже є, під локальним фільтром
+let list = S.items;
+if (!loaded) { const ok = loadFilter(S.f), tab = TAB_MATCH[S.tab]; list = list.filter((l) => tab(l.status) && ok(l)); }
+const n = list.length;
+let h = '';
+for (let i = 0; i < n; i++) h += rowHtml(list[i]);
+$('#rows').innerHTML = h;
+// «Немає заявок» — лише коли сервер справді відповів нулем рядків; до відповіді — «завантажую», після збою — причина
+const note = listNote();
+note.hidden = !L.error;
+note.textContent = L.error ? `Не вдалося завантажити список: ${L.error.replace(/[.\s]+$/, '')}. Пробую ще раз…${loaded && n ? ' На екрані — дані станом на ' + hhmm(L.at) + '.' : ''}` : '';
+const empty = $('#empty');
+empty.hidden = n > 0 || !!L.error;
+empty.textContent = loaded ? 'Немає заявок за цими фільтрами' : 'Завантажую список…';
+const total = loaded ? Math.max(L.total || 0, n) : 0;
+const capped = loaded && n >= LIST_MAX && total > n;
+const more = $('#more');
+more.hidden = !(loaded && n < total && !capped);
+more.disabled = L.more;
+more.textContent = L.more ? 'Завантажую…' : 'Показати ще';
+$('#shown').textContent = !loaded ? (n && !L.error ? 'Оновлюю…' : '')
+: n ? `Показано ${fmtN(n)} з ${fmtN(total)}${capped ? ' — щоб побачити решту, уточніть фільтри' : ''}` : '';
+}
+
+// Вкладка або фільтр змінились: старі відповіді більше не потрібні, лічильники — з нуля.
+// Рядки не чистимо — до відповіді сервера вони показуються під локальним фільтром.
+function listChanged() {
+L.key = JSON.stringify(listQuery());
+L.want = PAGE; L.total = null; L.at = 0; L.error = ''; L.more = false;
+L.floor = L.seq + 1; L.busy = 0;
+renderRows();
+}
+// kind: 'user' — дія користувача (вкладка, фільтр, після правки заявки): новий запит, старіші відповіді відкидаються;
+//       'more' — «Показати ще»: наступна сторінка з сервера (offset);
+//       'bg'   — фонове оновлення: не стартує, поки попередній запит ще в польоті.
+async function loadLoads(kind = 'user') {
+const q = listQuery(), key = JSON.stringify(q);
+if (key !== L.key) { listChanged(); kind = 'user'; }
+if (kind === 'bg' && L.busy) return;
+if (kind === 'more' && !L.at) kind = 'user';
+const more = kind === 'more';
+const offset = more ? S.items.length : 0;
+const limit = more ? Math.min(PAGE, LIST_MAX - offset) : Math.min(LIST_MAX, Math.max(PAGE, L.want));
+if (limit <= 0) return;
+const seq = ++L.seq;
+if (kind !== 'bg') L.floor = seq;
+L.busy = seq;
+if (L.more !== more) { L.more = more; renderRows(); }
+const stale = () => seq < L.floor || seq <= L.applied || key !== L.key;
 try {
-const r = await call('loads.list', p);
-if (my !== loadSeq) return;
-S.items = r?.items || [];
-} catch (e) { toast(e.message, true); }
-applyFilters();
+const r = await call('loads.list', { ...q, limit, offset }, { timeout: LIST_TIMEOUT_MS, tries: 1 });
+if (stale()) return; // уже застосовано новішу відповідь або запит змінився
+L.applied = seq;
+const items = r?.items || [];
+if (more) {
+// поки дочитували, список міг зсунутись (з'явились нові заявки) — повтори за id не дублюємо
+const have = new Set(S.items.map((l) => l.id));
+S.items = S.items.concat(items.filter((l) => !have.has(l.id)));
+L.want = S.items.length;
+} else S.items = items;
+L.total = Number(r?.total ?? S.items.length) || 0;
+L.at = Date.now(); L.error = '';
+} catch (e) {
+if (stale()) return;
+L.error = e.message || 'невідома помилка';
+if (!(e instanceof AuthError)) retryList(!!e.net);
+} finally {
+if (L.busy === seq) { L.busy = 0; L.more = false; } // якщо запит уже витіснено новішим — busy/more належать тому
+}
 renderRows();
 }
 const loadLoadsSoon = debounce(loadLoads, 150);
+// Фонове оновлення: лише коли список на екрані й ніщо не перекриває таблицю
+const visible = () => document.visibilityState === 'visible';
+function refreshList() { if (authed && visible() && S.view === 'loads' && $('#modal').hidden) loadLoads('bg'); }
+// Після збою пробуємо знову самі: збій зв'язку — спершу шукаємо сервер (нова адреса тунелю, ping), інше — коротка пауза.
+// Один ланцюжок за раз; якщо він обірвався (вкладка браузера неактивна) — підхопить звичайне оновлення раз на 20 с.
+async function retryList(net) {
+if (L.retry) return;
+L.retry = true;
+try {
+if (net && !demo) await waitForReconnect(); else await new Promise((res) => setTimeout(res, LIST_RETRY_MS));
+} finally { L.retry = false; }
+if (L.error) refreshList();
+}
 
 async function loadStatus() { try { S.status = await call('status.get'); renderKpis(); } catch (e) { /* тихо */ } }
 async function loadSettings() { try { S.settings = await call('settings.get'); $('#dry').checked = !!S.settings?.lardi?.dryRun; renderBanners(); fillAccountFilter(); } catch (e) { toast(e.message, true); } }
@@ -523,22 +608,22 @@ sel.value = S.f.account;
 }
 
 $$('.filters input, .filters select').forEach((inp) => inp.addEventListener(inp.tagName === 'SELECT' || inp.type === 'checkbox' ? 'change' : 'input', () => {
-S.f[inp.dataset.f] = inp.type === 'checkbox' ? inp.checked : inp.value; S.shown = PAGE;
-applyFilters(); renderRows();   // миттєво локально
-loadLoadsSoon();                // і на сервері (дебаунс 150 мс)
+S.f[inp.dataset.f] = inp.type === 'checkbox' ? inp.checked : inp.value;
+listChanged();                  // миттєво локально — з уже завантажених рядків
+loadLoadsSoon();                // і на сервері (дебаунс 150 мс) — його відповідь і є списком
 }));
 $('#tabs').addEventListener('click', (e) => {
 const b = e.target.closest('[data-tab]'); if (!b) return;
-S.tab = b.dataset.tab; S.shown = PAGE; renderTabs(); applyFilters(); renderRows(); loadLoads();
+S.tab = b.dataset.tab; renderTabs(); listChanged(); loadLoads();
 });
-$('#more').addEventListener('click', appendRows);
+$('#more').addEventListener('click', () => loadLoads('more'));
 
 const byId = (id) => S.items.find((l) => l.id === id);
 function replaceLoad(l) {
 if (!l || !l.id) return;
 const i = S.items.findIndex((x) => x.id === l.id);
 if (i >= 0) S.items[i] = l; else S.items.unshift(l);
-applyFilters(); renderRows();
+renderRows();
 }
 $('#rows').addEventListener('click', async (e) => {
 const b = e.target.closest('[data-act]'); if (!b) return;
@@ -554,7 +639,7 @@ if (act === 'unpublish') { b.disabled = true; replaceLoad(await call('loads.unpu
 if (act === 'delete') {
 if (!(await confirmBox('Видалити заявку?', `${l.fromCity} → ${l.toCity}, ${l.cargo}. Якщо вона опублікована — буде знята з Lardi. Заявка ще 30 днів зберігатиметься в «Архіві».`))) return;
 await call('loads.delete', { id, fromLardi: true });
-S.items = S.items.filter((x) => x.id !== id); applyFilters(); renderRows(); toast('Видалено');
+S.items = S.items.filter((x) => x.id !== id); if (L.total) L.total--; renderRows(); toast('Видалено');
 }
 loadStatus(); loadLoads();
 } catch (err) { toast(err.message, true); b.disabled = false; }
@@ -1006,6 +1091,7 @@ function start(ping) {
 authed = true;
 S.version = ping?.version || '';
 S.items = []; S.status = null; S.settings = null;
+listChanged(); // новий вхід — список з нуля: «Завантажую список…», доки сервер не відповість
 document.body.classList.remove('locked');
 $('#login').hidden = true;
 if (demo) { const n = $('#net'); n.className = 'net'; $('span', n).textContent = 'демо'; netOk = null; }
@@ -1013,14 +1099,16 @@ boot();
 }
 async function boot() {
 renderTabs(); renderBanners();
-await Promise.all([loadSettings(), loadStatus()]);
-go(['settings', 'log', 'customers'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'loads');
+const view = ['settings', 'log', 'customers'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'loads';
+const base = Promise.all([loadSettings(), loadStatus()]);
+if (view === 'loads') go(view); // список не чекає на налаштування й лічильники — запити йдуть паралельно
+await base;
+if (view === 'loads') renderRows(); else go(view); // назви акаунтів Lardi в рядках — із налаштувань
 }
 // Опитування замість пушів
-const visible = () => document.visibilityState === 'visible';
 setInterval(() => { if (authed) loadStatus(); }, 10000);
-setInterval(() => { if (authed && visible() && S.view === 'loads' && $('#modal').hidden) loadLoads(); }, 20000);
-document.addEventListener('visibilitychange', () => { if (authed && visible()) { loadStatus(); if (S.view === 'loads') loadLoads(); } });
+setInterval(refreshList, LIST_REFRESH_MS);
+document.addEventListener('visibilitychange', () => { if (authed && visible()) { loadStatus(); refreshList(); } });
 
 (async () => {
 renderTabs();
@@ -1101,10 +1189,12 @@ const api = {
 ping: () => ({ version: 'demo', authed: true }),
 'loads.list': (p) => {
 if (p.customer) { const c = customers.find((x) => x.id === p.customer); const r = items.filter((l) => c && c.keys.includes(dKey(l))); return { items: clone(r), total: r.length }; }
-const sts = p.status ? [].concat(p.status) : null;
-const r = visible().filter((l) => (!sts || sts.includes(l.status)) && (!p.fav || listOf(l) === 'white'))
-.sort((a, b) => (listOf(b) === 'white') - (listOf(a) === 'white') || b.seenAt - a.seenAt);
-return { items: r.map(withFav), total: r.length };
+const sts = p.status && p.status !== 'all' ? [].concat(p.status) : null;
+const ok = loadFilter(p);
+const r = visible().filter((l) => (sts ? sts.includes(l.status) : l.status !== 'deleted')).map(withFav).filter(ok)
+.sort((a, b) => !!b.fav - !!a.fav || b.seenAt - a.seenAt);
+const offset = Math.max(0, Number(p.offset) || 0), limit = Math.max(1, Number(p.limit) || 500);
+return { items: r.slice(offset, offset + limit), total: r.length };
 },
 'customers.list': () => ({ items: clone(customers).map((c) => ({ ...c, loads: items.filter((l) => c.keys.includes(dKey(l))).length, live: items.filter((l) => c.keys.includes(dKey(l))).reduce((n, l) => n + l.lardi.filter((e) => e.id && e.status === 'published').length, 0) })), hiddenBlack: items.filter((l) => listOf(l) === 'black').length }),
 'customers.preview': (p) => {
