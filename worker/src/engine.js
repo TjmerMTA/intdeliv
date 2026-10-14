@@ -15,6 +15,14 @@ export const MAX_ACCOUNTS = 5;
 export const BLACK_REASON = 'чорний список';
 
 export const DEFAULT_SEARCH_URL = 'https://della.com.ua/search/a204bd204eflolz1z21z3z4z51z6z7z8z9y1y2y3y4y5y6h0ilk0m1.html';
+/**
+ * Галочка «Лише прямий замовник» керує й прапорцем самої Della в адресі пошуку (`z21` — лише прямі, `z2` — усі).
+ * Інакше вимкнена галочка нічого не дає: Della за адресою з `z21` непрямих замовників не віддає взагалі.
+ * Увімкнена галочка адреси не змінює — непрямих відкидає наш фільтр (extension/lib/filters.js).
+ */
+export function dellaSearchUrl(url, directOnly) {
+  return directOnly ? url : String(url).replace(/z21(?=[a-z.])/, 'z2');
+}
 
 export const DEFAULT_SETTINGS = {
   della: { searchUrls: [DEFAULT_SEARCH_URL], pollSeconds: 60, pagesPerPoll: 3 },
@@ -410,7 +418,7 @@ export class Engine {
       // усі сторінки всіх пошуків — паралельно
       const jobs = [];
       for (const searchUrl of s.della.searchUrls) {
-        for (let page = 0; page < s.della.pagesPerPoll; page++) jobs.push({ url: buildPageUrl(searchUrl, page), page });
+        for (let page = 0; page < s.della.pagesPerPoll; page++) jobs.push({ url: buildPageUrl(dellaSearchUrl(searchUrl, s.filters.directOnly), page), page });
       }
       const pages = await Promise.allSettled(jobs.map((j) => this.fetchDella(j.url)));
       const byId = new Map();
