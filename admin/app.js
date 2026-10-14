@@ -284,7 +284,20 @@ cList: 'white', customers: null, accDraft: null,
 //   busy — запит у польоті (фонове оновлення тоді не стартує); more — дочитується сторінка; retry — іде повтор після збою.
 const LIST_MAX = 5000; // стільки рядків сервер віддає за запит — більше на екрані не тримаємо
 const LIST_TIMEOUT_MS = 60000, LIST_REFRESH_MS = 20000, LIST_RETRY_MS = 5000;
-const L = { key: null, want: PAGE, total: null, at: 0, error: '', seq: 0, applied: 0, floor: 0, busy: 0, more: false, retry: false };
+const L = { key: null, want: PAGE, total: null, at: 0, error: '', seq: 0, applied: 0, floor: 0, busy: 0, more: false, retry: false, cachedAt: 0 };
+// Останній отриманий список (перша сторінка) — у браузері: поки сервер перезапускається чи відповідає повільно,
+// на екрані збережені заявки з часом, а не порожня таблиця. Лише показ — дії з рядками йдуть на сервер, як завжди.
+const LIST_CACHE = 'intdeliv.lastList';
+function saveListCache() {
+try { if (!demo && L.at && S.items.length) localStorage.setItem(LIST_CACHE, JSON.stringify({ key: L.key, at: L.at, total: L.total, items: S.items.slice(0, PAGE) })); } catch { /* переповнено чи приватний режим */ }
+}
+function restoreListCache() {
+if (demo || S.items.length || L.at) return;
+try {
+const c = JSON.parse(localStorage.getItem(LIST_CACHE) || 'null');
+if (c && c.key === L.key && Array.isArray(c.items) && c.items.length) { S.items = c.items; L.cachedAt = Number(c.at) || 0; }
+} catch { /* зіпсований запис — просто без нього */ }
+}
 const TABS = [
 ['all', 'Усі', (c) => sum(c, ['new', 'queued', 'published', 'needs_review', 'error', 'inactive'])],
 ['active', 'Активні', (c) => sum(c, ['new', 'queued', 'published', 'needs_review', 'error'])],
@@ -522,7 +535,9 @@ $('#rows').innerHTML = h;
 // «Немає заявок» — лише коли сервер справді відповів нулем рядків; до відповіді — «завантажую», після збою — причина
 const note = listNote();
 note.hidden = !L.error;
-note.textContent = L.error ? `Не вдалося завантажити список: ${L.error.replace(/[.\s]+$/, '')}. Пробую ще раз…${loaded && n ? ' На екрані — дані станом на ' + hhmm(L.at) + '.' : ''}` : '';
+note.textContent = !L.error ? '' : !loaded && n && L.cachedAt
+? `Сервер зараз не відповідає (${L.error.replace(/[.\s]+$/, '')}). Показую збережені заявки станом на ${hhmm(L.cachedAt)}, підключаюсь…`
+: `Не вдалося завантажити список: ${L.error.replace(/[.\s]+$/, '')}. Пробую ще раз…${loaded && n ? ' На екрані — дані станом на ' + hhmm(L.at) + '.' : ''}`;
 const empty = $('#empty');
 empty.hidden = n > 0 || !!L.error;
 empty.textContent = loaded ? 'Немає заявок за цими фільтрами' : 'Завантажую список…';
@@ -532,7 +547,7 @@ const more = $('#more');
 more.hidden = !(loaded && n < total && !capped);
 more.disabled = L.more;
 more.textContent = L.more ? 'Завантажую…' : 'Показати ще';
-$('#shown').textContent = !loaded ? (n && !L.error ? 'Оновлюю…' : '')
+$('#shown').textContent = !loaded ? (n && L.cachedAt ? `Збережений список станом на ${hhmm(L.cachedAt)} — оновлюю…` : n && !L.error ? 'Оновлюю…' : '')
 : n ? `Показано ${fmtN(n)} з ${fmtN(total)}${capped ? ' — щоб побачити решту, уточніть фільтри' : ''}` : '';
 }
 
@@ -540,8 +555,9 @@ $('#shown').textContent = !loaded ? (n && !L.error ? 'Оновлюю…' : '')
 // Рядки не чистимо — до відповіді сервера вони показуються під локальним фільтром.
 function listChanged() {
 L.key = JSON.stringify(listQuery());
-L.want = PAGE; L.total = null; L.at = 0; L.error = ''; L.more = false;
+L.want = PAGE; L.total = null; L.at = 0; L.error = ''; L.more = false; L.cachedAt = 0;
 L.floor = L.seq + 1; L.busy = 0;
+restoreListCache();
 renderRows();
 }
 // kind: 'user' — дія користувача (вкладка, фільтр, після правки заявки): новий запит, старіші відповіді відкидаються;
@@ -573,7 +589,8 @@ S.items = S.items.concat(items.filter((l) => !have.has(l.id)));
 L.want = S.items.length;
 } else S.items = items;
 L.total = Number(r?.total ?? S.items.length) || 0;
-L.at = Date.now(); L.error = '';
+L.at = Date.now(); L.error = ''; L.cachedAt = 0;
+saveListCache();
 } catch (e) {
 if (stale()) return;
 L.error = e.message || 'невідома помилка';
