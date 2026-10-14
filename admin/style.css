@@ -103,6 +103,10 @@ body.locked .side,body.locked .main{display:none}
 .ib svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .ib.red:hover{color:var(--err)}
 .empty{padding:40px;text-align:center;color:var(--mut)}
+.f-active{display:flex;flex-wrap:wrap;align-items:center;gap:10px;background:var(--warn-b);color:#7a3e00;border:1px solid #f6d7a7;border-radius:8px;padding:8px 12px;margin-bottom:12px}
+.f-active[hidden]{display:none}
+.f-active span{flex:1 1 auto}
+.filters input[type=search]::-webkit-search-cancel-button{cursor:pointer}
 .list-note{background:var(--warn-b);color:#7a3e00;border-bottom:1px solid #f6d7a7;padding:10px 14px;line-height:1.45}
 .more-wrap{display:flex;align-items:center;gap:12px;justify-content:center;padding:12px}
 .more-wrap:has(#more[hidden]){justify-content:flex-end}

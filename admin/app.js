@@ -523,7 +523,34 @@ $('#v-loads .tbl-wrap').prepend(el);
 }
 return el;
 }
+// Увімкнені фільтри — завжди на виду, з кнопкою «Скинути»: інакше значення, яке браузер сам підставив у поле
+// (автозаповнення телефона чи адреси), тихо ховає всі заявки, і таблиця здається порожньою.
+const F_LABEL = { fromCity: 'Із міста', toCity: 'До міста', fromRegion: 'Із області', toRegion: 'До області', payment: 'Оплата', account: 'Lardi', q: 'Пошук', fav: 'Обрані' };
+function activeFilters() {
+const out = [];
+for (const k in S.f) {
+const v = S.f[k];
+if (typeof v === 'boolean') { if (v) out.push(F_LABEL[k] || k); continue; }
+if (!String(v).trim()) continue;
+const el = $(`.filters [data-f="${k}"]`);
+const shown = el && el.tagName === 'SELECT' ? (el.selectedOptions[0]?.textContent || v) : v;
+out.push(`${F_LABEL[k] || k}: «${String(shown).trim()}»`);
+}
+return out;
+}
+function renderActiveFilters() {
+const box = $('#f-active'); if (!box) return;
+const list = activeFilters();
+box.hidden = !list.length;
+$('span', box).textContent = list.length ? 'Увімкнено фільтр — показано не всі заявки. ' + list.join(', ') : '';
+}
+function resetFilters() {
+for (const k in S.f) S.f[k] = typeof S.f[k] === 'boolean' ? false : '';
+$$('.filters input, .filters select').forEach((inp) => { if (inp.type === 'checkbox') inp.checked = false; else inp.value = ''; });
+listChanged(); loadLoads();
+}
 function renderRows() {
+renderActiveFilters();
 const loaded = L.at > 0;
 // сервер уже відповів на цей запит — показуємо рівно його рядки; ще ні — те, що вже є, під локальним фільтром
 let list = S.items;
@@ -540,7 +567,7 @@ note.textContent = !L.error ? '' : !loaded && n && L.cachedAt
 : `Не вдалося завантажити список: ${L.error.replace(/[.\s]+$/, '')}. Пробую ще раз…${loaded && n ? ' На екрані — дані станом на ' + hhmm(L.at) + '.' : ''}`;
 const empty = $('#empty');
 empty.hidden = n > 0 || !!L.error;
-empty.textContent = loaded ? 'Немає заявок за цими фільтрами' : 'Завантажую список…';
+empty.textContent = loaded ? (activeFilters().length ? 'Немає заявок за цими фільтрами — натисніть «Скинути фільтри» вгорі' : 'Немає заявок за цими фільтрами') : 'Завантажую список…';
 const total = loaded ? Math.max(L.total || 0, n) : 0;
 const capped = loaded && n >= LIST_MAX && total > n;
 const more = $('#more');
@@ -634,6 +661,7 @@ const b = e.target.closest('[data-tab]'); if (!b) return;
 S.tab = b.dataset.tab; renderTabs(); listChanged(); loadLoads();
 });
 $('#more').addEventListener('click', () => loadLoads('more'));
+$('#f-reset')?.addEventListener('click', resetFilters);
 
 const byId = (id) => S.items.find((l) => l.id === id);
 function replaceLoad(l) {

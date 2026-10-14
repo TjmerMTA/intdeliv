@@ -67,15 +67,16 @@
 
 <section id="v-loads" class="view">
 <div class="filters">
-<input data-f="fromCity" placeholder="Із міста" autocomplete="off">
-<input data-f="toCity" placeholder="До міста" autocomplete="off">
-<input data-f="fromRegion" placeholder="Із області" autocomplete="off">
-<input data-f="toRegion" placeholder="До області" autocomplete="off">
+<input type="search" name="flt-fromCity" data-f="fromCity" placeholder="Із міста" autocomplete="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore data-bwignore data-form-type="other">
+<input type="search" name="flt-toCity" data-f="toCity" placeholder="До міста" autocomplete="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore data-bwignore data-form-type="other">
+<input type="search" name="flt-fromRegion" data-f="fromRegion" placeholder="Із області" autocomplete="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore data-bwignore data-form-type="other">
+<input type="search" name="flt-toRegion" data-f="toRegion" placeholder="До області" autocomplete="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore data-bwignore data-form-type="other">
 <select data-f="payment" aria-label="Оплата"><option value="">Оплата: будь-яка</option><option value="cashless">Безнал</option><option value="cash">Готівка</option><option value="card">Картка</option><option value="vat">З ПДВ</option><option value="novat">Без ПДВ</option></select>
 <select data-f="account" aria-label="Lardi"><option value="">Lardi: будь-який</option><option value="none">Не опубліковано</option></select>
-<input data-f="q" placeholder="Телефон / ID / компанія" autocomplete="off">
+<input type="search" name="flt-q" data-f="q" placeholder="Пошук: ID / компанія / цифри" autocomplete="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore data-bwignore data-form-type="other">
 <label class="chk fav-f" title="Лише заявки обраних замовників"><input type="checkbox" data-f="fav"> Обрані ★</label>
 </div>
+<div id="f-active" class="f-active" role="status" hidden><span></span><button type="button" class="btn" id="f-reset">Скинути фільтри</button></div>
 <div class="tabs" id="tabs" role="tablist"></div>
 <div class="tbl-wrap">
 <div id="list-note" class="list-note" role="status" hidden></div>
