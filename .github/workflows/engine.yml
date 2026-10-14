@@ -1,6 +1,30 @@
 name: engine
-# Рушій IntDeliv: працює циклом ~5,75 год, розклад кожні 30 хв ставить наступний запуск у чергу,
-# тож він стартує одразу після попереднього. Публічний репозиторій — хвилини Actions безкоштовні.
+# Рушій IntDeliv: працює циклом ~5,75 год. Публічний репозиторій — хвилини Actions безкоштовні.
+#
+# Безперервність (щоб між запусками не було пауз):
+#  1) кожен запуск, щойно піднялися сервер і тунель, САМ ставить наступний у чергу (workflow_dispatch через
+#     GITHUB_TOKEN — для цього дозвіл actions: write; server/successor.mjs). Наступний чекає в групі `engine`
+#     і стартує тієї ж миті, коли цей завершиться;
+#  2) раз на 10 хв і в останньому кроці запуск перевіряє, чи наступник досі чекає, і якщо ні — ставить знову;
+#  3) розклад лишається запасним. Сам по собі він ненадійний: GitHub запускає його нерегулярно (паузи по 3–7 год),
+#     і якщо за час роботи запуску тригер не прийшов, після його завершення рушія немає (13.10.2026 — 2 год 29 хв).
+#
+# Крайні випадки:
+#  - у групі concurrency чекати може лише ОДИН запуск: новий у черзі скасовує старішого, що чекав (того, що працює,
+#    не чіпає — cancel-in-progress: false). Тому спрацювання розкладу просто замінює нашого наступника своїм;
+#    у списку Actions від заміненого лишається «cancelled» — це норма, а не збій;
+#  - запуск, поставлений у чергу, бере код з голови main НА МОМЕНТ ПОСТАНОВКИ й тримає його, скільки б не чекав.
+#    Після пушу в main наступник у черзі ще зі старим кодом. Щоб новий код пішов із наступного ж запуску:
+#    `gh workflow run engine.yml --ref main` (замінить того, що чекає); щоб негайно — ще й `gh run cancel <id поточного>`;
+#  - передача справ між запусками не змінилась: старий зупиняє сервер і зберігає базу (final save) → новий
+#    відновлює базу → піднімає тунель → пише api.json. Кроки одного job ідуть послідовно, а новий запуск стартує
+#    лише після завершення старого, тож відновлення завжди бачить останнє збереження;
+#  - збій постановки в чергу запуск не валить: successor.mjs завжди завершується з кодом 0, про невдачу — анотація;
+#  - запуск, що впав, теж ставить наступника, але не більше 3 збоїв на годину (щоб зламаний крок не крутив запуски
+#    по колу) — далі рушій чекає на розклад або ручний запуск;
+#  - GitHub вимикає розклад у репозиторії без активності 60 днів — кожен запуск знову вмикає workflow.
+#    Вимкнений уручну він не чіпає. Зупинити рушій навмисно: `gh workflow disable engine.yml`, потім скасувати
+#    запуск, що чекає, і поточний; повернути: `gh workflow enable engine.yml && gh workflow run engine.yml --ref main`.
 on:
   schedule:
     - cron: "*/30 * * * *"
@@ -10,6 +34,7 @@ concurrency:
   cancel-in-progress: false
 permissions:
   contents: write
+  actions: write
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -28,6 +53,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      - name: keep workflow enabled
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node server/successor.mjs enable || true
       - name: cloudflared
         run: |
           curl -fsSL -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -35,7 +64,12 @@ jobs:
       - name: restore db
         run: bash server/persist.sh restore
       - name: run
+        env:
+          SUCCESSOR_TOKEN: ${{ github.token }}
         run: |
+          # токен GitHub потрібен лише successor.mjs: серверу й тунелю в оточення він не потрапляє
+          GH_T="$SUCCESSOR_TOKEN"; unset SUCCESSOR_TOKEN
+          successor() { GITHUB_TOKEN="$GH_T" node server/successor.mjs "$@" || true; }
           node server/run.mjs > server.log 2>&1 &
           echo $! > server.pid
           for i in $(seq 1 60); do curl -fs localhost:$PORT/ >/dev/null && break; sleep 1; done
@@ -55,6 +89,8 @@ jobs:
           [ -n "$URL" ] || { echo "тунель не піднявся"; cat tunnel.log; exit 1; }
           bash server/persist.sh publish-url "$URL"
           echo "API: $URL"
+          # сервер і тунель працюють — ставимо в чергу наступника (він чекатиме, доки цей запуск не завершиться)
+          successor ensure
           n=0
           while kill -0 $(cat server.pid) 2>/dev/null; do
             sleep 30; n=$((n+1))
@@ -66,12 +102,26 @@ jobs:
               URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
               [ -n "$URL" ] && bash server/persist.sh publish-url "$URL" || true
             fi
-            [ $((n % 10)) -eq 0 ] && { bash server/persist.sh save || true; }
+            # кожні 5 хв — база в гілку data; невдача не зупиняє рушій, але й не мовчить
+            if [ $((n % 10)) -eq 0 ]; then
+              bash server/persist.sh save || echo "::error::базу не збережено (persist.sh save) — причина в рядках вище"
+            fi
+            # кожні 10 хв — чи наступник досі чекає (одна спроба; не вийшло — повторимо за 10 хв)
+            if [ $((n % 20)) -eq 0 ]; then successor ensure --tries=1; fi
           done
           echo "сервер завершився"; tail -n 20 server.log
       - name: final save
         if: always()
         run: |
-          kill $(cat server.pid 2>/dev/null) 2>/dev/null || true
-          sleep 3
-          bash server/persist.sh save || true
+          # сервер має встигнути дописати базу й закритися (до 90 с), лише тоді знімок повний
+          PID=$(cat server.pid 2>/dev/null || true)
+          if [ -n "$PID" ]; then
+            kill "$PID" 2>/dev/null || true
+            for i in $(seq 1 90); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
+          fi
+          bash server/persist.sh save
+      - name: queue successor (last check)
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node server/successor.mjs ensure --job-status="${{ job.status }}" || true
