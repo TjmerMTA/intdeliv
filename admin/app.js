@@ -464,7 +464,7 @@ const hc = hasCustomer(l);
 return `<tr class="${off ? 'off' : ''}${l.fav ? ' fav' : ''}" data-id="${esc(l.id)}">
 <td data-l="Дата"><div class="d1">${off ? '🚫 ' : ''}${fmtDate(l.dateFrom)}${l.dateTo && l.dateTo !== l.dateFrom ? '–' + fmtDate(l.dateTo) : ''}</div><div class="sub">${esc(l.firstSeenAt ? hhmm(l.firstSeenAt) : '')}${l.edited ? ' · ✎' : ''}</div>${off && l.updatedAt ? `<div class="sub" title="${esc(l.statusReason || '')}">в архіві до ${esc(fmtDay(l.updatedAt + ARCHIVE_MS))}</div>` : ''}</td>
 <td class="c-rt" data-l="Маршрут"><div class="rt">${l.fav ? '<span class="star" title="Обраний замовник">★</span>' : ''}${dl ? `<a class="rtl" href="${esc(dl)}" target="_blank" rel="noopener noreferrer" title="Відкрити на Della">` : ''}<span class="nw"><span class="dot">•</span> ${esc(l.fromCity)}</span> → <span class="nw"><span class="dot">•</span> ${esc(l.toCity)}</span>${dl ? '</a>' : ''}</div><div class="sub">${esc(l.fromRegion)} → ${esc(l.toRegion)}${dist}</div>${custLine(l)}</td>
-<td class="c-cg" data-l="Вантаж / авто"><div>${esc(l.cargo)}</div><div class="sub">${esc(l.body)}</div>${tags}</td>
+<td class="c-cg" data-l="Вантаж / авто"><div>${esc(l.cargo)}</div><div class="sub">${esc(l.body)}</div>${tags}${l.comment ? `<div class="cmt" title="${esc(l.comment)}">💬 ${esc(l.comment)}</div>` : ''}</td>
 <td class="num" data-l="Вага">${l.weight != null ? esc(fmtN(l.weight)) + ' т' : '—'}</td>
 <td class="num" data-l="Об'єм">${l.volume != null ? esc(fmtN(l.volume)) + ' м³' : '—'}</td>
 <td data-l="Ціна">${l.price ? `<div class="pr">${esc(fmtN(l.price))} ${esc(cur)}</div>${ppk ? `<div class="sub">${esc(fmtN(ppk))} ${esc(cur)}/км</div>` : ''}` : '<span class="muted">—</span>'}</td>
@@ -710,7 +710,8 @@ return `<label class="fld">${esc(label)}${input}</label>`;
 const pubs = (l.lardi || []).length ? `<h4>Публікації на Lardi</h4><table class="pubs">${l.lardi.map((a) => `<tr><td>${esc(accName(a.account))}</td><td>${a.id ? 'Lardi id ' + esc(a.id) : '—'}</td><td>${chip(a.status || (a.error ? 'error' : 'queued'), '', a.error)}</td><td class="muted">${a.publishedAt ? esc(new Date(a.publishedAt).toLocaleString('uk-UA')) : ''}</td></tr>`).join('')}</table>` : '';
 const hc = hasCustomer(l);
 modal.open(`<h3>Редагувати заявку</h3><form id="ef"><div class="grid">${f}
-<label class="fld wide">Мітки (через кому)<input name="tags" value="${esc((l.tags || []).join(', '))}"></label></div>${pubs}
+<label class="fld wide">Мітки (через кому)<input name="tags" value="${esc((l.tags || []).join(', '))}"></label>
+<label class="fld wide">Коментар<textarea name="comment" rows="2" maxlength="2000" autocomplete="off" placeholder="Лише для нас — нікуди не передається">${esc(l.comment || '')}</textarea><span class="hint">Бачите лише ви в IntDeliv. На Lardi не йде.</span></label></div>${pubs}
 <div class="m-foot"><button type="button" class="btn" data-lst="fav"${hc ? '' : ` disabled title="${esc(NO_CUST)}"`}>${l.fav ? '★ Прибрати з обраних' : '☆ В обрані'}</button><button type="button" class="btn" data-lst="black"${hc ? '' : ` disabled title="${esc(NO_CUST)}"`}>🚫 В чорний список</button><span style="flex:1"></span><button type="button" class="btn" data-close>Скасувати</button><button class="btn pri">Зберегти</button></div></form>`, (b) => {
 $('[data-close]', b).onclick = modal.close;
 $$('[data-lst]', b).forEach((x) => { x.onclick = () => { modal.close(); (x.dataset.lst === 'fav' ? toggleFav : toBlack)(l, x); }; });
@@ -724,12 +725,21 @@ if (String(l[k] ?? '') !== String(v ?? '')) patch[k] = v;
 }
 const tags = String(fd.get('tags') || '').split(',').map((s) => s.trim()).filter(Boolean);
 if (tags.join('|') !== (l.tags || []).join('|')) patch.tags = tags;
+const comment = String(fd.get('comment') || '').trim();
+if (comment !== (l.comment || '')) patch.comment = comment;
 if ('price' in patch || 'distanceKm' in patch) {
 const p = patch.price ?? l.price, d = patch.distanceKm ?? l.distanceKm;
 patch.pricePerKm = p && d ? Math.round((p / d) * 100) / 100 : null;
 }
 const btn = $('.btn.pri', b); btn.disabled = true;
-try { replaceLoad(await call('loads.update', { id: l.id, patch })); modal.close(); toast('Збережено'); loadLoads(); loadStatus(); }
+try {
+const saved = await call('loads.update', { id: l.id, patch });
+replaceLoad(saved); modal.close();
+// старий сервер (до оновлення рушія) поле коментаря мовчки пропускає — кажемо чесно
+if ('comment' in patch && (saved.comment || '') !== patch.comment) toast('Збережено, але коментар сервер ще не приймає — запрацює після оновлення сервера', true);
+else toast('Збережено');
+loadLoads(); loadStatus();
+}
 catch (err) { toast(err.message, true); btn.disabled = false; }
 };
 });

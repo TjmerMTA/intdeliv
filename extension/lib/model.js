@@ -9,6 +9,15 @@ export const EDITABLE_FIELDS = [
   'phone', 'edrpou', 'note',
 ];
 
+/** Лише наші поля: зберігаються в базі IntDeliv, на Lardi не йдуть і заявку «зміненою» не роблять. */
+export const LOCAL_FIELDS = ['comment'];
+
+/** Правка зачіпає лише LOCAL_FIELDS (прапорець edited від адмінки не рахується). */
+export const isLocalPatch = (patch = {}) => {
+  const keys = Object.keys(patch || {}).filter((k) => k !== 'edited');
+  return keys.length > 0 && keys.every((k) => LOCAL_FIELDS.includes(k));
+};
+
 /** Новая запись из результата парсера (уже с id/fingerprint). */
 export function newLoad(parsed, now = Date.now()) {
   return {
@@ -53,6 +62,12 @@ export function applyPatch(load, patch = {}, now = Date.now()) {
     if (Object.prototype.hasOwnProperty.call(patch, k)) {
       next[k] = patch[k];
       changed = true;
+    }
+  }
+  for (const k of LOCAL_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(patch, k)) {
+      const v = String(patch[k] ?? '').trim().slice(0, 2000);
+      if (v) next[k] = v; else delete next[k];
     }
   }
   if (changed) {

@@ -173,3 +173,8 @@ test('buildCargoBody: Lardi limits — note ≤ 100, contentName ≤ 50, setting
   assert.equal(b.groupage, undefined);
   assert.ok(b.contentName.length <= LIMITS.contentName);
 });
+
+test('buildCargoBody never carries the local comment', () => {
+  const b = buildCargoBody({ ...load, comment: 'лише для нас' }, { bodyIds: [34], from: { townId: 1, townName: 'Київ' }, to: { townId: 2, townName: 'Львів' }, paymentUnitId: 1 });
+  assert.doesNotMatch(JSON.stringify(b), /лише для нас/);
+});

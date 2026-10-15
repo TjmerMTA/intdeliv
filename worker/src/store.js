@@ -18,7 +18,7 @@ const OF_CUSTOMER = "(loads.custKeys <> '' AND EXISTS (SELECT 1 FROM customer_ke
 
 function rowOf(l) {
   const search = [l.id, l.cargo, l.company, l.phone, l.edrpou, l.fromCity, l.toCity, l.fromRegion, l.toRegion,
-    l.dellaRequestId, ...(l.lardi || []).map((e) => e.id)].filter((x) => x !== undefined && x !== null).join(' ');
+    l.dellaRequestId, l.comment, ...(l.lardi || []).map((e) => e.id)].filter((x) => x !== undefined && x !== null).join(' ');
   return {
     id: l.id,
     status: l.status || 'new',

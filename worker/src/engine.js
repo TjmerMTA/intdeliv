@@ -4,7 +4,7 @@ import { parseDellaSearchWithIds, buildPageUrl } from '../../extension/lib/della
 import { applyFilters } from '../../extension/lib/filters.js';
 import { LardiClient, NeedsReviewError } from '../../extension/lib/lardi.js';
 import {
-  STATUSES, applyPatch, maskToken, isMasked, accountsNeeded, upsertLardiEntry, describe,
+  STATUSES, applyPatch, isLocalPatch, maskToken, isMasked, accountsNeeded, upsertLardiEntry, describe,
   customerKeys, weakKeys, parseCustomerInput,
 } from '../../extension/lib/model.js';
 import { Store } from './store.js';
@@ -856,6 +856,8 @@ Engine.prototype.handlers = {
     const s = await this.getSettings();
     const cur = await this.store.getLoad(id);
     if (!cur) throw new Error('заявку не знайдено');
+    // лише коментар — тільки в нашу базу: без Lardi, черги й чорного списку
+    if (isLocalPatch(patch)) return this.store.updateLoad(id, (l) => ({ ...applyPatch(l, patch, this.now()), updatedAt: l.updatedAt }));
     let next = await this.store.updateLoad(id, (l) => applyPatch(l, patch || {}, this.now()));
     // правка телефону/компанії/ЄДРПОУ могла ввести заявку в чорний список або вивести з нього
     const black = await this.isBlackLoad(next);

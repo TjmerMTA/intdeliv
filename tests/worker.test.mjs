@@ -293,3 +293,31 @@ test('loads.list: payment filter (form via json_extract, ПДВ via tag)', async
   assert.deepEqual((await st.listLoads({ payment: 'vat' })).items.map((x) => x.id), ['a']);
   assert.deepEqual((await st.listLoads({ payment: 'novat' })).items.map((x) => x.id), ['b']);
 });
+
+test('local comment: saved and searchable, never sent to Lardi, does not touch the Lardi copy or the ✎ mark', async () => {
+  const h = setup();
+  await setSettings(h, {
+    lardi: { dryRun: false, mode: 'both', intervalSeconds: 5, accounts: [{ name: 'A', token: 'tokAAAA1111', enabled: true }] },
+  });
+  await h.engine().runCycle();
+  const pub = (await h.rpc('loads.list', { status: 'published' })).body.result.items[0];
+  assert.ok(pub, 'є опублікована заявка');
+  const writes = h.lardiWrites().length;
+  const calls = h.calls.lardi.length;
+  const r = await h.rpc('loads.update', { id: pub.id, patch: { edited: true, comment: 'Передзвонити Олегу 0501234567' } });
+  assert.equal(r.body.ok, true, r.body.error);
+  assert.equal(r.body.result.comment, 'Передзвонити Олегу 0501234567');
+  assert.notEqual(r.body.result.edited, true, 'коментар не робить заявку «зміненою»');
+  assert.equal(h.calls.lardi.length, calls, 'Lardi не викликано зовсім');
+  assert.equal(h.lardiWrites().length, writes);
+  const found = (await h.rpc('loads.list', { q: 'олегу' })).body.result.items;
+  assert.deepEqual(found.map((l) => l.id), [pub.id], 'пошук знаходить за коментарем');
+  // справжня правка разом із коментарем — оновлення на Lardi без коментаря
+  await h.rpc('loads.update', { id: pub.id, patch: { edited: true, price: 77777, comment: 'інший коментар' } });
+  const upd = h.calls.lardi.slice(calls).filter((c) => c.method !== 'GET');
+  assert.ok(upd.length >= 1, 'правка ціни йде на Lardi');
+  for (const c of upd) assert.doesNotMatch(JSON.stringify(c.body || {}), /коментар|Олегу/);
+  // порожній коментар прибирає його
+  const cleared = (await h.rpc('loads.update', { id: pub.id, patch: { comment: '' } })).body.result;
+  assert.ok(!cleared.comment);
+});
