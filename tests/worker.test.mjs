@@ -321,3 +321,31 @@ test('local comment: saved and searchable, never sent to Lardi, does not touch t
   const cleared = (await h.rpc('loads.update', { id: pub.id, patch: { comment: '' } })).body.result;
   assert.ok(!cleared.comment);
 });
+
+test('«Лише готівка/картка»: on — only cash/card (and manual) loads go to Lardi, the rest wait in the queue; off — all go', async () => {
+  const h = setup();
+  const s0 = (await h.rpc('settings.get')).body.result;
+  assert.equal(s0.lardi.cashCardOnly, false, 'за замовчуванням вимкнено');
+  await setSettings(h, { lardi: { dryRun: false, cashCardOnly: true, intervalSeconds: 5, accounts: [{ name: 'A', token: 'tokAAAA1111', enabled: true }] } });
+  await h.engine().runCycle();
+  const posts = () => h.calls.lardi.filter((c) => c.method === 'POST' && c.path === '/proposals/my/add/cargo');
+  assert.equal(posts().length, 0, 'у вибірці немає готівки/картки — нічого не публікується');
+  const q = (await h.rpc('loads.list', { status: 'queued' })).body.result.items;
+  assert.equal(q.length, 16, 'решта чекає в черзі');
+  const [cash, card, manual] = q;
+  await h.rpc('loads.update', { id: cash.id, patch: { payment: 'Готівка' } });
+  await h.rpc('loads.update', { id: card.id, patch: { payment: 'Картка' } });
+  assert.notEqual(manual.payment, 'Готівка');
+  const m = await h.rpc('loads.publish', { id: manual.id });
+  assert.equal(m.body.ok, true, m.body.error);
+  h.clock.t += 60e3;
+  await h.engine().publishTick(h.clock.t + 25e3);
+  const pub = (await h.rpc('loads.list', { status: 'published' })).body.result.items.map((l) => l.id).sort();
+  assert.deepEqual(pub, [cash.id, card.id, manual.id].sort(), 'готівка, картка і поставлена вручну');
+  const cc = (await h.rpc('loads.list', { payment: 'cashcard' })).body.result.items.map((l) => l.id).sort();
+  assert.deepEqual(cc, [cash.id, card.id].sort(), 'фільтр списку «Готівка або картка»');
+  await setSettings(h, { lardi: { cashCardOnly: false } });
+  h.clock.t += 60e3;
+  await h.engine().publishTick(h.clock.t + 25e3);
+  assert.ok((await h.rpc('loads.list', { status: 'published' })).body.result.items.length > 3, 'вимкнули — публікуються й інші');
+});

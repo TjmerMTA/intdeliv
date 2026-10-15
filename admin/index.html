@@ -59,6 +59,9 @@
 <label class="sw" title="У тестовому режимі нічого не публікується на Lardi">
 <input type="checkbox" id="dry"><span class="sw-t"></span><span>Тестовий режим</span>
 </label>
+<label class="sw" title="Увімкнено — на Lardi йдуть лише заявки з оплатою готівкою або на картку (і ті, що ви опублікували вручну); решта чекає в черзі">
+<input type="checkbox" id="cashonly"><span class="sw-t"></span><span>Лише готівка/картка</span>
+</label>
 <button class="btn" id="pause" title="Вимкнути автопублікацію й очистити чергу">Зупинити публікацію</button>
 <button class="btn dan" id="unpub-all" title="Зняти всі опубліковані заявки з Lardi">Зняти все з Lardi</button>
 <button class="btn pri" id="sync">Синхронізувати зараз</button>
@@ -71,7 +74,7 @@
 <input type="search" name="flt-toCity" data-f="toCity" placeholder="До міста" autocomplete="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore data-bwignore data-form-type="other">
 <input type="search" name="flt-fromRegion" data-f="fromRegion" placeholder="Із області" autocomplete="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore data-bwignore data-form-type="other">
 <input type="search" name="flt-toRegion" data-f="toRegion" placeholder="До області" autocomplete="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore data-bwignore data-form-type="other">
-<select data-f="payment" aria-label="Оплата"><option value="">Оплата: будь-яка</option><option value="cashless">Безнал</option><option value="cash">Готівка</option><option value="card">Картка</option><option value="vat">З ПДВ</option><option value="novat">Без ПДВ</option></select>
+<select data-f="payment" aria-label="Оплата"><option value="">Оплата: будь-яка</option><option value="cashless">Безнал</option><option value="cashcard">Готівка або картка</option><option value="cash">Готівка</option><option value="card">Картка</option><option value="vat">З ПДВ</option><option value="novat">Без ПДВ</option></select>
 <select data-f="account" aria-label="Lardi"><option value="">Lardi: будь-який</option><option value="none">Не опубліковано</option></select>
 <input type="search" name="flt-q" data-f="q" placeholder="Пошук: ID / компанія / цифри" autocomplete="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore data-bwignore data-form-type="other">
 <label class="chk fav-f" title="Лише заявки обраних замовників"><input type="checkbox" data-f="fav"> Обрані ★</label>

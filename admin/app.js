@@ -365,6 +365,7 @@ function renderBanners() {
 let h = '';
 if (demo) h += `<div class="banner warn"><span class="tag-demo">ДЕМО</span>Показано демонстраційні дані — дії нічого не змінюють. <a href="#" data-logout>Вийти з демо</a></div>`;
 if (S.settings?.lardi?.dryRun) h += `<div class="banner info">🧪 <b>Тестовий режим — нічого не публікується.</b> Заявки проходять усі перевірки, але на Lardi не відправляються. Вимкніть перемикач «Тестовий режим», коли будете готові.</div>`;
+if (S.settings?.lardi?.cashCardOnly) h += `<div class="banner info">💳 <b>Лише готівка/картка.</b> На Lardi йдуть тільки заявки з оплатою готівкою або на картку (і ті, що ви опублікували вручну). Решта чекає в черзі й піде, щойно вимкнете перемикач.</div>`;
 if (S.status?.lastError) h += `<div class="banner warn">Остання помилка: ${esc(S.status.lastError)}</div>`;
 $('#banners').innerHTML = h;
 }
@@ -432,7 +433,7 @@ const PAY_TERM = /пдв|оплат|платеж|розвантаженні|за
 const payTerms = (l) => (l.tags || []).filter((t) => PAY_TERM.test(t));
 const cargoTags = (l) => (l.tags || []).filter((t) => !PAY_TERM.test(t));
 const PAY_FILTER = {
-cashless: (l) => l.payment === 'Безнал', cash: (l) => l.payment === 'Готівка', card: (l) => l.payment === 'Картка',
+cashless: (l) => l.payment === 'Безнал', cashcard: (l) => l.payment === 'Готівка' || l.payment === 'Картка', cash: (l) => l.payment === 'Готівка', card: (l) => l.payment === 'Картка',
 vat: (l) => (l.tags || []).some((t) => /^пдв$/i.test(String(t).trim())), novat: (l) => (l.tags || []).some((t) => /без пдв/i.test(t)),
 };
 // Прямого посилання на заявку Della немає (ID шифрується на кожен запит), тож відкриваємо пошук саме цього маршруту місто → місто
@@ -643,7 +644,7 @@ if (L.error) refreshList();
 }
 
 async function loadStatus() { try { S.status = await call('status.get'); renderKpis(); } catch (e) { /* тихо */ } }
-async function loadSettings() { try { S.settings = await call('settings.get'); $('#dry').checked = !!S.settings?.lardi?.dryRun; renderBanners(); fillAccountFilter(); } catch (e) { toast(e.message, true); } }
+async function loadSettings() { try { S.settings = await call('settings.get'); $('#dry').checked = !!S.settings?.lardi?.dryRun; $('#cashonly').checked = !!S.settings?.lardi?.cashCardOnly; renderBanners(); fillAccountFilter(); } catch (e) { toast(e.message, true); } }
 function fillAccountFilter() {
 const sel = $('select[data-f="account"]'); if (!sel) return;
 const accs = (S.settings?.lardi?.accounts || []).map((a, i) => [a, i]).filter(([a]) => !a.archived);
@@ -909,6 +910,16 @@ toast(want ? 'Тестовий режим увімкнено' : 'Тестови�
 } catch (err) { toast(err.message, true); e.target.checked = !want; }
 renderBanners(); if (S.view === 'settings') renderSettings(); loadStatus();
 });
+$('#cashonly').addEventListener('change', async (e) => {
+const want = e.target.checked;
+try {
+S.settings = await call('settings.set', { lardi: { ...(S.settings?.lardi || {}), cashCardOnly: want } });
+// старий сервер (до оновлення рушія) цю настройку не знає — не вдаємо, що ввімкнули
+if (!!S.settings?.lardi?.cashCardOnly !== want) { e.target.checked = !!S.settings?.lardi?.cashCardOnly; toast('Сервер ще не вміє «Лише готівка/картка» — запрацює після оновлення сервера', true); }
+else toast(want ? 'Лише готівка/картка: на Lardi йдуть тільки такі заявки, решта чекає в черзі' : 'Публікуються заявки з будь-якою оплатою');
+} catch (err) { toast(err.message, true); e.target.checked = !want; }
+renderBanners();
+});
 
 // Налаштування
 const lines = (a) => (a || []).join('\n');
@@ -1024,6 +1035,7 @@ const btn = $('.save-bar .btn', e.target); btn.disabled = true;
 try {
 S.settings = await call('settings.set', patch);
 $('#dry').checked = !!S.settings?.lardi?.dryRun;
+$('#cashonly').checked = !!S.settings?.lardi?.cashCardOnly;
 renderSettings(); renderBanners(); renderKpis(); toast('Налаштування збережено'); loadStatus();
 } catch (err) { toast(err.message, true); btn.disabled = false; }
 });
@@ -1234,7 +1246,7 @@ Object.assign(demoAdd('black', 'tel:380509998877', '050 999 88 77'), { note: 'д
 let settings = { della: { searchUrls: ['https://della.com.ua/search/a204bd204eflolz1z21z3z4z51z6z7z8z9y1y2y3y4y5y6h0ilk0m1.html'], pollSeconds: 90, pagesPerPoll: 4 },
 filters: { minPrice: 8000, directOnly: true, bodies: [], fromRegions: [], toRegions: [], excludeRegions: [], stopWords: ['металобрухт'], maxAgeHours: 24 },
 lardi: { accounts: [{ name: 'Кілик В.', token: '••••4821', enabled: true, state: 'ok' }, { name: 'Друге Ларді', token: '', enabled: true, state: 'pending' }],
-mode: 'both', autoPublish: true, dryRun: true, intervalSeconds: 20, dailyLimit: 500, note: '' }, staleHours: 6 };
+mode: 'both', autoPublish: true, dryRun: true, cashCardOnly: false, intervalSeconds: 20, dailyLimit: 500, note: '' }, staleHours: 6 };
 const counts = () => items.reduce((c, l) => ((c[l.status] = (c[l.status] || 0) + 1), c), {});
 const logs = [['info', 'Зібрано 25 заявок зі сторінки 1, нових: 3'], ['info', 'Опубліковано на Lardi (Софія): Полтава → Харків'], ['warn', 'needs_review: не знайдено кузов «цільномет» на Lardi'], ['error', 'Lardi 429 — повтор через 30 с']]
 .map(([level, msg], i) => ({ t: now - i * 4 * 60e3, level, msg }));

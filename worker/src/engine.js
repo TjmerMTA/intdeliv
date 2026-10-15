@@ -7,7 +7,7 @@ import {
   STATUSES, applyPatch, isLocalPatch, maskToken, isMasked, accountsNeeded, upsertLardiEntry, describe,
   customerKeys, weakKeys, parseCustomerInput,
 } from '../../extension/lib/model.js';
-import { Store } from './store.js';
+import { Store, MANUAL_QUEUE } from './store.js';
 
 export const VERSION = '1.2.0-worker';
 export const ARCHIVE_DAYS = 30;
@@ -35,7 +35,7 @@ export const DEFAULT_SETTINGS = {
       { name: 'Акаунт 1', token: '', enabled: true },
       { name: 'Акаунт 2', token: '', enabled: true },
     ],
-    mode: 'both', autoPublish: true, dryRun: true, intervalSeconds: 60, dailyLimit: 500, note: '',
+    mode: 'both', autoPublish: true, dryRun: true, cashCardOnly: false, intervalSeconds: 60, dailyLimit: 500, note: '',
   },
   staleHours: 6,
 };
@@ -211,6 +211,7 @@ export class Engine {
       if (p.mode !== undefined) next.lardi.mode = p.mode === 'roundrobin' ? 'roundrobin' : 'both';
       if (p.autoPublish !== undefined) next.lardi.autoPublish = !!p.autoPublish;
       if (p.dryRun !== undefined) next.lardi.dryRun = !!p.dryRun;
+      if (p.cashCardOnly !== undefined) next.lardi.cashCardOnly = !!p.cashCardOnly;
       if (p.intervalSeconds !== undefined) next.lardi.intervalSeconds = num(p.intervalSeconds, cur.lardi.intervalSeconds, 5, 3600);
       if (p.dailyLimit !== undefined) next.lardi.dailyLimit = Math.round(num(p.dailyLimit, cur.lardi.dailyLimit, 0, 10000));
       if (p.note !== undefined) next.lardi.note = String(p.note || '').slice(0, 300);
@@ -504,7 +505,7 @@ export class Engine {
       return {
         ...l,
         status: 'queued',
-        statusReason: manual ? 'поставлено в чергу вручну' : undefined,
+        statusReason: manual ? MANUAL_QUEUE : undefined,
         lardi: (l.lardi || []).filter((e) => e.status !== 'error' && e.status !== 'removed'),
         queuedAt: now,
         updatedAt: now,
@@ -529,7 +530,8 @@ export class Engine {
       const s = await this.getSettings();
       // autoPublish керує лише автоматичним постановленням у чергу; ручні «Опублікувати» теж тут
       const today = kyivDay(this.now());
-      const queued = (await this.store.queuedLight()).filter((l) => !(l.dateLast && l.dateLast < today));
+      // «Лише готівка/картка»: решта автоматичних чекає в черзі, поставлені вручну — публікуються
+      const queued = (await this.store.queuedLight(5000, { cashCardOnly: !!s.lardi.cashCardOnly })).filter((l) => !(l.dateLast && l.dateLast < today));
       if (!queued.length) break;
       const counts = await this.getToday(s.lardi.accounts.length);
       const lastAt = (await this.store.getMeta('lastPublishAt', {})) || {};

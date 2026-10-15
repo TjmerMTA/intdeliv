@@ -14,6 +14,9 @@ export const LISTS = ['black', 'white'];
 const inList = (list) => `(loads.custKeys <> '' AND EXISTS (SELECT 1 FROM customer_keys ck WHERE ck.list = '${list}' AND instr(loads.custKeys, '|' || ck.key || '|') > 0))`;
 export const IS_BLACK = inList('black');
 export const IS_WHITE = inList('white');
+/** «Лише готівка/картка»: оплата готівкою чи на картку, або заявку поставили в чергу вручну. */
+export const MANUAL_QUEUE = 'поставлено в чергу вручну';
+const CASH_CARD = `(json_extract(loads.data, '$.payment') IN ('Готівка', 'Картка') OR json_extract(loads.data, '$.statusReason') = '${MANUAL_QUEUE}')`;
 const OF_CUSTOMER = "(loads.custKeys <> '' AND EXISTS (SELECT 1 FROM customer_keys ck WHERE ck.customerId = ? AND instr(loads.custKeys, '|' || ck.key || '|') > 0))";
 
 function rowOf(l) {
@@ -142,10 +145,10 @@ export class Store {
   }
 
   /** Легкі рядки черги: {id, queuedAt, updatedAt, dateLast, lardi[], fav}. Обрані замовники — першими, чорний список — ні. */
-  async queuedLight(limit = 5000, { withBlack = false } = {}) {
+  async queuedLight(limit = 5000, { withBlack = false, cashCardOnly = false } = {}) {
     const { results } = await this.db.prepare(
       `SELECT id, queuedAt, updatedAt, dateLast, lardi, ${IS_WHITE} AS fav FROM loads WHERE status = 'queued'
-       ${withBlack ? '' : `AND NOT ${IS_BLACK}`} ORDER BY fav DESC, COALESCE(queuedAt, updatedAt) DESC LIMIT ?`,
+       ${withBlack ? '' : `AND NOT ${IS_BLACK}`} ${cashCardOnly ? `AND ${CASH_CARD}` : ''} ORDER BY fav DESC, COALESCE(queuedAt, updatedAt) DESC LIMIT ?`,
     ).bind(limit).all();
     return (results || []).map((r) => ({ ...r, fav: !!r.fav, lardi: parse(r.lardi, []) }));
   }
@@ -233,6 +236,7 @@ export class Store {
     if (p.toRegion) like('toRegionLc', p.toRegion);
     const PAY = { cashless: 'Безнал', cash: 'Готівка', card: 'Картка' };
     if (PAY[p.payment]) { where.push("json_extract(data, '$.payment') = ?"); args.push(PAY[p.payment]); }
+    if (p.payment === 'cashcard') where.push("json_extract(data, '$.payment') IN ('Готівка', 'Картка')");
     if (p.payment === 'vat') where.push(`data LIKE '%"ПДВ"%'`);
     if (p.payment === 'novat') where.push(`data LIKE '%"Без ПДВ"%'`);
     // Lardi: акаунт N (жива публікація саме там) або 'none' — ніде не опубліковано
