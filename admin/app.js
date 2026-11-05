@@ -874,20 +874,19 @@ try {
 let saved;
 try { saved = await call('loads.update', { id: l.id, patch, ...(released ? { fromBlack: true } : {}) }); }
 catch (err) {
-// рушій сам побачив, що правка виведе заявку з-під чорного списку, а ми не спитали (список застарів) — питаємо зараз;
-// відмова про інше чи вже після її «так» — показуємо його власні слова
-const act = err?.data?.action;
-if (err?.code !== 'fromBlack' || released || ['add', 'move', 'remove'].includes(act)) throw err;
+// рушій сам побачив, що правка виведе заявку з-під чорного списку (action 'edit'), а ми не спитали — бо список
+// у панелі застарів: питаємо зараз з його даних. Відмова про інше або вже після її «так» — його власні слова
+const rel = released ? null : releaseFromRefusal(err, patch);
+if (!rel) throw err;
 btn.disabled = false;
-const en = err.data?.entries?.[0];
-const ch = Object.keys(CUST_F).filter((k) => k in patch).map((k) => CUST_F[k]);
-showRelease(e.target, { ex: en ? { label: en.label || (en.keys || [])[0] } : null, what: ch.length > 1 ? ch.slice(0, -1).join(', ') + ' й ' + ch[ch.length - 1] : ch[0] || 'даних замовника' });
+showRelease(e.target, rel);
 return;
 }
-replaceLoad(saved); modal.close();
+const { affected, ...load } = saved || {}; // affected — лише у відповіді рушія, не в заявці
+replaceLoad(load); modal.close();
 // старий сервер (до оновлення рушія) поле коментаря мовчки пропускає — кажемо чесно
 if ('comment' in patch && (saved.comment || '') !== patch.comment) toast('Збережено, але коментар сервер ще не приймає — запрацює після оновлення сервера', true);
-else toast('Збережено');
+else toast(released ? releasedToast(saved) : 'Збережено');
 loadLoads(); loadStatus();
 }
 catch (err) { toast(err.message, true); btn.disabled = false; }
@@ -896,8 +895,26 @@ catch (err) { toast(err.message, true); btn.disabled = false; }
 }
 
 // Правка замовника в заявці може вивести її з чорного списку (це законне виправлення — не забороняємо, але кажемо):
-// → {ex: запис, що зараз її ховає, what: «телефону» / «назви компанії» / …} або null
+// → {ex: запис, що зараз її ховає, what: «телефону» / «назви компанії» / …, outcome} або null
 const CUST_F = { phone: 'телефону', company: 'назви компанії', edrpou: 'ЄДРПОУ' };
+const whatOf = (patch) => { const w = Object.keys(CUST_F).filter((k) => k in (patch || {})).map((k) => CUST_F[k]); return w.length > 1 ? w.slice(0, -1).join(', ') + ' й ' + w[w.length - 1] : w[0] || ''; };
+const kyivToday = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Kyiv' }).format(new Date()); // YYYY-MM-DD
+// Що станеться із заявкою, коли вона вийде з-під чорного списку — так само, як рахує рушій (loadRefusal):
+// сама ставить «Неактуальна» → inactive; «У черзі» → queued; дата минула → archived; інакше — за автопублікацією
+function releaseOutcome(l, patch) {
+if (patch.status === 'inactive') return 'inactive';
+if (patch.status === 'queued') return 'queued';
+const last = (patch.dateTo ?? l.dateTo) || (patch.dateFrom ?? l.dateFrom);
+if (last && last < kyivToday()) return 'archived';
+return S.status?.autoPublish !== false ? 'queued' : 'new';
+}
+// Що вона прочитає: куди саме піде заявка — «у чергу на Lardi» і «в роботу» для неї різні речі
+const RELEASE_THEN = {
+queued: 'і стане в чергу на Lardi — її опублікують',
+new: 'і повернеться в роботу; на Lardi сама не піде, бо автопублікацію зупинено',
+archived: 'і з\'явиться в Архіві — дата завантаження минула, на Lardi вона не піде',
+inactive: 'і буде серед знятих — ви самі ставите їй «Неактуальна», на Lardi вона не піде',
+};
 async function releaseCheck(l, patch) {
 const ch = Object.keys(CUST_F).filter((k) => k in patch);
 if (!ch.length) return null;
@@ -908,15 +925,34 @@ const next = { ...l, ...patch };
 let after = null; // без жодного ключа (усе стерто) — під список теж не підпадає
 try { after = await call('customers.preview', { phone: next.phone || '', name: next.company || '', edrpou: next.edrpou || '', dellaId: next.dellaCompanyId || '' }); } catch { after = null; }
 if (after?.list === 'black') return null;
-const what = ch.map((k) => CUST_F[k]);
-return { ex: await hitEntry(before), what: what.length > 1 ? what.slice(0, -1).join(', ') + ' й ' + what[what.length - 1] : what[0] };
+await loadStatus(); // автопублікація — зараз, а не коли відкрили сторінку
+return { ex: await hitEntry(before), what: whatOf(patch), outcome: releaseOutcome(l, patch) };
+}
+// Відмова рушія для правки (action 'edit'): питання — з його даних. Щось незнайоме (інший outcome, немає записів) —
+// у попередженні його власне речення, а не наше вгадане. → rel для showRelease або null (тоді — лише його слова тостом)
+function releaseFromRefusal(err, patch) {
+const d = err?.data;
+if (err?.code !== 'fromBlack' || d?.action !== 'edit') return null;
+const en = (d.entries || [])[0];
+const known = !!RELEASE_THEN[d.outcome] && !!en && !!whatOf(patch);
+return known ? { ex: { label: en.label || (en.keys || [])[0] }, what: whatOf(patch), outcome: d.outcome } : { text: err.message };
+}
+// Після збереження з fromBlack: що сказав рушій (affected), її словами
+function releasedToast(saved) {
+const a = saved?.affected;
+if (!a) return 'Збережено';
+if (a.queued) return 'Збережено. Заявка вийшла з чорного списку й стала в чергу на Lardi';
+if (saved.status === 'inactive') return a.archived ? 'Збережено. Заявка вийшла з чорного списку — вона в Архіві, дата минула' : 'Збережено. Заявка вийшла з чорного списку — вона серед знятих';
+if (a.restored) return 'Збережено. Заявка вийшла з чорного списку й повернулася в роботу';
+return 'Збережено. Заявка вийшла з чорного списку';
 }
 // Попередження всередині «Редагувати» (не окремим вікном — інакше пропали б її правки); «Скасувати» — наперед
 function showRelease(form, rel) {
 $('.rel-warn', form)?.remove();
 const box = document.createElement('div');
 box.className = 'warnline rel-warn';
-box.innerHTML = `<p>${esc(`Ця заявка зараз прихована чорним списком${rel.ex?.label ? ` (запис ${labelQ(rel.ex.label)})` : ''}. Після зміни ${rel.what} вона перестане підпадати під нього й може піти на Lardi.`)}</p><div class="m-foot"><button type="button" class="btn" data-x="0">Скасувати</button><button type="button" class="btn dan" data-x="1">Все одно зберегти</button></div>`;
+const text = rel.text || `Ця заявка зараз прихована чорним списком${rel.ex?.label ? ` (запис ${labelQ(rel.ex.label)})` : ''}. Після зміни ${rel.what} вона перестане підпадати під нього ${RELEASE_THEN[rel.outcome] || 'і знову буде видно'}.`;
+box.innerHTML = `<p>${esc(text)}</p><div class="m-foot"><button type="button" class="btn" data-x="0">Скасувати</button><button type="button" class="btn dan" data-x="1">Все одно зберегти</button></div>`;
 $('.m-foot', form).before(box);
 box.addEventListener('click', (ev) => {
 const x = ev.target.closest('[data-x]'); if (!x) return;
