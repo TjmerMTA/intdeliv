@@ -1081,6 +1081,8 @@ export class Engine {
     await this.catchUpBlack(s);
     // спершу добір того, що не вдалося зняти раніше; щойно неактуальні знімаються в markInactive нижче
     await this.sweepLardi(s);
+    // позначка «чорний список» без жодного чорного ключа в базі — заявка повертається туди, де їй місце
+    await this.reconcileBlackMarks(s, seenBefore);
     const cands = await this.store.staleCandidates(['new', 'queued', 'published', 'needs_review', 'error'], today, seenBefore, 200);
     let n = 0;
     for (const c of cands) {
@@ -1306,8 +1308,10 @@ export class Engine {
   /**
    * Одна заявка, прихована чорним списком, після зняття з нього: актуальна — у new, минула — лишається в архіві.
    * → 'restored' | 'archived' | null (заявку не ховав чорний список — не чіпаємо).
+   * unseen: {before, reason} — давно не видно в Della (seenAt < before) — теж в Архів, як у staleCheck; reason — новий
+   * statusReason для повернених у роботу.
    */
-  async restoreLoad(id, today = kyivDay(this.now())) {
+  async restoreLoad(id, today = kyivDay(this.now()), { unseen, reason = 'замовника прибрано з чорного списку' } = {}) {
     let kind = null;
     await this.store.updateLoad(id, (x) => {
       if (x.status !== 'inactive' || x.inactiveKind !== 'blacklist') return null;
@@ -1316,8 +1320,12 @@ export class Engine {
         kind = 'archived';
         return { ...x, inactiveKind: 'date', statusReason: 'дата завантаження минула', updatedAt: this.now() };
       }
+      if (unseen && (x.seenAt || 0) < unseen.before) {
+        kind = 'archived';
+        return { ...x, inactiveKind: 'stale', statusReason: unseen.reason, updatedAt: this.now() };
+      }
       kind = 'restored';
-      const next = { ...x, status: 'new', statusReason: 'замовника прибрано з чорного списку', lardi: (x.lardi || []).filter((e) => e.status !== 'removed'), updatedAt: this.now() };
+      const next = { ...x, status: 'new', statusReason: reason, lardi: (x.lardi || []).filter((e) => e.status !== 'removed'), updatedAt: this.now() };
       delete next.inactiveKind;
       return next;
     });
@@ -1341,6 +1349,38 @@ export class Engine {
       } else if (kind === 'archived') archived++;
     }
     return { restored, archived, queued };
+  }
+
+  /**
+   * Звірка позначок (staleCheck): заявка позначена «чорний список», але вже не підпадає під жоден ключ чорного списку
+   * в базі (позначку лишило недороблене зняття тощо) — повертаємо туди, де їй місце: у роботу (і в чергу, якщо
+   * автопублікація), в Архів — якщо дата минула або Della її давно не показує. Це не зняття блокування: правда — з
+   * чорного списку в базі, не з позначки; заявку, що підпадає під будь-який чорний ключ (за колонкою чи за даними
+   * замовника), не чіпаємо. Не більше limit за прохід, кожна — раз. seenBefore — як у staleCheck (-1 — збору ще не було).
+   * → {ids — розглянуті, restored, archived, queued}
+   */
+  async reconcileBlackMarks(s, seenBefore, limit = SWEEP_LIMIT) {
+    const ids = await this.store.staleBlackMarks(limit);
+    const r = { ids, restored: 0, archived: 0, queued: 0 };
+    if (!ids.length) return r;
+    const today = kyivDay(this.now());
+    const unseen = { before: seenBefore, reason: `не видно в Della понад ${s.staleHours} год` };
+    for (const id of ids) {
+      const cur = await this.store.getLoad(id);
+      if (!cur || (await this.isBlackLoad(cur))) continue;
+      const kind = await this.restoreLoad(id, today, { unseen, reason: 'більше не підпадає під чорний список' });
+      if (kind === 'restored') {
+        r.restored++;
+        if (s.lardi.autoPublish && (await this.enqueue(id, false))?.status === 'queued') r.queued++;
+      } else if (kind === 'archived') r.archived++;
+    }
+    const n = r.restored + r.archived;
+    if (n) {
+      const parts = [`у роботі ${r.restored}${r.queued ? `, з них у черзі на Lardi ${r.queued}` : ''}`];
+      if (r.archived) parts.push(`в Архіві ${r.archived} (дата минула або давно не видно в Della)`);
+      await this.log('info', `Чорний список: ${n} заявок більше не підпадають під чорний список — повернулися: ${parts.join('; ')}${ids.length >= limit ? ` (по ${limit} за прохід, решта — наступним)` : ''}`);
+    }
+    return r;
   }
 
   /** hiddenBefore — id заявок, прихованих чорним списком до дії (для чесного affected.visible). */

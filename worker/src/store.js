@@ -580,6 +580,18 @@ export class Store {
     return (results || []).map((r) => r.id);
   }
 
+  /**
+   * Позначки «чорний список» без жодного чорного ключа (за колонкою custKeys і customer_keys у базі): id, давніші
+   * першими, не більше limit. Перевірку за даними замовника робить Engine.reconcileBlackMarks.
+   */
+  async staleBlackMarks(limit) {
+    const { results } = await this.db.prepare(
+      `SELECT id FROM loads WHERE status = 'inactive' AND json_extract(data, '$.inactiveKind') = 'blacklist' AND NOT ${IS_BLACK}
+       ORDER BY updatedAt ASC, id ASC LIMIT ?`,
+    ).bind(limit).all();
+    return (results || []).map((r) => r.id);
+  }
+
   // ---------- settings / meta ----------
 
   async getKV(k, dflt) {
