@@ -224,3 +224,7 @@ details.ds-how p{margin:4px 0 0;font-size:12.5px;color:var(--mut)}
 .c-tel .lnk{font-size:12px}
 .c-tel-note{padding:8px 12px;border-bottom:1px solid var(--line);font-size:12.5px;color:#4a5462;background:#f7f8fa}
 .ds-res .ds-msg{color:var(--mut);font-size:12.5px}
+.c-mark{margin:0 0 0 6px;vertical-align:1px}
+.ctbl tr.c-hl td{background:var(--warn-b)!important;transition:background .3s}
+.rel-warn p{margin:0 0 8px}.rel-warn .m-foot{margin-top:6px}
+.c-cov{font-size:12.5px;margin:-4px 0 10px}
