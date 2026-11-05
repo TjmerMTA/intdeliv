@@ -228,7 +228,11 @@ test('ключ не може бути у двох списках: додаван
   assert.equal(cl.items.length, 1);
   // злиття двох записів, що виявились одним замовником
   const c2 = await h.call('customers.add', { list: 'white', text: 'della:A1' });
-  const m = await h.call('customers.add', { list: 'white', keys: ['della:A1', 'tel:380501234567'] });
+  // злиття з чорним записом в «Обрані» — лише навмисно (guard-black-to-white)
+  const no = await h.rpc('customers.add', { list: 'white', keys: ['della:A1', 'tel:380501234567'] });
+  assert.equal(no.ok, false);
+  assert.equal(no.code, 'fromBlack');
+  const m = await h.call('customers.add', { list: 'white', keys: ['della:A1', 'tel:380501234567'], fromBlack: true });
   assert.equal((await h.call('customers.list', {})).items.length, 1);
   assert.deepEqual(m.customer.keys.sort(), ['della:A1', 'tel:380501234567']);
   assert.ok([c2.customer.id, w.customer.id].includes(m.customer.id));

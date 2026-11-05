@@ -691,9 +691,9 @@ test('K2: міграція — збережені раніше ключі за �
   await st.migrate(); // як під час старту сервера
   assert.deepEqual((await st.getCustomer(customer.id)).keys, ['name:логістик плюс']);
   assert.equal((await st.loadsByKeys(['name:логістик плюс'])).length, 1, 'заявка знову належить замовнику');
-  assert.equal(await st.migrateNameKeys(), 0, 'повторно — нічого (позначка версії)');
+  assert.equal(await st.migrateNameKeys(), null, 'повторно — нічого (позначка версії)');
   await h.env.DB.prepare("DELETE FROM settings WHERE k = 'meta:nameKeysV'").run();
-  assert.equal(await st.migrateNameKeys(), 0, 'і без позначки — уже нема чого міняти');
+  assert.equal((await st.migrateNameKeys()).changed, 0, 'і без позначки — уже нема чого міняти');
 });
 
 test('status-della-has: status.get.della — has, phoneSeen і частка карток з останньої перевірки чи збору, без запиту до Della', async () => {

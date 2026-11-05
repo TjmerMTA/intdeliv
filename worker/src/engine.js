@@ -13,6 +13,15 @@ import {
 import { Store, MANUAL_QUEUE } from './store.js';
 
 export const VERSION = '1.2.0-worker';
+
+/** Відмова RPC з подробицями для адмінки: {ok:false, error, code, data} (worker/src/index.js). */
+export class RpcError extends Error {
+  constructor(message, code, data) {
+    super(message);
+    this.code = code;
+    this.data = data;
+  }
+}
 export const ARCHIVE_DAYS = 30;
 export const MAX_ACCOUNTS = 5;
 export const BLACK_REASON = 'чорний список';
@@ -276,11 +285,31 @@ export class Engine {
   ready() {
     let p = migrations.get(this.env.DB);
     if (!p) {
-      p = this.store.migrate().then((n) => { if (n) console.log(`[IntDeliv] migrate: custKeys для ${n} заявок`); });
+      p = this.store.migrate().then(async (n) => {
+        if (n) console.log(`[IntDeliv] migrate: custKeys для ${n} заявок`);
+        if (this.store.nameMigration) await this.logNameMigration(this.store.nameMigration);
+      });
       migrations.set(this.env.DB, p);
       p.catch(() => migrations.delete(this.env.DB));
     }
     return p;
+  }
+
+  /** Міграція ключів за назвою (Store.migrateNameKeys) + один рядок журналу. → null, якщо вже мігровано. */
+  async migrateNameKeys() {
+    const r = await this.store.migrateNameKeys();
+    if (r) await this.logNameMigration(r);
+    return r;
+  }
+
+  /** Один рядок: що міграція назв змінила, лишила й не розв'язала — лише лічильники. */
+  async logNameMigration(r) {
+    if (!(r.changed + r.kept + r.repaired + r.issues.length)) return;
+    const by = (k) => r.issues.filter((x) => x.kind === k).length;
+    await this.log(r.issues.length ? 'warn' : 'info', `Назви в списках (нові правила порівняння): оновлено ${r.changed}, лишено як було ${r.kept}, `
+      + `відновлено з підпису ${r.repaired}; не розв'язано ${r.issues.length} (два записи на одну фірму — ${by('clash')}, `
+      + `назва без змісту — ${by('empty')}, без ключа — ${by('keyless')})`
+      + `${r.blackWon ? `; спір чорного з білим — на користь чорного: ${r.blackWon}` : ''}; заявок перераховано ${r.loads}`);
   }
 
   waitUntil(p) {
@@ -1197,10 +1226,31 @@ export class Engine {
     return { hidden };
   }
 
+  /**
+   * Ключі зараз у чорному списку, а запит забирає їх в інший список (зокрема злиттям записів) — лише з
+   * {fromBlack: true}. Інакше відмова RpcError('fromBlack') з тим, що потрібно, аби спитати людину:
+   * {list: куди, entries: [{id, list, label, keys — спільні}], loads: скільки заявок повернулося б}.
+   */
+  async guardFromBlack(keys, toList, fromBlack) {
+    if (toList === 'black' || fromBlack === true) return;
+    const ids = [...new Set((await this.store.customersByKeys(keys)).filter((x) => x.list === 'black').map((x) => x.customerId))];
+    if (!ids.length) return;
+    const entries = [];
+    let loads = 0;
+    for (const id of ids.sort((a, b) => a - b)) {
+      const c = await this.store.getCustomer(id);
+      entries.push({ id: c.id, list: c.list, label: c.label ?? null, keys: c.keys.filter((k) => keys.includes(k)) });
+      loads += (await this.store.loadsByKeys(c.keys)).length;
+    }
+    const who = entries.map((e) => `«${e.label || e.keys[0]}»`).join(', ');
+    throw new RpcError(`${who} зараз у чорному списку — в «Обрані» переносимо лише після підтвердження (повернеться заявок: ${loads})`,
+      'fromBlack', { list: toList, entries, loads });
+  }
+
   /** Після зняття з чорного списку: актуальні — у new (+ черга), минулі — лишаються в архіві. */
   async restoreUnblocked(s) {
     const today = kyivDay(this.now());
-    let restored = 0; let archived = 0;
+    let restored = 0; let archived = 0; let queued = 0;
     for (const id of await this.store.unblockedIds()) {
       const l = await this.store.updateLoad(id, (x) => {
         const last = x.dateTo || x.dateFrom;
@@ -1212,10 +1262,10 @@ export class Engine {
       if (!l) continue;
       if (l.status === 'new') {
         restored++;
-        if (s.lardi.autoPublish) await this.enqueue(id, false);
+        if (s.lardi.autoPublish && (await this.enqueue(id, false))?.status === 'queued') queued++;
       } else archived++;
     }
-    return { restored, archived };
+    return { restored, archived, queued };
   }
 
   async afterListChange(customer, prevList, s) {
@@ -1224,8 +1274,14 @@ export class Engine {
       await this.log('info', `Чорний список: «${customer.label || customer.keys[0]}» — приховано ${a.hidden}, знято з Lardi ${a.removed}${a.failed ? `, не вдалося зняти ${a.failed}` : ''}`);
       return a;
     }
-    const a = prevList === 'black' ? await this.restoreUnblocked(s) : { restored: 0 };
-    await this.log('info', `Обрані: «${customer.label || customer.keys[0]}»${a.restored ? `, повернуто з чорного списку ${a.restored}` : ''}`);
+    if (prevList !== 'black') {
+      await this.log('info', `Обрані: «${customer.label || customer.keys[0]}»`);
+      return { restored: 0 };
+    }
+    // навмисний перенос із чорного (fromBlack): правда для адмінки — скільки заявок знову видно і скільки в черзі
+    const a = await this.restoreUnblocked(s);
+    a.visible = (await this.store.loadsByKeys(customer.keys)).length;
+    await this.log('info', `Обрані: «${customer.label || customer.keys[0]}» — з чорного списку в «Обрані» (підтверджено): знову видно заявок ${a.visible}, у черзі ${a.queued}`);
     return a;
   }
 }
@@ -1416,7 +1472,8 @@ Engine.prototype.handlers = {
 
   async 'customers.list'({ list } = {}) {
     const l = list === 'black' || list === 'white' ? list : undefined;
-    return { items: await this.store.listCustomers(l), hiddenBlack: await this.store.hiddenBlackCount() };
+    // nameKeyIssues — що не розв'язала міграція назв (два записи на одну фірму тощо), щоб адмінка показала
+    return { items: await this.store.listCustomers(l), hiddenBlack: await this.store.hiddenBlackCount(), nameKeyIssues: await this.store.nameKeyIssues() };
   },
 
   /** Лише читання — для діалогу підтвердження. */
@@ -1449,6 +1506,7 @@ Engine.prototype.handlers = {
     const list = p.list === 'black' ? 'black' : p.list === 'white' ? 'white' : null;
     if (!list) throw new Error('list: black або white');
     const { keys, label } = await this.resolveCustomer(p);
+    await this.guardFromBlack(keys, list, p.fromBlack);
     const s = await this.getSettings();
     const prevLists = await this.store.customersByKeys(keys);
     const prevList = prevLists.some((h) => h.list === 'black') ? 'black' : null;
@@ -1457,10 +1515,11 @@ Engine.prototype.handlers = {
     return { customer, affected };
   },
 
-  async 'customers.move'({ id, list } = {}) {
+  async 'customers.move'({ id, list, fromBlack } = {}) {
     if (list !== 'black' && list !== 'white') throw new Error('list: black або white');
     const cur = await this.store.getCustomer(id);
     if (!cur) throw new Error('замовника не знайдено');
+    if (cur.list === 'black') await this.guardFromBlack(cur.keys, list, fromBlack);
     const s = await this.getSettings();
     const customer = await this.store.setCustomerList(cur.id, list);
     const affected = await this.afterListChange(customer, cur.list, s);
@@ -1491,7 +1550,8 @@ Engine.prototype.handlers = {
     const c = await this.store.removeCustomer(id);
     if (!c) throw new Error('замовника не знайдено');
     const s = await this.getSettings();
-    const r = c.list === 'black' ? await this.restoreUnblocked(s) : { restored: 0, archived: 0 };
+    const r = c.list === 'black' ? await this.restoreUnblocked(s) : { restored: 0, archived: 0, queued: 0 };
+    r.visible = c.list === 'black' ? (await this.store.loadsByKeys(c.keys)).length : 0;
     await this.log('info', `${c.list === 'black' ? 'Чорний список' : 'Обрані'}: прибрано «${c.label || c.keys[0]}»${r.restored ? `, повернуто заявок ${r.restored}` : ''}`);
     return r;
   },
