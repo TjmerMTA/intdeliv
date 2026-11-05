@@ -477,8 +477,8 @@ const broken = known && ((cov && cov.w === 0 && !(session === 'alive' && cov.t =
 return { known, session, cov, broken, none: !!cov && cov.w === 0, checkedAt: d?.checkedAt || 0 };
 }
 // Що Della дає з входом: {phone, company, dellaCompanyId, edrpou} — з відповіді della.session.check (sample.has, по всіх
-// картках сторінки). status.get цього не несе, тож пам'ятаємо останню перевірку — доки не змінилась сама сесія
-// (settings.della.session.updatedAt). Якщо сервер колись додасть della.has / della.phoneSeen у status.get — беремо звідти.
+// картках сторінки). Спершу — status.get → della.has / della.phoneSeen (збережений стан останньої перевірки, без нового
+// запиту до Della); інакше — що показала «Перевірити» в цьому браузері, доки не змінилась сесія. Сама панель Della не питає.
 const HAS_LS = 'intdeliv.dellaHas';
 const sessStamp = () => String(S.settings?.della?.session?.updatedAt ?? '');
 function dellaHas() {
@@ -504,15 +504,6 @@ if (c.session === 'alive') return dellaHas()?.phone === false;
 return c.none;
 }
 const nameOnly = () => custState().session === 'alive' && dellaHas()?.phone === false;
-// Живий вхід, а що дає Della — ще не перевіряли: одна тиха перевірка за відкриття сторінки
-let hasProbed = false;
-function probeHas() {
-if (hasProbed || custState().session !== 'alive' || dellaHas()) return;
-hasProbed = true;
-call('della.session.check', {}, { timeout: 60000, tries: 1 })
-.then((r) => { noteHas(r?.sample); if (S.customers) renderCustomers(); loadStatus(); })
-.catch(() => { /* старий сервер чи Della не відповіла — нічого не стверджуємо */ });
-}
 // Як сервер розпізнає ручне введення (parseCustomerInput): лише цифри/пробіли/дужки/+/-, номер України, не ЄДРПОУ/ІПН
 function isPhoneText(t) {
 t = String(t || '').trim();
@@ -938,14 +929,16 @@ renderCustWarn();
 $('#c-add .btn').textContent = S.cList === 'black' ? 'В чорний список' : 'В обрані';
 const rows = c.items.filter((x) => x.list === S.cList);
 const zeroWhy = custState().none ? 'Сервер не бачить замовника в жодній заявці — потрібен вхід у Della' : '';
-// Записи лише з телефоном: Della телефон не показує — тихо позначаємо й підказуємо, самі записи не чіпаємо
-const blindTel = phoneNo() ? rows.filter(telOnly) : [];
-const telNote = ensureEl('c-tel-note', 'c-tel-note', (el) => $('#v-customers .ctbl').before(el));
-telNote.hidden = !blindTel.length;
-telNote.textContent = blindTel.length ? `Лише за телефоном: ${fmtN(blindTel.length)} (усього записів: ${fmtN(rows.length)}). Della телефон не показує, тож за такими записами ${S.cList === 'black' ? 'блокування' : 'вибір в обрані'} не спрацює. Додайте назву компанії — ваші записи лишаються як є.` : '';
-const telHint = S.cList === 'black' ? 'За телефоном Della замовника не показує — додайте назву компанії, щоб блокування спрацювало' : 'За телефоном Della замовника не показує — додайте назву компанії, щоб це спрацювало';
+// Тихі позначки записів (самі записи не чіпаємо): чип і підказка в рядку, а над списком — один рядок-лічильник на вид
+const bl = S.cList === 'black';
+const marked = CUST_MARKS.map((mk) => [mk, rows.filter((x) => mk.on(x))]);
+const note = ensureEl('c-tel-note', 'c-tel-note', (el) => $('#v-customers .ctbl').before(el));
+const lines = marked.filter(([, xs]) => xs.length).map(([mk, xs]) => mk.count(xs.length, rows.length, bl));
+note.hidden = !lines.length;
+note.innerHTML = lines.map((t) => `<div>${esc(t)}</div>`).join('');
+const marksOf = (x) => marked.filter(([, xs]) => xs.includes(x)).map(([mk]) => mk);
 $('#c-rows').innerHTML = rows.map((x) => `<tr data-cid="${esc(x.id)}">
-<td data-l="Замовник"><b>${esc(x.label || '—')}</b>${blindTel.includes(x) ? `<span class="chip c-off tel-only">лише телефон</span><div class="c-tel">${esc(telHint)} · <button type="button" class="lnk" data-c="addname">Додати назву</button></div>` : ''}${x.list === 'black' && x.live ? `<div class="c-sweep" title="Не вдалося зняти одразу (Lardi не відповідав) — рушій повторює кожні 10 хв">на Lardi ще ${esc(fmtN(x.live))} — знімаємо</div>` : ''}</td>
+<td data-l="Замовник"><b>${esc(x.label || '—')}</b>${marksOf(x).map((mk) => `<span class="chip c-off c-mark ${mk.cls}">${esc(mk.chip)}</span>`).join('')}${marksOf(x).map((mk) => `<div class="c-tel">${esc(mk.hint(bl))}${mk.act ? ` · <button type="button" class="lnk" data-c="${mk.act[0]}">${esc(mk.act[1])}</button>` : ''}</div>`).join('')}${x.list === 'black' && x.live ?`<div class="c-sweep" title="Не вдалося зняти одразу (Lardi не відповідав) — рушій повторює кожні 10 хв">на Lardi ще ${esc(fmtN(x.live))} — знімаємо</div>` : ''}</td>
 <td data-l="Ключі">${(x.keys || []).map((k) => `<span class="key">${esc(keyLabel(k))}</span>`).join('')}</td>
 <td data-l="Додано" class="num">${esc(new Date(x.createdAt).toLocaleDateString('uk-UA'))}</td>
 <td data-l="Нотатка"><input class="note-in" data-note value="${esc(x.note || '')}" placeholder="—" aria-label="Нотатка"></td>
@@ -958,6 +951,18 @@ em.textContent = S.cList === 'black'
 ? 'Чорний список порожній. Натисніть 🚫 у рядку заявки або впишіть вище телефон, ЄДРПОУ чи назву — заявки такого замовника не показуватимуться й не публікуватимуться на Lardi.'
 : 'Обраних ще немає. Натисніть ☆ у рядку заявки або впишіть замовника вище — його заявки завжди вгорі списку й публікуються першими.';
 }
+// Види тихих позначок. Новий вид (напр. «два записи претендують на одну компанію», коли сервер дасть поле) — ще один елемент.
+//   on(x) — чи позначати запис; chip — коротко в рядку; hint(bl) — одне речення; act — посилання-дія; count(n, m, bl) — рядок над списком
+const CUST_MARKS = [
+{ id: 'tel', cls: 'tel-only', chip: 'лише телефон', act: ['addname', 'Додати назву'],
+on: (x) => phoneNo() && telOnly(x),
+hint: (bl) => `За телефоном Della замовника не показує — додайте назву компанії, щоб ${bl ? 'блокування спрацювало' : 'це спрацювало'}`,
+count: (n, m, bl) => `Лише за телефоном: ${fmtN(n)} (усього записів: ${fmtN(m)}). Della телефон не показує, тож за такими записами ${bl ? 'блокування' : 'вибір в обрані'} не спрацює. Додайте назву компанії — ваші записи лишаються як є.` },
+{ id: 'nokey', cls: 'no-key', chip: 'без ключа', act: ['addname', 'Додати замовника'],
+on: (x) => Array.isArray(x.keys) && !x.keys.length,
+hint: () => 'У записі не лишилось ні телефону, ні назви — він ні з чим не порівнюється. Додайте замовника ще раз',
+count: (n, m) => `Без ключа: ${fmtN(n)} (усього записів: ${fmtN(m)}) — такі записи ні з чим не порівнюються; додайте замовника ще раз.` },
+];
 $('#c-tabs').addEventListener('click', (e) => { const b = e.target.closest('[data-cl]'); if (!b) return; S.cList = b.dataset.cl; renderCustomers(); });
 // Елемент зі сторінки; якщо браузер ще тримає стару index.html без нього — створюємо
 function ensureEl(id, cls, place) {
@@ -980,7 +985,6 @@ const ht = typedTel ? PHONE_WARN : !c.broken || !c.cov ? '' : c.cov.w === 0
 : `Спрацює лише для заявок, де видно замовника: ${fmtN(c.cov.w)} з ${fmtN(c.cov.t)}.`;
 hint.hidden = !ht; hint.textContent = ht;
 $('#c-add .btn').title = ht;
-if (S.view === 'customers') probeHas();
 }
 $('#c-add [name="text"]').addEventListener('input', () => renderCustWarn());
 $('#v-customers').addEventListener('click', async (e) => {
@@ -1648,7 +1652,7 @@ return { ...a, token: t, state: a.archived || !a.enabled ? 'disabled' : t ? 'ok'
 });
 return withSess(clone(settings));
 },
-'status.get': () => ({ della: { session: sess.state, checkedAt: sess.checkedAt, customerSeen: custSeen() },
+'status.get': () => ({ della: { session: sess.state, checkedAt: sess.checkedAt, customerSeen: custSeen(), ...(custSeen() ? { has: { phone: !sess.nameOnly, company: true, dellaCompanyId: sess.nameOnly, edrpou: false }, phoneSeen: !sess.nameOnly } : {}) },
 custCoverage: { withCustomer: items.filter((l) => l.status !== 'deleted' && dKey(l)).length, total: items.filter((l) => l.status !== 'deleted').length },
 running: true, autoPublish: settings.lardi.autoPublish, lastPollAt: now - 70e3, counts: counts(), today: { collected: 187, published: settings.lardi.accounts.map((a, i) => (i ? 0 : 142)), dry: settings.lardi.accounts.map(() => 0) }, queue: items.filter((l) => l.status === 'queued').length,
 accounts: settings.lardi.accounts.map((a, i) => ({ index: i, name: a.name, enabled: a.enabled, archived: !!a.archived, state: a.archived || !a.enabled ? 'disabled' : a.token ? 'ok' : 'pending', hasToken: !!a.token, today: { published: i ? 0 : 142, dry: 0, limit: settings.lardi.dailyLimit }, live: i ? 0 : 118, errors: i ? 0 : 2, lastPublishAt: i ? undefined : now - 95e3 })) }),
