@@ -366,7 +366,9 @@ let h = '';
 if (demo) h += `<div class="banner warn"><span class="tag-demo">ДЕМО</span>Показано демонстраційні дані — дії нічого не змінюють. <a href="#" data-logout>Вийти з демо</a></div>`;
 if (S.settings?.lardi?.dryRun) h += `<div class="banner info">🧪 <b>Тестовий режим — нічого не публікується.</b> Заявки проходять усі перевірки, але на Lardi не відправляються. Вимкніть перемикач «Тестовий режим», коли будете готові.</div>`;
 if (S.settings?.lardi?.cashCardOnly) h += `<div class="banner info">💳 <b>Лише готівка/картка.</b> На Lardi йдуть тільки заявки з оплатою готівкою або на картку (і ті, що ви опублікували вручну). Решта чекає в черзі й піде, щойно вимкнете перемикач.</div>`;
-if (S.status?.lastError) h += `<div class="banner warn">Остання помилка: ${esc(S.status.lastError)}</div>`;
+// сесія, що вже працювала, тихо закінчилась — видно на будь-якій вкладці (на «Замовниках» про це каже своя строка)
+if (S.status?.della?.session === 'expired' && S.view !== 'customers') h += `<div class="banner warn">Сесія Della закінчилась — вставте нову. Поки її немає, заявки збираються без замовника, і чорний список їх не впізнає. <a href="#" data-go-sess>Налаштувати вхід у Della</a></div>`;
+if (S.status?.lastError) h +=`<div class="banner warn">Остання помилка: ${esc(S.status.lastError)}</div>`;
 $('#banners').innerHTML = h;
 }
 
@@ -391,6 +393,8 @@ $('span', r).textContent = on ? 'Публікація працює' : 'Публ�
 const pb = $('#pause'); pb.textContent = on ? 'Зупинити публікацію' : 'Відновити публікацію'; pb.classList.toggle('pri', !on);
 renderTabs();
 renderBanners();
+renderCustWarn();
+renderDellaSess();
 }
 setInterval(() => { if (S.status) $('#k-sync').textContent = rel(S.status.lastPollAt); }, 15000);
 
@@ -446,7 +450,63 @@ return /^https?:\/\//.test(l.dellaUrl || '') ? l.dellaUrl : '';
 // Чи є в заявці дані про замовника (як customerKeys на сервері, спрощено) — інакше кнопки списків неактивні
 const hasCustomer = (l) => !!(l.dellaCompanyId || String(l.edrpou || '').replace(/\D/g, '').length >= 8
 || String(l.phone || '').replace(/\D/g, '').length >= 9 || String(l.company || '').replace(/[^\p{L}\p{N}]/gu, '').length >= 4);
-const NO_CUST = 'Немає даних про замовника — впишіть телефон або компанію в редагуванні заявки';
+
+// Вхід у Della. Della показує замовника (назву, телефон) лише тим, хто увійшов: без сесії в заявках немає замовника,
+// і чорний/білий список нема з чим порівнювати. status.get → della {session, checkedAt, customerSeen} і custCoverage
+// {withCustomer, total}; старий сервер цих полів не знає — тоді нічого не стверджуємо (known = false).
+const DS_STATES = ['none', 'alive', 'blind', 'expired', 'error'];
+// стан → [клас чипа, короткий підпис, вердикт одним реченням]
+const DS = {
+none: ['c-warn', 'немає входу', 'Входу в Della немає — сервер бачить заявки без замовника, тож чорний список не спрацює.'],
+alive: ['c-ok', 'вхід працює', 'Вхід у Della працює — сервер бачить замовника заявок.'],
+blind: ['c-warn', 'замовника не видно', 'Вхід є, але замовник у картці не видно — схоже, акаунт Della не верифікований.'],
+expired: ['c-err', 'сесія закінчилась', 'Сесія Della закінчилась — увійдіть у Della ще раз і вставте нову.'],
+error: ['c-err', 'не вдалося перевірити', 'Не вдалося перевірити вхід — Della не відповіла. Спробуйте ще раз за хвилину.'],
+};
+const OLD_SERVER = (e) => /невідомий метод|unknown method/i.test(e?.message || '');
+const DS_OLD = 'Вхід у Della запрацює після оновлення сервера.';
+function custState(st = S.status) {
+const d = st?.della && typeof st.della === 'object' ? st.della : null;
+const c = st?.custCoverage && typeof st.custCoverage === 'object' ? st.custCoverage : null;
+const session = d && DS_STATES.includes(d.session) ? d.session : null;
+const w = Number(c?.withCustomer), t = Number(c?.total);
+const cov = c && Number.isFinite(w) && Number.isFinite(t) ? { w, t } : null;
+const known = !!(session || cov);
+// порожня база з живим входом — не збій; інакше: замовника не видно в жодній заявці або вхід не живий
+const broken = known && ((cov && cov.w === 0 && !(session === 'alive' && cov.t === 0)) || (!!session && session !== 'alive'));
+return { known, session, cov, broken, none: !!cov && cov.w === 0, checkedAt: d?.checkedAt || 0 };
+}
+// Чому кнопка списку неактивна — одне коротке речення
+function noCustWhy() {
+const c = custState();
+if (!c.known || c.session === 'alive') return 'Della не показала замовника цієї заявки — впишіть телефон у «Редагувати»';
+if (c.session === 'blind') return 'Замовника не видно: акаунт Della не верифікований (Налаштування → Della)';
+if (c.session === 'expired') return 'Замовника не видно: сесія Della закінчилась (Налаштування → Della)';
+return 'Замовника не видно: немає входу в Della (Налаштування → Della)';
+}
+// Неактивна кнопка не показує підказку в частині браузерів — підказка на обгортці
+const offBtn = (html, why) => `<span class="ib-w" title="${esc(why)}">${html}</span>`;
+// Чесна строка над «Замовниками»: null — список працює (або сервер ще не вміє сказати)
+function custWarnText() {
+const c = custState();
+if (!c.broken) return null;
+const head = c.cov && c.cov.w > 0
+? `Чорний список працює лише частково: замовника видно в ${fmtN(c.cov.w)} з ${fmtN(c.cov.t)} заявок.`
+: `Чорний список зараз не працює: сервер не бачить замовника заявок${c.cov ? ` (${fmtN(c.cov.w)} з ${fmtN(c.cov.t)})` : ''}.`;
+const why = {
+alive: 'Вхід у Della є — замовник з\'явиться в нових заявках після наступного збору.',
+blind: 'Вхід у Della є, але замовник у картці не видно — схоже, акаунт Della не верифікований.',
+expired: 'Сесія Della закінчилась — вставте нову.',
+error: 'Не вдалося перевірити вхід у Della — натисніть «Перевірити» в налаштуваннях.',
+}[c.session] || 'Della показує замовника лише після входу.';
+return { text: head + ' ' + why, button: c.session !== 'alive' };
+}
+// Попередження в підтвердженні «В чорний список», поки список не працює
+function blackWarn(pv) {
+const parts = [pv?.weak ? WEAK : ''];
+if (custState().none) parts.push('Зараз запис нічого не приховає: сервер не бачить замовника заявок. Він запрацює, щойно з\'явиться вхід у Della.');
+return parts.filter(Boolean).join(' ');
+}
 function custLine(l) {
 const parts = [l.company, l.phone, l.edrpou ? 'ЄДРПОУ ' + l.edrpou : ''].filter(Boolean);
 return parts.length ? `<div class="cust">${l.fav ? '<span class="star">★</span>' : ''}${esc(parts.join(' · '))}</div>` : '';
@@ -462,6 +522,7 @@ const dl = dellaLink(l);
 const canPub = l.status !== 'published' && l.status !== 'queued';
 const canUnpub = (l.lardi || []).some((a) => a.id && a.status !== 'removed') || l.status === 'published';
 const hc = hasCustomer(l);
+const why = hc ? '' : noCustWhy();
 return `<tr class="${off ? 'off' : ''}${l.fav ? ' fav' : ''}" data-id="${esc(l.id)}">
 <td data-l="Дата"><div class="d1">${off ? '🚫 ' : ''}${fmtDate(l.dateFrom)}${l.dateTo && l.dateTo !== l.dateFrom ? '–' + fmtDate(l.dateTo) : ''}</div><div class="sub">${esc(l.firstSeenAt ? hhmm(l.firstSeenAt) : '')}${l.edited ? ' · ✎' : ''}</div>${off && l.updatedAt ? `<div class="sub" title="${esc(l.statusReason || '')}">в архіві до ${esc(fmtDay(l.updatedAt + ARCHIVE_MS))}</div>` : ''}</td>
 <td class="c-rt" data-l="Маршрут"><div class="rt">${l.fav ? '<span class="star" title="Обраний замовник">★</span>' : ''}${dl ? `<a class="rtl" href="${esc(dl)}" target="_blank" rel="noopener noreferrer" title="Відкрити на Della">` : ''}<span class="nw"><span class="dot">•</span> ${esc(l.fromCity)}</span> → <span class="nw"><span class="dot">•</span> ${esc(l.toCity)}</span>${dl ? '</a>' : ''}</div><div class="sub">${esc(l.fromRegion)} → ${esc(l.toRegion)}${dist}</div>${custLine(l)}</td>
@@ -473,8 +534,9 @@ return `<tr class="${off ? 'off' : ''}${l.fav ? ' fav' : ''}" data-id="${esc(l.i
 <td class="c-lr" data-l="Lardi">${lardiCell(l)}</td>
 <td class="c-ac"><div class="acts">
 <button class="ib" data-act="edit" title="Редагувати">${ICON.edit}</button>
-<button class="ib${l.fav ? ' fav-on' : ''}" data-act="fav" title="${hc ? (l.fav ? 'Прибрати з обраних' : 'В обрані — завжди вгорі й публікуються першими') : NO_CUST}"${hc ? '' : ' disabled'}>${l.fav ? '★' : '☆'}</button>
-<button class="ib" data-act="black" title="${hc ? 'В чорний список — не показувати й не публікувати' : NO_CUST}"${hc ? '' : ' disabled'}>🚫</button>
+${hc ? `<button class="ib${l.fav ? ' fav-on' : ''}" data-act="fav" title="${l.fav ? 'Прибрати з обраних' : 'В обрані — завжди вгорі й публікуються першими'}">${l.fav ? '★' : '☆'}</button>
+<button class="ib" data-act="black" title="В чорний список — не показувати й не публікувати">🚫</button>`
+: offBtn(`<button class="ib" data-act="fav" disabled aria-label="${esc(why)}">☆</button>`, why) + offBtn(`<button class="ib" data-act="black" disabled aria-label="${esc(why)}">🚫</button>`, why)}
 ${canPub ? `<button class="ib" data-act="publish" title="${off ? 'Повернути з архіву й опублікувати' : 'Опублікувати зараз'}">${ICON.pub}</button>` : ''}
 ${canUnpub ? `<button class="ib" data-act="unpublish" title="Зняти з Lardi">${ICON.unpub}</button>` : ''}
 ${dl ? `<a class="ib" href="${esc(dl)}" target="_blank" rel="noopener noreferrer" title="Відкрити на Della">${ICON.link}</a>` : ''}
@@ -710,10 +772,12 @@ return `<label class="fld">${esc(label)}${input}</label>`;
 }).join('');
 const pubs = (l.lardi || []).length ? `<h4>Публікації на Lardi</h4><table class="pubs">${l.lardi.map((a) => `<tr><td>${esc(accName(a.account))}</td><td>${a.id ? 'Lardi id ' + esc(a.id) : '—'}</td><td>${chip(a.status || (a.error ? 'error' : 'queued'), '', a.error)}</td><td class="muted">${a.publishedAt ? esc(new Date(a.publishedAt).toLocaleString('uk-UA')) : ''}</td></tr>`).join('')}</table>` : '';
 const hc = hasCustomer(l);
+const why = esc(noCustWhy());
 modal.open(`<h3>Редагувати заявку</h3><form id="ef"><div class="grid">${f}
 <label class="fld wide">Мітки (через кому)<input name="tags" value="${esc((l.tags || []).join(', '))}"></label>
 <label class="fld wide">Коментар<textarea name="comment" rows="2" maxlength="2000" autocomplete="off" placeholder="Лише для нас — нікуди не передається">${esc(l.comment || '')}</textarea><span class="hint">Бачите лише ви в IntDeliv. На Lardi не йде.</span></label></div>${pubs}
-<div class="m-foot"><button type="button" class="btn" data-lst="fav"${hc ? '' : ` disabled title="${esc(NO_CUST)}"`}>${l.fav ? '★ Прибрати з обраних' : '☆ В обрані'}</button><button type="button" class="btn" data-lst="black"${hc ? '' : ` disabled title="${esc(NO_CUST)}"`}>🚫 В чорний список</button><span style="flex:1"></span><button type="button" class="btn" data-close>Скасувати</button><button class="btn pri">Зберегти</button></div></form>`, (b) => {
+${hc ? '' : `<div class="warnline">${why}</div>`}
+<div class="m-foot"><button type="button" class="btn" data-lst="fav"${hc ? '' : ` disabled title="${why}"`}>${l.fav ? '★ Прибрати з обраних' : '☆ В обрані'}</button><button type="button" class="btn" data-lst="black"${hc ? '' : ` disabled title="${why}"`}>🚫 В чорний список</button><span style="flex:1"></span><button type="button" class="btn" data-close>Скасувати</button><button class="btn pri">Зберегти</button></div></form>`, (b) => {
 $('[data-close]', b).onclick = modal.close;
 $$('[data-lst]', b).forEach((x) => { x.onclick = () => { modal.close(); (x.dataset.lst === 'fav' ? toggleFav : toBlack)(l, x); }; });
 $('#ef', b).onsubmit = async (e) => {
@@ -760,12 +824,12 @@ return `Замовник «${pv.label}» (${pv.keys.map(keyLabel).join(', ')}). 
 }
 const WEAK = 'Замовника визначено лише за назвою — може збігтися з іншою компанією з такою самою назвою.';
 function blackDone(a) {
-return `У чорному списку. Приховано: ${a?.hidden ?? 0}, знято з Lardi: ${a?.removed ?? 0}${a?.failed ? ', не вдалося зняти: ' + a.failed + ' (див. Журнал)' : ''}`;
+return `У чорному списку. Приховано: ${a?.hidden ?? 0}, знято з Lardi: ${a?.removed ?? 0}${a?.failed ? ', не вдалося зняти: ' + a.failed + ' (див. Журнал)' : ''}${!a?.hidden && custState().none ? ' — сервер поки не бачить замовника заявок' : ''}`;
 }
 async function toBlack(l, b) {
 let pv;
 try { pv = await call('customers.preview', { loadId: l.id }); } catch (e) { return toast(e.message, true); }
-if (!(await confirmBox('Додати в чорний список?', blackText(pv), 'В чорний список', pv.weak ? WEAK : ''))) return;
+if (!(await confirmBox('Додати в чорний список?', blackText(pv), 'В чорний список', blackWarn(pv)))) return;
 if (b) b.disabled = true;
 try { const r = await call('customers.add', { list: 'black', loadId: l.id }); toast(blackDone(r.affected), !!r.affected?.failed); }
 catch (e) { toast(e.message, true); }
@@ -803,15 +867,17 @@ $('#c-tabs').innerHTML = [['white', 'Обрані ★'], ['black', 'Чорний
 `<button class="tab${S.cList === k ? ' on' : ''}" data-cl="${k}">${label}<span class="n">${fmtN(cnt(k))}</span></button>`).join('');
 const hid = $('#c-hidden');
 hid.hidden = S.cList !== 'black';
-hid.textContent = 'Приховано заявок: ' + fmtN(c.hiddenBlack || 0);
+hid.innerHTML = `<span>Приховано заявок: ${esc(fmtN(c.hiddenBlack || 0))}</span><button type="button" class="btn" id="c-reapply" title="Перевірити всі заявки, що вже лежать у базі: заявки замовників із чорного списку приховати, а опубліковані — зняти з Lardi">Застосувати список до старих заявок</button>`;
+renderCustWarn();
 $('#c-add .btn').textContent = S.cList === 'black' ? 'В чорний список' : 'В обрані';
 const rows = c.items.filter((x) => x.list === S.cList);
+const zeroWhy = custState().none ? 'Сервер не бачить замовника в жодній заявці — потрібен вхід у Della' : '';
 $('#c-rows').innerHTML = rows.map((x) => `<tr data-cid="${esc(x.id)}">
 <td data-l="Замовник"><b>${esc(x.label || '—')}</b>${x.list === 'black' && x.live ? `<div class="c-sweep" title="Не вдалося зняти одразу (Lardi не відповідав) — рушій повторює кожні 10 хв">на Lardi ще ${esc(fmtN(x.live))} — знімаємо</div>` : ''}</td>
 <td data-l="Ключі">${(x.keys || []).map((k) => `<span class="key">${esc(keyLabel(k))}</span>`).join('')}</td>
 <td data-l="Додано" class="num">${esc(new Date(x.createdAt).toLocaleDateString('uk-UA'))}</td>
 <td data-l="Нотатка"><input class="note-in" data-note value="${esc(x.note || '')}" placeholder="—" aria-label="Нотатка"></td>
-<td data-l="Заявок у базі" class="num">${x.loads ? `<button type="button" class="lnk" data-c="loads">${esc(fmtN(x.loads))}</button>` : '0'}</td>
+<td data-l="Заявок у базі" class="num">${x.loads ? `<button type="button" class="lnk" data-c="loads">${esc(fmtN(x.loads))}</button>` : `<span${zeroWhy ? ` title="${esc(zeroWhy)}"` : ''}>0</span>`}</td>
 <td data-l="На Lardi зараз" class="num">${esc(fmtN(x.live))}</td>
 <td class="c-ac"><div class="acts"><button type="button" class="btn" data-c="move">${x.list === 'black' ? 'В обрані' : 'В чорний список'}</button><button type="button" class="btn" data-c="remove">Прибрати</button></div></td></tr>`).join('');
 const em = $('#c-empty');
@@ -821,6 +887,45 @@ em.textContent = S.cList === 'black'
 : 'Обраних ще немає. Натисніть ☆ у рядку заявки або впишіть замовника вище — його заявки завжди вгорі списку й публікуються першими.';
 }
 $('#c-tabs').addEventListener('click', (e) => { const b = e.target.closest('[data-cl]'); if (!b) return; S.cList = b.dataset.cl; renderCustomers(); });
+// Елемент зі сторінки; якщо браузер ще тримає стару index.html без нього — створюємо
+function ensureEl(id, cls, place) {
+let el = document.getElementById(id);
+if (!el) { el = document.createElement('div'); el.id = id; el.className = cls; el.hidden = true; place(el); }
+return el;
+}
+// Чесна строка «чорний список не працює» + підказка під формою додавання — з живих custCoverage/della
+function renderCustWarn() {
+const box = ensureEl('c-warn', 'banner warn c-warn-line', (el) => $('#v-customers').prepend(el));
+const w = custWarnText();
+box.hidden = !w;
+box.innerHTML = w ? `<span>${esc(w.text)}</span>${w.button ? '<button type="button" class="btn" data-go-sess>Налаштувати вхід у Della</button>' : ''}` : '';
+const hint = ensureEl('c-add-hint', 'c-add-hint', (el) => $('#c-add').after(el));
+const c = custState();
+const ht = !c.broken || !c.cov ? '' : c.cov.w === 0
+? 'Запис збережеться, але спрацює лише тоді, коли сервер бачитиме замовника заявок — зараз не бачить у жодній.'
+: `Спрацює лише для заявок, де видно замовника: ${fmtN(c.cov.w)} з ${fmtN(c.cov.t)}.`;
+hint.hidden = !ht; hint.textContent = ht;
+$('#c-add .btn').title = ht;
+}
+$('#v-customers').addEventListener('click', async (e) => {
+const b = e.target.closest('#c-reapply'); if (!b) return;
+if (!(await confirmBox('Застосувати чорний список до старих заявок?', 'Усі заявки, що вже лежать у базі, буде перевірено за чорним списком: заявки цих замовників зникнуть зі списку, а опубліковані — знімуться з Lardi.', 'Застосувати'))) return;
+b.disabled = true; toast('Перевіряю заявки… це може зайняти хвилину');
+try {
+const r = await call('customers.reapply', {}, { timeout: 120000, tries: 1 });
+const n = r?.hidden ?? 0, m = r?.removed ?? 0;
+toast(`Приховано ${fmtN(n)}, знято з Lardi ${fmtN(m)}${r?.failed ? ', не вдалося зняти: ' + fmtN(r.failed) + ' (див. Журнал)' : ''}${!n && custState().none ? ' — сервер поки не бачить замовника заявок' : ''}`, !!r?.failed);
+} catch (err) { toast(OLD_SERVER(err) ? 'Ця кнопка запрацює після оновлення сервера' : err.message, true); }
+b.disabled = false; loadCustomers(); loadStatus(); loadLoads();
+});
+// «Налаштувати вхід у Della» — у налаштування, одразу до блока сесії з розгорнутою інструкцією
+document.addEventListener('click', (e) => {
+if (!e.target.closest('[data-go-sess]')) return;
+e.preventDefault();
+if (custState().session !== 'alive') S.dsHowOpen = true;
+go('settings');
+requestAnimationFrame(() => $('#della-sess')?.scrollIntoView({ block: 'start', behavior: 'smooth' }));
+});
 $('#c-add').addEventListener('submit', async (e) => {
 e.preventDefault();
 const fd = new FormData(e.target); const text = String(fd.get('text') || '').trim(); const note = String(fd.get('note') || '').trim();
@@ -828,7 +933,7 @@ const list = S.cList; const btn = $('.btn', e.target);
 try {
 if (list === 'black') {
 const pv = await call('customers.preview', { text });
-if (!(await confirmBox('Додати в чорний список?', blackText(pv), 'В чорний список', pv.weak ? WEAK : ''))) return;
+if (!(await confirmBox('Додати в чорний список?', blackText(pv), 'В чорний список', blackWarn(pv)))) return;
 }
 btn.disabled = true;
 const r = await call('customers.add', { list, text, note });
@@ -857,7 +962,7 @@ toast(r?.restored ? `Прибрано, повернуто заявок: ${r.rest
 const to = x.list === 'black' ? 'white' : 'black';
 if (to === 'black') {
 const pv = await call('customers.preview', { keys: x.keys, label: x.label });
-if (!(await confirmBox('Перенести в чорний список?', blackText(pv), 'В чорний список', pv.weak ? WEAK : ''))) return;
+if (!(await confirmBox('Перенести в чорний список?', blackText(pv), 'В чорний список', blackWarn(pv)))) return;
 }
 b.disabled = true;
 const r = await call('customers.move', { id, list: to });
@@ -931,6 +1036,7 @@ S.accDraft = (L.accounts && L.accounts.length ? L.accounts : [{}]).map((a) => ({
 const num = (name, label, v, extra = '') => `<label class="fld">${label}<input name="${name}" type="number" min="0" value="${esc(v ?? '')}" ${extra}></label>`;
 const txt = (name, label, v, ph = '') => `<label class="fld">${label}<input name="${name}" value="${esc(v ?? '')}" placeholder="${esc(ph)}"></label>`;
 const chk = (name, label, v) => `<label class="chk"><input type="checkbox" name="${name}"${v ? ' checked' : ''}> ${label}</label>`;
+const typed = $('#ds-cookie')?.value || ''; // вставлене, але ще не збережене — повертаємо DOM-властивістю, не в HTML
 $('#sf').innerHTML = `
 <div class="card"><h3>Сервер</h3><p class="help">Система працює на сервері цілодобово, 24/7, сама по собі: збирає заявки з Della й публікує їх на Lardi, навіть коли цю сторінку закрито, а комп'ютер вимкнено. Ця панель лише показує дані та змінює налаштування.${S.version ? ' Версія: ' + esc(S.version) + '.' : ''}</p>
 <div class="grid"><label class="fld wide">Адреса сервера<input name="api" value="${esc(demo ? '' : apiBase())}" placeholder="${esc(DEFAULT_API || 'автоматично')}"${demo ? ' disabled' : ''}></label></div></div>
@@ -939,6 +1045,23 @@ $('#sf').innerHTML = `
 <p class="help">Зробіть пошук на <a href="https://della.com.ua/" target="_blank" rel="noopener">della.com.ua</a> з потрібними фільтрами (країна, області, «прямий замовник», «з вартістю»), натисніть «Знайти» і скопіюйте адресу сторінки з рядка браузера. Одна адреса — один рядок. Якщо порожньо — береться вся Україна, прямий замовник, з вартістю.</p>
 <div class="grid"><label class="fld wide">Посилання на пошук Della<textarea name="searchUrls" placeholder="https://della.com.ua/search/a204bd204eflolz1z21z3z4z51z6z7z8z9y1y2y3y4y5y6h0ilk0m1.html">${esc(lines(d.searchUrls))}</textarea></label>
 ${num('pollSeconds', 'Опитувати кожні, с', d.pollSeconds, 'min="30"')}${num('pagesPerPoll', 'Сторінок за раз (по 25)', d.pagesPerPoll, 'min="1" max="40"')}</div></div>
+
+<div class="card" id="della-sess"><h3>Вхід у Della (сесія)</h3>
+<p class="help">Della показує замовника заявки (назву й телефон) лише тим, хто увійшов. Без вашого входу сервер не бачить замовника — і чорному списку нема з чим порівнювати.</p>
+<div class="ds-st" id="ds-st"></div>
+<div class="ds-row"><input id="ds-cookie" name="dellaCookie" form="ds-f" type="password" autocomplete="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore data-bwignore data-form-type="other" placeholder="вставте сюди рядок cookie з Della" aria-label="Сесія Della">
+<button type="button" class="btn pri" data-ds="save">Зберегти</button><button type="button" class="btn" data-ds="check">Перевірити</button><button type="button" class="btn" data-ds="clear">Прибрати</button></div>
+<div class="ds-res" id="ds-res" role="status"></div>
+<details class="ds-how" id="ds-how"${S.dsHowOpen ? ' open' : ''}><summary>Як скопіювати сесію з Chrome</summary><ol>
+<li>Відкрийте <a href="https://della.com.ua/" target="_blank" rel="noopener">della.com.ua</a> у Chrome — ви маєте бути увійшли (вгорі видно ваше ім'я).</li>
+<li>Натисніть <b>F12</b> — збоку відкриється панель. Угорі панелі виберіть вкладку <b>Network</b> (або «Мережа»).</li>
+<li>Оновіть сторінку Della клавішею <b>F5</b>.</li>
+<li>У списку в панелі натисніть на перший рядок — <b>della.com.ua</b>.</li>
+<li>Праворуч знайдіть розділ <b>Request Headers</b>, а в ньому рядок <b>cookie:</b> — виділіть його мишкою повністю й скопіюйте (Ctrl+C).</li>
+<li>Поверніться сюди, вставте в поле вище (Ctrl+V), натисніть «Зберегти», а потім «Перевірити».</li></ol>
+<p>🔒 Сесія зберігається лише в нашій зашифрованій базі на сервері й більше ніде не показується — навіть тут. Нікому її не пересилайте.</p>
+<p>Якщо на Della натиснути «Вийти», сесія закінчиться — тоді скопіюйте й вставте нову.</p></details>
+</div>
 
 <div class="card"><h3>Фільтри</h3><p class="help">Списки — через кому. Області пишіть як на Della, напр. «Київська обл.». Порожнє поле — без обмежень.</p>
 <div class="grid">${num('minPrice', 'Мінімальна ціна, грн', f.minPrice ?? 8000)}${num('maxAgeHours', 'Не старші ніж, год', f.maxAgeHours)}
@@ -961,8 +1084,77 @@ ${txt('note', 'Примітка до заявки', L.note)}
 <div class="grid">${num('staleHours', 'Неактуальна після, год', s.staleHours ?? 6)}</div></div>
 
 <div class="save-bar"><button class="btn pri">Зберегти налаштування</button><span class="muted" id="sf-st"></span></div>`;
+if (typed) $('#ds-cookie').value = typed;
 renderAccs();
+renderDellaSess();
 }
+// Блок «Вхід у Della»: лише чи є сесія і вердикт перевірки — саме значення сервер не віддає, і ми його ніде не показуємо
+function dsVerdictHtml(v) {
+if (!v) return '';
+if (v.text) return `<div class="${v.cls || 'muted'}">${esc(v.text)}</div>`;
+const [cls, , text] = DS[v.state] || DS.error;
+const sm = v.sample && [v.sample.company, v.sample.phone, v.sample.edrpou ? 'ЄДРПОУ ' + v.sample.edrpou : ''].filter(Boolean).join(' · ');
+const icon = v.state === 'alive' ? '✓ ' : v.state === 'none' ? '' : '✗ ';
+return `<div class="${cls === 'c-ok' || cls === 'c-err' ? cls : ''}"><b>${esc(icon + text)}</b></div>${sm ? `<div class="smp">Зараз сервер бачить про замовника: ${esc(sm)}</div>` : ''}`;
+}
+function renderDellaSess() {
+const st = $('#ds-st'); if (!st) return;
+const c = custState();
+const old = !!S.status && !demo && !c.session && !S.dsVerdict?.state; // старий сервер: status.get без della
+let h = '';
+if (c.session) {
+const [cls, label] = DS[c.session];
+h += `<span class="chip ${c.session === 'none' ? 'c-off' : 'c-info'}">Сесія: ${c.session === 'none' ? 'немає' : 'встановлено'}</span><span class="chip ${cls}">${esc(label)}</span>`;
+if (c.checkedAt) h += `<span class="muted">перевірено ${esc(rel(c.checkedAt))}</span>`;
+if (c.cov) h += `<span class="muted">· замовника видно в ${esc(fmtN(c.cov.w))} з ${esc(fmtN(c.cov.t))} заявок</span>`;
+} else h += `<span class="muted">${old ? esc(DS_OLD) : 'Сесія: …'}</span>`;
+st.innerHTML = h;
+$$('[data-ds]').forEach((b) => { b.disabled = !!S.dsBusy || old || (b.dataset.ds === 'clear' && c.session === 'none'); });
+$('#ds-res').innerHTML = dsVerdictHtml(S.dsVerdict);
+}
+// Рядок із панелі Chrome: «cookie: a=1; b=2» або лише значення — серверу йде лише значення
+const cleanCookie = (v) => String(v || '').replace(/[\r\n]+/g, ' ').trim().replace(/^cookie\s*:\s*/i, '').trim();
+const dsState = (r, fallback) => (DS_STATES.includes(r?.state) ? r.state : fallback);
+async function dsRun(kind) {
+if (S.dsBusy) return;
+let cookie = '';
+if (kind === 'save') {
+cookie = cleanCookie($('#ds-cookie')?.value);
+if (!cookie) { S.dsVerdict = { text: 'Спершу вставте в поле рядок cookie з Della — як в інструкції нижче.', cls: 'c-err' }; S.dsHowOpen = true; $('#ds-how').open = true; return renderDellaSess(); }
+if (!/=/.test(cookie)) { S.dsVerdict = { text: 'Це не схоже на рядок cookie — скопіюйте весь рядок «cookie:» з Request Headers.', cls: 'c-err' }; return renderDellaSess(); }
+}
+if (kind === 'clear' && !(await confirmBox('Прибрати вхід у Della?', 'Сервер знову збиратиме заявки без замовника, і чорний список перестане їх впізнавати.', 'Прибрати'))) return;
+S.dsBusy = true;
+S.dsVerdict = { text: kind === 'check' ? 'Перевіряю вхід у Della…' : kind === 'save' ? 'Зберігаю й перевіряю…' : 'Прибираю…' };
+renderDellaSess();
+const check = () => call('della.session.check', {}, { timeout: 60000, tries: 1 });
+try {
+if (kind === 'check') {
+const r = await check();
+S.dsVerdict = { state: dsState(r, 'error'), sample: r?.sample || null };
+} else {
+const r = await call('della.session.set', { cookie }, { timeout: 60000, tries: 1 });
+if ($('#ds-cookie')) $('#ds-cookie').value = ''; // значення більше ніде не тримаємо
+cookie = '';
+S.dsVerdict = { state: dsState(r, kind === 'clear' ? 'none' : 'error'), sample: null };
+toast(kind === 'clear' ? 'Вхід у Della прибрано' : 'Сесію збережено');
+if (kind === 'save' && S.dsVerdict.state !== 'none') { // одразу показуємо, що сервер тепер бачить про замовника
+const ck = await check().catch(() => null);
+if (ck && DS_STATES.includes(ck.state)) S.dsVerdict = { state: ck.state, sample: ck.sample || null };
+}
+}
+} catch (err) {
+S.dsVerdict = { text: OLD_SERVER(err) ? DS_OLD : 'Не вдалося: ' + err.message, cls: 'c-err' };
+}
+S.dsBusy = false;
+renderDellaSess();
+await loadStatus();
+}
+$('#sf').addEventListener('click', (e) => { const b = e.target.closest('[data-ds]'); if (b) dsRun(b.dataset.ds); });
+// Enter у полі сесії — «Зберегти» сесію, а не відправка всіх налаштувань
+$('#sf').addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.id === 'ds-cookie') { e.preventDefault(); dsRun('save'); } });
+document.addEventListener('submit', (e) => { if (e.target.id === 'ds-f') { e.preventDefault(); dsRun('save'); } });
+$('#sf').addEventListener('toggle', (e) => { if (e.target.id === 'ds-how') S.dsHowOpen = e.target.open; }, true);
 const MAX_ACCOUNTS = 5;
 const ACC_ST = {
 ok: ['c-ok', 'Підключено'], unchecked: ['c-info', 'Токен не перевірено'], pending: ['c-warn', 'Очікує підключення'],
@@ -1094,6 +1286,7 @@ function go(view) {
 S.view = view;
 $$('.nav').forEach((b) => b.classList.toggle('on', b.dataset.view === view));
 $$('.view').forEach((v) => (v.hidden = v.id !== 'v-' + view));
+renderBanners();
 if (view === 'loads') loadLoads();
 if (view === 'settings') { renderSettings(); Promise.all([loadSettings(), loadStatus()]).then(renderSettings); }
 if (view === 'customers') { renderCustomers(); loadCustomers(); }
@@ -1226,13 +1419,21 @@ company: ['ТОВ «Агроплюс»', 'Логістик-Юг', undefined, 'Ф
 lardi: lardi.map(([st, id, err], a) => ({ account: a, status: st, id: id || undefined, error: err })),
 seenAt: seen, firstSeenAt: seen - H, updatedAt: seen };
 });
-// замовник заявки в демо — за телефоном
-const dKey = (l) => (l.phone ? 'tel:' + String(l.phone).replace(/\D/g, '').slice(-12) : null);
+// Вхід у Della в демо: ?demo — входу немає; ?demo=alive|blind|expired|error — одразу цей стан.
+// Без живого входу Della не показує замовника — як на справжньому сервері: у заявках немає ні телефону, ні компанії.
+// У полі сесії: будь-який рядок «a=b» → вхід працює; зі словом blind / expired / error → цей стан.
+const want = new URLSearchParams(location.search).get('demo');
+const sess = { state: DS_STATES.includes(want) ? want : 'none', checkedAt: now - 4 * 60e3 };
+const custSeen = () => sess.state === 'alive';
+const view = (l) => (custSeen() || l.edited ? l : { ...l, phone: undefined, company: undefined, edrpou: undefined });
+// замовник заявки в демо — за телефоном (і лише якщо його видно)
+const telKey = (l) => (l.phone ? 'tel:' + String(l.phone).replace(/\D/g, '').slice(-12) : null);
+const dKey = (l) => telKey(view(l));
 let customers = [];
 let custSeq = 1;
 const listOf = (l) => { const k = dKey(l); const c = k && customers.find((x) => x.keys.includes(k)); return c ? c.list : null; };
 const visible = () => items.filter((l) => listOf(l) !== 'black');
-const withFav = (l) => ({ ...clone(l), ...(listOf(l) === 'white' ? { fav: true } : {}) });
+const withFav = (l) => ({ ...clone(view(l)), ...(listOf(l) === 'white' ? { fav: true } : {}) });
 const demoAdd = (list, key, label) => {
 const c = customers.find((x) => x.keys.includes(key));
 if (c) { c.list = list; return c; }
@@ -1240,8 +1441,8 @@ const n = { id: custSeq++, list, label, note: '', keys: [key], createdAt: Date.n
 customers.push(n); return n;
 };
 // заготовлені: обраний і два в чорному списку — у Вінниці зняття з Lardi ще не пройшло (на Lardi ще 1 — знімаємо)
-demoAdd('white', dKey(items[0]), items[0].company).note = 'стабільно платить, пріоритет';
-demoAdd('black', dKey(items[2]), '+380 67 123 6789').note = 'не оплатив рейс';
+demoAdd('white', telKey(items[0]), items[0].company).note = 'стабільно платить, пріоритет';
+demoAdd('black', telKey(items[2]), '+380 67 123 6789').note = 'не оплатив рейс';
 Object.assign(demoAdd('black', 'tel:380509998877', '050 999 88 77'), { note: 'додано вручну', createdAt: now - 3 * 86400e3 });
 let settings = { della: { searchUrls: ['https://della.com.ua/search/a204bd204eflolz1z21z3z4z51z6z7z8z9y1y2y3y4y5y6h0ilk0m1.html'], pollSeconds: 90, pagesPerPoll: 4 },
 filters: { minPrice: 8000, directOnly: true, bodies: [], fromRegions: [], toRegions: [], excludeRegions: [], stopWords: ['металобрухт'], maxAgeHours: 24 },
@@ -1282,6 +1483,23 @@ return { customer: clone(c), affected: p.list === 'black' ? { hidden: pv.loads, 
 'customers.move': ({ id, list }) => { const c = customers.find((x) => x.id === id); c.list = list; return { customer: clone(c), affected: { hidden: 0, removed: 0, failed: 0, restored: 0 } }; },
 'customers.update': ({ id, note }) => { const c = customers.find((x) => x.id === id); if (note !== undefined) c.note = note; return clone(c); },
 'customers.remove': ({ id }) => { customers = customers.filter((x) => x.id !== id); return { restored: 0 }; },
+'customers.reapply': () => {
+const own = items.filter((l) => listOf(l) === 'black');
+const removed = own.filter((l) => l.status === 'published').length;
+own.forEach((l) => { if (l.status === 'published') { l.status = 'inactive'; l.statusReason = 'Чорний список'; l.lardi = l.lardi.map((a) => ({ ...a, status: 'removed' })); } });
+return { hidden: own.length, removed, failed: 0 };
+},
+'della.session.set': ({ cookie }) => {
+const c = String(cookie || '');
+sess.state = !c ? 'none' : /blind/i.test(c) ? 'blind' : /expired/i.test(c) ? 'expired' : /error/i.test(c) ? 'error' : 'alive';
+sess.checkedAt = Date.now();
+return { state: sess.state };
+},
+'della.session.check': () => {
+sess.checkedAt = Date.now();
+const l = items.find((x) => x.company && x.phone);
+return { state: sess.state, customerSeen: custSeen(), sample: custSeen() && l ? { company: l.company, phone: l.phone, edrpou: null, dellaCompanyId: null } : null, message: '' };
+},
 'lardi.accounts': () => api['status.get']().accounts,
 'lardi.backfill': ({ dryRunOnly }) => (dryRunOnly ? { candidates: 3 } : { queued: 3 }),
 'loads.update': ({ id, patch }) => upd(id, (l) => Object.assign(l, patch)),
@@ -1297,7 +1515,9 @@ return { ...a, token: t, state: a.archived || !a.enabled ? 'disabled' : t ? 'ok'
 });
 return clone(settings);
 },
-'status.get': () => ({ running: true, autoPublish: settings.lardi.autoPublish, lastPollAt: now - 70e3, counts: counts(), today: { collected: 187, published: settings.lardi.accounts.map((a, i) => (i ? 0 : 142)), dry: settings.lardi.accounts.map(() => 0) }, queue: items.filter((l) => l.status === 'queued').length,
+'status.get': () => ({ della: { session: sess.state, checkedAt: sess.checkedAt, customerSeen: custSeen() },
+custCoverage: { withCustomer: items.filter((l) => l.status !== 'deleted' && dKey(l)).length, total: items.filter((l) => l.status !== 'deleted').length },
+running: true, autoPublish: settings.lardi.autoPublish, lastPollAt: now - 70e3, counts: counts(), today: { collected: 187, published: settings.lardi.accounts.map((a, i) => (i ? 0 : 142)), dry: settings.lardi.accounts.map(() => 0) }, queue: items.filter((l) => l.status === 'queued').length,
 accounts: settings.lardi.accounts.map((a, i) => ({ index: i, name: a.name, enabled: a.enabled, archived: !!a.archived, state: a.archived || !a.enabled ? 'disabled' : a.token ? 'ok' : 'pending', hasToken: !!a.token, today: { published: i ? 0 : 142, dry: 0, limit: settings.lardi.dailyLimit }, live: i ? 0 : 118, errors: i ? 0 : 2, lastPublishAt: i ? undefined : now - 95e3 })) }),
 'sync.now': () => ({ started: true }),
 'lardi.stopAll': ({ remove }) => { settings.lardi.autoPublish = false; let removed = 0; if (remove) items.forEach((l) => { if (l.status === 'published') { l.status = 'inactive'; l.statusReason = 'знято вручну (усі)'; l.lardi = l.lardi.map((a) => ({ ...a, status: 'removed' })); removed++; } }); return { dequeued: 0, removed, failed: 0 }; },
