@@ -863,14 +863,27 @@ const p = patch.price ?? l.price, d = patch.distanceKm ?? l.distanceKm;
 patch.pricePerKm = p && d ? Math.round((p / d) * 100) / 100 : null;
 }
 // заявку ховає чорний список, а нові телефон/назва/ЄДРПОУ під нього вже не підпадають — сказати до збереження
-if (e.target.dataset.releaseOk !== '1') {
+const released = e.target.dataset.releaseOk === '1'; // вона вже відповіла «Все одно зберегти»
+if (!released) {
 const rel = await releaseCheck(l, patch);
 if (rel) { showRelease(e.target, rel); return; }
 }
 delete e.target.dataset.releaseOk;
 const btn = $('.btn.pri', b); btn.disabled = true;
 try {
-const saved = await call('loads.update', { id: l.id, patch });
+let saved;
+try { saved = await call('loads.update', { id: l.id, patch, ...(released ? { fromBlack: true } : {}) }); }
+catch (err) {
+// рушій сам побачив, що правка виведе заявку з-під чорного списку, а ми не спитали (список застарів) — питаємо зараз;
+// відмова про інше чи вже після її «так» — показуємо його власні слова
+const act = err?.data?.action;
+if (err?.code !== 'fromBlack' || released || ['add', 'move', 'remove'].includes(act)) throw err;
+btn.disabled = false;
+const en = err.data?.entries?.[0];
+const ch = Object.keys(CUST_F).filter((k) => k in patch).map((k) => CUST_F[k]);
+showRelease(e.target, { ex: en ? { label: en.label || (en.keys || [])[0] } : null, what: ch.length > 1 ? ch.slice(0, -1).join(', ') + ' й ' + ch[ch.length - 1] : ch[0] || 'даних замовника' });
+return;
+}
 replaceLoad(saved); modal.close();
 // старий сервер (до оновлення рушія) поле коментаря мовчки пропускає — кажемо чесно
 if ('comment' in patch && (saved.comment || '') !== patch.comment) toast('Збережено, але коментар сервер ще не приймає — запрацює після оновлення сервера', true);
@@ -903,7 +916,7 @@ function showRelease(form, rel) {
 $('.rel-warn', form)?.remove();
 const box = document.createElement('div');
 box.className = 'warnline rel-warn';
-box.innerHTML = `<p>${esc(`Ця заявка зараз прихована чорним списком (запис ${labelQ(rel.ex?.label)}). Після зміни ${rel.what} вона перестане підпадати під нього й може піти на Lardi.`)}</p><div class="m-foot"><button type="button" class="btn" data-x="0">Скасувати</button><button type="button" class="btn dan" data-x="1">Все одно зберегти</button></div>`;
+box.innerHTML = `<p>${esc(`Ця заявка зараз прихована чорним списком${rel.ex?.label ? ` (запис ${labelQ(rel.ex.label)})` : ''}. Після зміни ${rel.what} вона перестане підпадати під нього й може піти на Lardi.`)}</p><div class="m-foot"><button type="button" class="btn" data-x="0">Скасувати</button><button type="button" class="btn dan" data-x="1">Все одно зберегти</button></div>`;
 $('.m-foot', form).before(box);
 box.addEventListener('click', (ev) => {
 const x = ev.target.closest('[data-x]'); if (!x) return;
@@ -971,7 +984,7 @@ async function removeEntry(x, answeredBlack) {
 let r;
 try { r = await call('customers.remove', { id: x.id, ...(answeredBlack ? { fromBlack: true } : {}) }); }
 catch (e) {
-if (e?.code !== 'fromBlack' || answeredBlack) throw e;
+if (e?.code !== 'fromBlack' || answeredBlack || (e.data?.action && e.data.action !== 'remove')) throw e; // інша відмова — її власні слова
 const ok = (await askBox({ title: 'Цей замовник у чорному списку', text: ['Цей замовник зараз у чорному списку. Прибрати його зі списку? Його заявки знову підуть на Lardi.', entryLine({ ...x, ...(e.data?.entries?.[0] || {}) }), Number.isFinite(Number(e.data?.loads)) ? `Повернеться заявок: ${fmtN(e.data.loads)}.` : '', 'Минулі заявки лишаться в Архіві.'],
 buttons: [['0', 'Скасувати'], ['1', 'Прибрати з чорного списку', 'dan']], focus: '0' })) === '1';
 if (!ok) return null;
@@ -1019,6 +1032,8 @@ return a === '1';
 // питаємо так само й переносимо лише після «так». → true, якщо це була така відмова (відповідь уже дано)
 async function unblockRefused(e) {
 if (e?.code !== 'fromBlack') return false;
+const act = e.data?.action; // 'add' | 'move' | 'remove' | … (старий рушій — без action: це add/move)
+if (act && act !== 'add' && act !== 'move') { toast(e.message, true); return true; } // не про перенос — не питаємо про перенос
 const ents = (e.data?.entries || []).filter((x) => x && x.id != null);
 if (!ents.length) { toast(e.message, true); return true; }
 const known = (S.customers?.items || []);
