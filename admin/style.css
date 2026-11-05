@@ -223,3 +223,4 @@ details.ds-how p{margin:4px 0 0;font-size:12.5px;color:var(--mut)}
 .c-tel{font-size:12px;color:var(--mut);margin-top:3px;line-height:1.4}
 .c-tel .lnk{font-size:12px}
 .c-tel-note{padding:8px 12px;border-bottom:1px solid var(--line);font-size:12.5px;color:#4a5462;background:#f7f8fa}
+.ds-res .ds-msg{color:var(--mut);font-size:12.5px}
