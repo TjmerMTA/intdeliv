@@ -153,7 +153,7 @@ test('зняття з чорного списку: актуальні — зно
   const own = (await h.list({ customer: customer.id, status: 'all' })).items;
   const past = own[0];
   await h.engine().store.updateLoad(past.id, (l) => ({ ...l, dateFrom: '2026-09-01', dateTo: undefined }));
-  const r = await h.call('customers.remove', { id: customer.id });
+  const r = await h.call('customers.remove', { id: customer.id, fromBlack: true });
   assert.equal(r.restored, 9);
   assert.equal(r.archived, 1);
   const all = (await h.list({ status: 'all' })).items;

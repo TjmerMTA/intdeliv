@@ -548,6 +548,21 @@ export class Store {
     return (results || []).map((r) => ({ ...r, lardi: parse(r.lardi, []) }));
   }
 
+  /**
+   * Id заявок (не видалених) із будь-яким із ключів, які зараз ховає чорний список. except — id записів, яких
+   * не рахувати: «що лишилося б прихованим, якби цих записів у чорному списку не було».
+   */
+  async blackIdsByKeys(keys, except = []) {
+    if (!keys.length) return [];
+    const cond = keys.map(() => "instr(custKeys, '|' || ? || '|') > 0").join(' OR ');
+    const ex = except.length ? ` AND ck.customerId NOT IN (${except.map(() => '?').join(',')})` : '';
+    const { results } = await this.db.prepare(
+      `SELECT id FROM loads WHERE custKeys <> '' AND (${cond}) AND status <> 'deleted'
+       AND EXISTS (SELECT 1 FROM customer_keys ck WHERE ck.list = 'black'${ex} AND instr(loads.custKeys, '|' || ck.key || '|') > 0)`,
+    ).bind(...keys, ...except.map(Number)).all();
+    return (results || []).map((r) => r.id);
+  }
+
   /** Догін: актуальні опубліковані заявки без живого запису на акаунті account; обрані першими, чорні — ні. */
   async backfillCandidates(account, today) {
     const { results } = await this.db.prepare(

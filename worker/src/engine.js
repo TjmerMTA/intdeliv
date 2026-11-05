@@ -1226,25 +1226,57 @@ export class Engine {
     return { hidden };
   }
 
+  /** Id чорних записів, яким належить хоч один із ключів. */
+  async blackIdsOf(keys) {
+    return [...new Set((await this.store.customersByKeys(keys)).filter((x) => x.list === 'black').map((x) => x.customerId))].sort((a, b) => a - b);
+  }
+
+  /** Усі ключі записів ids. */
+  async keysOfCustomers(ids) {
+    const keys = [];
+    for (const id of ids) keys.push(...((await this.store.getCustomer(id))?.keys || []));
+    return [...new Set(keys)];
+  }
+
+  /**
+   * Скільки з заявок hiddenBefore (id, приховані чорним списком до дії) тепер видно. keys мають їх покривати.
+   * Заявку, яку й далі ховає інший чорний запис, не рахуємо — «знову видно» лише те, що справді стало видно.
+   */
+  async nowVisible(keys, hiddenBefore) {
+    if (!hiddenBefore.length) return 0;
+    const still = new Set(await this.store.blackIdsByKeys(keys));
+    return hiddenBefore.filter((id) => !still.has(id)).length;
+  }
+
   /**
    * Ключі зараз у чорному списку, а запит забирає їх в інший список (зокрема злиттям записів) — лише з
-   * {fromBlack: true}. Інакше відмова RpcError('fromBlack') з тим, що потрібно, аби спитати людину:
-   * {list: куди, entries: [{id, list, label, keys — спільні}], loads: скільки заявок повернулося б}.
+   * {fromBlack: true}. Інакше відмова (unblockRefusal).
    */
-  async guardFromBlack(keys, toList, fromBlack) {
+  async guardFromBlack(keys, toList, fromBlack, action) {
     if (toList === 'black' || fromBlack === true) return;
-    const ids = [...new Set((await this.store.customersByKeys(keys)).filter((x) => x.list === 'black').map((x) => x.customerId))];
-    if (!ids.length) return;
+    const ids = await this.blackIdsOf(keys);
+    if (ids.length) throw await this.unblockRefusal(ids, action, toList, keys);
+  }
+
+  /**
+   * Відмова RpcError('fromBlack') з тим, що потрібно, аби спитати людину: {action: 'add' | 'move' | 'remove',
+   * list: куди ('white'; null — прибрати), entries: [{id, list, label, keys}], loads: скільки заявок знову стало б видно —
+   * без тих, що й далі ховав би інший чорний запис}. keys — ключі запиту: у entries лише спільні (без них — усі ключі запису).
+   */
+  async unblockRefusal(ids, action, toList, keys = null) {
     const entries = [];
-    let loads = 0;
-    for (const id of ids.sort((a, b) => a - b)) {
+    for (const id of ids) {
       const c = await this.store.getCustomer(id);
-      entries.push({ id: c.id, list: c.list, label: c.label ?? null, keys: c.keys.filter((k) => keys.includes(k)) });
-      loads += (await this.store.loadsByKeys(c.keys)).length;
+      entries.push({ id: c.id, list: c.list, label: c.label ?? null, keys: keys ? c.keys.filter((k) => keys.includes(k)) : c.keys });
     }
+    const all = await this.keysOfCustomers(ids);
+    const now = await this.store.blackIdsByKeys(all);
+    const after = new Set(await this.store.blackIdsByKeys(all, ids));
+    const loads = now.filter((id) => !after.has(id)).length;
     const who = entries.map((e) => `«${e.label || e.keys[0]}»`).join(', ');
-    throw new RpcError(`${who} зараз у чорному списку — в «Обрані» переносимо лише після підтвердження (повернеться заявок: ${loads})`,
-      'fromBlack', { list: toList, entries, loads });
+    const what = toList ? 'в «Обрані» переносимо' : 'прибираємо з нього';
+    return new RpcError(`${who} зараз у чорному списку — ${what} лише після підтвердження (повернеться заявок: ${loads})`,
+      'fromBlack', { action, list: toList ?? null, entries, loads });
   }
 
   /** Після зняття з чорного списку: актуальні — у new (+ черга), минулі — лишаються в архіві. */
@@ -1268,7 +1300,8 @@ export class Engine {
     return { restored, archived, queued };
   }
 
-  async afterListChange(customer, prevList, s) {
+  /** hiddenBefore — id заявок, прихованих чорним списком до дії (для чесного affected.visible). */
+  async afterListChange(customer, prevList, s, hiddenBefore = []) {
     if (customer.list === 'black') {
       const a = await this.applyBlack(customer.keys, s);
       await this.log('info', `Чорний список: «${customer.label || customer.keys[0]}» — приховано ${a.hidden}, знято з Lardi ${a.removed}${a.failed ? `, не вдалося зняти ${a.failed}` : ''}`);
@@ -1280,7 +1313,7 @@ export class Engine {
     }
     // навмисний перенос із чорного (fromBlack): правда для адмінки — скільки заявок знову видно і скільки в черзі
     const a = await this.restoreUnblocked(s);
-    a.visible = (await this.store.loadsByKeys(customer.keys)).length;
+    a.visible = await this.nowVisible(customer.keys, hiddenBefore);
     await this.log('info', `Обрані: «${customer.label || customer.keys[0]}» — з чорного списку в «Обрані» (підтверджено): знову видно заявок ${a.visible}, у черзі ${a.queued}`);
     return a;
   }
@@ -1506,12 +1539,13 @@ Engine.prototype.handlers = {
     const list = p.list === 'black' ? 'black' : p.list === 'white' ? 'white' : null;
     if (!list) throw new Error('list: black або white');
     const { keys, label } = await this.resolveCustomer(p);
-    await this.guardFromBlack(keys, list, p.fromBlack);
+    await this.guardFromBlack(keys, list, p.fromBlack, 'add');
     const s = await this.getSettings();
-    const prevLists = await this.store.customersByKeys(keys);
-    const prevList = prevLists.some((h) => h.list === 'black') ? 'black' : null;
+    const blackIds = await this.blackIdsOf(keys);
+    const prevList = blackIds.length ? 'black' : null;
+    const hiddenBefore = blackIds.length && list !== 'black' ? await this.store.blackIdsByKeys(await this.keysOfCustomers(blackIds)) : [];
     const { customer } = await this.store.upsertCustomer(list, keys, { label: p.label, fallbackLabel: label, note: p.note });
-    const affected = await this.afterListChange(customer, prevList, s);
+    const affected = await this.afterListChange(customer, prevList, s, hiddenBefore);
     return { customer, affected };
   },
 
@@ -1519,10 +1553,11 @@ Engine.prototype.handlers = {
     if (list !== 'black' && list !== 'white') throw new Error('list: black або white');
     const cur = await this.store.getCustomer(id);
     if (!cur) throw new Error('замовника не знайдено');
-    if (cur.list === 'black') await this.guardFromBlack(cur.keys, list, fromBlack);
+    if (cur.list === 'black') await this.guardFromBlack(cur.keys, list, fromBlack, 'move');
     const s = await this.getSettings();
+    const hiddenBefore = cur.list === 'black' && list !== 'black' ? await this.store.blackIdsByKeys(cur.keys) : [];
     const customer = await this.store.setCustomerList(cur.id, list);
-    const affected = await this.afterListChange(customer, cur.list, s);
+    const affected = await this.afterListChange(customer, cur.list, s, hiddenBefore);
     return { customer, affected };
   },
 
@@ -1546,12 +1581,21 @@ Engine.prototype.handlers = {
     return { hidden, removed, failed };
   },
 
-  async 'customers.remove'({ id } = {}) {
-    const c = await this.store.removeCustomer(id);
+  /**
+   * Прибрати запис. Чорний — лише з {fromBlack: true} (буквально true): його заявки повертаються в роботу й чергу на Lardi,
+   * а клієнт із застарілим списком міг вважати його обраним. Без прапорця — та сама відмова, що й у add/move
+   * (action 'remove', list null). Список перевіряємо за базою, не за тим, що думає клієнт. Обраний — як і було.
+   */
+  async 'customers.remove'({ id, fromBlack } = {}) {
+    const cur = await this.store.getCustomer(id);
+    if (!cur) throw new Error('замовника не знайдено');
+    if (cur.list === 'black' && fromBlack !== true) throw await this.unblockRefusal([cur.id], 'remove', null);
+    const hiddenBefore = cur.list === 'black' ? await this.store.blackIdsByKeys(cur.keys) : [];
+    const c = await this.store.removeCustomer(cur.id);
     if (!c) throw new Error('замовника не знайдено');
     const s = await this.getSettings();
     const r = c.list === 'black' ? await this.restoreUnblocked(s) : { restored: 0, archived: 0, queued: 0 };
-    r.visible = c.list === 'black' ? (await this.store.loadsByKeys(c.keys)).length : 0;
+    r.visible = c.list === 'black' ? await this.nowVisible(c.keys, hiddenBefore) : 0;
     await this.log('info', `${c.list === 'black' ? 'Чорний список' : 'Обрані'}: прибрано «${c.label || c.keys[0]}»${r.restored ? `, повернуто заявок ${r.restored}` : ''}`);
     return r;
   },
