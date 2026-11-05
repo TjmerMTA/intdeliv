@@ -386,3 +386,30 @@ test('C5 contacts: answer that is HTML (logged-out page) is a refusal → stops'
   for (let i = 0; i < 3; i++) { tag++; h.clock.t += 61e3; await h.engine().poll(); }
   assert.equal(posts(h).length, 1);
 });
+
+// ---------------------------------------------------------------- round 2 (58a9c6b): name-key migration keeps her entries working
+
+/** A DB holding OLD-normalisation (v1) name keys, as a live DB does before the release; then migrateNameKeys. */
+async function migrated(entries) {
+  const h = setup();
+  const e = h.engine(); await e.ready();
+  await e.store.setKV('meta:nameKeysV', 0);
+  for (const [i, c] of entries.entries()) {
+    await e.store.db.prepare('INSERT INTO customers (id, list, label, note, createdAt, updatedAt) VALUES (?, ?, ?, ?, 1, 1)').bind(i + 1, c.list, c.label, c.note).run();
+    for (const k of c.keys) await e.store.db.prepare('INSERT INTO customer_keys (key, customerId, list) VALUES (?, ?, ?)').bind(k, i + 1, c.list).run();
+  }
+  await e.store.migrateNameKeys();
+  return (await h.call('customers.list', {})).items;
+}
+test('M1 migration: v1 hyphen and space spellings in DIFFERENT lists — the black entry must not end up with no key', async () => {
+  const items = await migrated([
+    { list: 'black', label: 'ТОВ «Логістик-Плюс»', note: 'не платить', keys: ['name:логістик-плюс'] },
+    { list: 'white', label: 'Логістик Плюс', note: 'інша фірма?', keys: ['name:логістик плюс'] },
+  ]);
+  const black = items.find((c) => c.list === 'black');
+  assert.ok(black.keys.length > 0, `black entry «${black.label}» left with keys=${JSON.stringify(black.keys)} — it blocks nothing now, and its company matches «Обрані»`);
+});
+test('M2 migration: an entry whose v1 name key normalises to nothing (a long legal form alone) must not silently lose its only key', async () => {
+  const items = await migrated([{ list: 'black', label: 'Приватне підприємство', note: 'з нотаткою', keys: ['name:приватне підприємство'] }]);
+  assert.ok(items[0].keys.length > 0, `«${items[0].label}» left with no key at all`);
+});

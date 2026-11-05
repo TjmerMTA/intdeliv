@@ -276,11 +276,31 @@ export class Engine {
   ready() {
     let p = migrations.get(this.env.DB);
     if (!p) {
-      p = this.store.migrate().then((n) => { if (n) console.log(`[IntDeliv] migrate: custKeys для ${n} заявок`); });
+      p = this.store.migrate().then(async (n) => {
+        if (n) console.log(`[IntDeliv] migrate: custKeys для ${n} заявок`);
+        if (this.store.nameMigration) await this.logNameMigration(this.store.nameMigration);
+      });
       migrations.set(this.env.DB, p);
       p.catch(() => migrations.delete(this.env.DB));
     }
     return p;
+  }
+
+  /** Міграція ключів за назвою (Store.migrateNameKeys) + один рядок журналу. → null, якщо вже мігровано. */
+  async migrateNameKeys() {
+    const r = await this.store.migrateNameKeys();
+    if (r) await this.logNameMigration(r);
+    return r;
+  }
+
+  /** Один рядок: що міграція назв змінила, лишила й не розв'язала — лише лічильники. */
+  async logNameMigration(r) {
+    if (!(r.changed + r.kept + r.repaired + r.issues.length)) return;
+    const by = (k) => r.issues.filter((x) => x.kind === k).length;
+    await this.log(r.issues.length ? 'warn' : 'info', `Назви в списках (нові правила порівняння): оновлено ${r.changed}, лишено як було ${r.kept}, `
+      + `відновлено з підпису ${r.repaired}; не розв'язано ${r.issues.length} (два записи на одну фірму — ${by('clash')}, `
+      + `назва без змісту — ${by('empty')}, без ключа — ${by('keyless')})`
+      + `${r.blackWon ? `; спір чорного з білим — на користь чорного: ${r.blackWon}` : ''}; заявок перераховано ${r.loads}`);
   }
 
   waitUntil(p) {
@@ -1416,7 +1436,8 @@ Engine.prototype.handlers = {
 
   async 'customers.list'({ list } = {}) {
     const l = list === 'black' || list === 'white' ? list : undefined;
-    return { items: await this.store.listCustomers(l), hiddenBlack: await this.store.hiddenBlackCount() };
+    // nameKeyIssues — що не розв'язала міграція назв (два записи на одну фірму тощо), щоб адмінка показала
+    return { items: await this.store.listCustomers(l), hiddenBlack: await this.store.hiddenBlackCount(), nameKeyIssues: await this.store.nameKeyIssues() };
   },
 
   /** Лише читання — для діалогу підтвердження. */

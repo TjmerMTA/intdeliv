@@ -1,9 +1,14 @@
 // Доступ до D1: заявки, налаштування/мета, кеш, журнал, лічильники.
-import { mergeSeen, newLoad, custKeysColumn, nameKey } from '../../extension/lib/model.js';
+import {
+  mergeSeen, newLoad, custKeysColumn, nameKey, nameKeyV1, customerKeys, parseCustomerInput,
+} from '../../extension/lib/model.js';
 
 export const LOG_MAX = 5000;
-/** Версія нормалізації назв (model.normCompany): 2 — дефіс = пробіл, усі апострофи, повні й латинські форми власності. */
-export const NAME_KEYS_V = 2;
+/**
+ * Версія нормалізації назв (model.normCompany): 2 — дефіс = пробіл, усі апострофи, повні й латинські форми власності;
+ * 3 — та сама нормалізація, але міграція не губить ключів (і відновлює ті, що загубила версія 2).
+ */
+export const NAME_KEYS_V = 3;
 
 const lc = (v) => String(v ?? '').toLowerCase().replace(/[’ʼ`]/g, "'").trim();
 const nn = (v) => (v === undefined ? null : v);
@@ -82,36 +87,117 @@ export class Store {
         .bind(custKeysColumn(parse(r.data, null) || {}), r.id)));
       n += rows.length;
     }
-    await this.migrateNameKeys();
+    this.nameMigration = await this.migrateNameKeys(); // рядок журналу пише Engine.ready
     return n;
   }
 
   /**
-   * Нова нормалізація назв: ключі «name:…» у списках і в заявках переписуються на нове написання, щоб уже внесене
-   * клієнткою й надалі збігалося. Один раз (meta:nameKeysV). Ключ, що вже належить іншому запису, не перехоплюється.
-   * Повертає, скільки ключів у списках змінилось.
+   * Нова нормалізація назв: ключі «name:…» у списках переписуються на нове написання, щоб уже внесене клієнткою
+   * й надалі збігалося з картками. Один раз (meta:nameKeysV). Жоден запис не лишається без ключа:
+   * - нове написання порожнє (сама форма власності) — старий ключ лишається, запис позначено (empty);
+   * - нове написання вже в іншого запису — старий ключ лишається, нічого не перехоплюється, спір позначено (clash);
+   *   виняток — чорний проти білого: ключ бере чорний (блок клієнтки важливіший), білий тримає старе написання;
+   * - нове написання береться з підпису запису, якщо старий ключ вийшов саме з нього (підпис — те, що вона вписала);
+   * - запис узагалі без ключа (так лишала версія 2) — ключ із підпису, якщо він нічий; інакше позначено (keyless).
+   * → null (уже мігровано) або {changed, kept, blackWon, repaired, loads, issues}
    */
   async migrateNameKeys() {
-    if ((await this.getKV('meta:nameKeysV', 0)) >= NAME_KEYS_V) return 0;
-    const { results: keys } = await this.db.prepare("SELECT key, customerId, list FROM customer_keys WHERE key LIKE 'name:%'").all();
-    const stmts = [];
-    let n = 0;
-    for (const r of keys || []) {
-      const nk = nameKey(r.key.slice(5));
+    if ((await this.getKV('meta:nameKeysV', 0)) >= NAME_KEYS_V) return null;
+    const { results: custs } = await this.db.prepare('SELECT id, list, label FROM customers').all();
+    const { results: rows } = await this.db.prepare('SELECT key, customerId, list FROM customer_keys').all();
+    const cust = new Map((custs || []).map((c) => [c.id, c]));
+    const before = new Map((rows || []).map((r) => [r.key, r.customerId]));
+    const owner = new Map(before); // key → customerId — як стане
+    const keysOf = new Map((custs || []).map((c) => [c.id, new Set()]));
+    for (const [k, id] of owner) (keysOf.get(id) || keysOf.set(id, new Set()).get(id)).add(k);
+    const listOf = (id) => (cust.get(id) || {}).list;
+    const give = (k, id) => { owner.set(k, id); keysOf.get(id).add(k); };
+    const drop = (k) => { const id = owner.get(k); owner.delete(k); if (keysOf.has(id)) keysOf.get(id).delete(k); };
+    const sum = { changed: 0, kept: 0, blackWon: 0, repaired: 0, loads: 0 };
+    const issues = new Map();
+    // subject — запис, якого стосується позначка (той, що лишився зі старим ключем або без ключа)
+    const issue = (kind, key, ids, winner) => {
+      const x = { kind, key, winner, subject: ids[0], ids: [...new Set(ids)].sort((a, b) => a - b) };
+      issues.set(JSON.stringify(x), x);
+    };
+    // чорні — першими: спірну назву першим бере чорний список
+    const names = (rows || []).filter((r) => r.key.startsWith('name:'))
+      .sort((a, b) => (listOf(a.customerId) === 'black' ? 0 : 1) - (listOf(b.customerId) === 'black' ? 0 : 1) || a.customerId - b.customerId);
+    for (const r of names) {
+      const id = r.customerId;
+      if (owner.get(r.key) !== id) continue; // уже перейшов у спорі чорного з білим
+      const text = r.key.slice(5);
+      const label = (cust.get(id) || {}).label;
+      const nk = (label && nameKeyV1(label) === text && nameKey(label)) || nameKey(text);
       const key = nk ? `name:${nk}` : '';
       if (key === r.key) continue;
-      n++;
-      stmts.push(this.db.prepare('DELETE FROM customer_keys WHERE key = ?').bind(r.key));
-      if (key) stmts.push(this.db.prepare('INSERT OR IGNORE INTO customer_keys (key, customerId, list) VALUES (?, ?, ?)').bind(key, r.customerId, r.list));
+      if (!key) { sum.kept++; issue('empty', r.key, [id], null); continue; }
+      const other = owner.get(key);
+      if (other === undefined || other === id) {
+        drop(r.key);
+        if (other === undefined) give(key, id);
+        sum.changed++;
+        continue;
+      }
+      if (listOf(id) === 'black' && listOf(other) === 'white') {
+        drop(key);
+        give(key, id);
+        drop(r.key);
+        if (!keysOf.get(other).size) give(r.key, other); // білий без ключа не лишається: тримає старе написання
+        sum.changed++;
+        sum.blackWon++;
+        issue('clash', key, [id, other], id);
+        continue;
+      }
+      sum.kept++;
+      issue('clash', key, [id, other], listOf(other) === 'black' && listOf(id) !== 'black' ? other : null);
     }
-    const { results: rows } = await this.db.prepare("SELECT id, data, custKeys FROM loads WHERE custKeys <> '' AND custKeys LIKE '%|name:%'").all();
-    for (const r of rows || []) {
+    // записи без жодного ключа — з підпису, якщо ці ключі нічиї (чужого не беремо)
+    for (const [id, ks] of keysOf) {
+      if (ks.size) continue;
+      const c = cust.get(id);
+      const want = c && c.label ? customerKeys(parseCustomerInput(c.label)) : [];
+      const free = want.filter((k) => !owner.has(k));
+      if (free.length) {
+        for (const k of free) give(k, id);
+        sum.repaired++;
+        continue;
+      }
+      issue('keyless', want[0] || null, [id, ...want.map((k) => owner.get(k)).filter((x) => x !== undefined)], null);
+    }
+    const stmts = [];
+    for (const k of before.keys()) if (!owner.has(k)) stmts.push(this.db.prepare('DELETE FROM customer_keys WHERE key = ?').bind(k));
+    for (const [k, id] of owner) {
+      if (before.get(k) !== id) stmts.push(this.db.prepare('INSERT OR REPLACE INTO customer_keys (key, customerId, list) VALUES (?, ?, ?)').bind(k, id, listOf(id)));
+    }
+    const { results: loads } = await this.db.prepare("SELECT id, data, custKeys FROM loads WHERE custKeys <> '' AND custKeys LIKE '%|name:%'").all();
+    for (const r of loads || []) {
       const ck = custKeysColumn(parse(r.data, null) || {});
-      if (ck !== r.custKeys) stmts.push(this.db.prepare('UPDATE loads SET custKeys = ? WHERE id = ?').bind(ck, r.id));
+      if (ck !== r.custKeys) { stmts.push(this.db.prepare('UPDATE loads SET custKeys = ? WHERE id = ?').bind(ck, r.id)); sum.loads++; }
     }
     for (let i = 0; i < stmts.length; i += 100) await this.db.batch(stmts.slice(i, i + 100));
+    const list = [...issues.values()].sort((a, b) => String(a.key ?? '\uffff').localeCompare(String(b.key ?? '\uffff')) || a.kind.localeCompare(b.kind));
+    await this.setKV('meta:nameKeyIssues', list);
     await this.setKV('meta:nameKeysV', NAME_KEYS_V);
-    return n;
+    return { ...sum, issues: await this.nameKeyIssues() };
+  }
+
+  /**
+   * Нерозв'язане міграцією назв — для адмінки: [{kind: 'clash'|'empty'|'keyless', key, winner, entries: [{id, list, label}]}].
+   * Лише те, що досі стоїть: прибрала один із двох записів, змінила ключі — позначка зникає.
+   */
+  async nameKeyIssues() {
+    const out = [];
+    for (const x of (await this.getKV('meta:nameKeyIssues', [])) || []) {
+      const entries = [];
+      for (const id of x.ids || []) { const c = await this.getCustomer(id); if (c) entries.push(c); }
+      if (entries.length !== (x.ids || []).length) continue;
+      const subj = entries.find((c) => c.id === x.subject);
+      if (x.kind === 'empty' && !(subj && subj.keys.includes(x.key))) continue;
+      if (x.kind === 'keyless' && !(subj && !subj.keys.length)) continue;
+      out.push({ kind: x.kind, key: x.key, winner: x.winner, entries: entries.map((c) => ({ id: c.id, list: c.list, label: c.label ?? null })) });
+    }
+    return out;
   }
 
   // ---------- loads ----------

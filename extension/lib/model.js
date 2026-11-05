@@ -199,6 +199,20 @@ export function edrpouKey(s) {
   return d.length === 8 || d.length === 10 ? d : '';
 }
 
+/**
+ * Нормалізація назв ПЕРШОЇ версії (до K2) — заморожена копія, лише щоб міграція розуміла старі ключі:
+ * дефіс лишався, апострофи — лише ’ ʼ `, повні й латинські форми власності не прибирались.
+ */
+export function normCompanyV1(s) {
+  return String(s || '').toLowerCase().replace(/ё/g, 'е').replace(/[’ʼ`]/g, "'").replace(/["«»„“”]/g, ' ')
+    .split(/[^\p{L}\p{N}'-]+/u).map((t) => t.replace(/^['-]+|['-]+$/g, ''))
+    .filter((t) => t && !LEGAL_FORMS.has(t)).join(' ');
+}
+export function nameKeyV1(s) {
+  const n = normCompanyV1(s);
+  return n.replace(/[\s'-]/g, '').length >= 4 && !NAME_STOP.has(n) ? n : '';
+}
+
 /** Ключ за назвою (найслабший): ≥ 4 символів і не з переліку загальних назв. */
 export function nameKey(s) {
   const n = normCompany(s);
