@@ -1264,11 +1264,7 @@ export class Engine {
    * без тих, що й далі ховав би інший чорний запис}. keys — ключі запиту: у entries лише спільні (без них — усі ключі запису).
    */
   async unblockRefusal(ids, action, toList, keys = null) {
-    const entries = [];
-    for (const id of ids) {
-      const c = await this.store.getCustomer(id);
-      entries.push({ id: c.id, list: c.list, label: c.label ?? null, keys: keys ? c.keys.filter((k) => keys.includes(k)) : c.keys });
-    }
+    const entries = await this.blockEntries(ids, keys);
     const all = await this.keysOfCustomers(ids);
     const now = await this.store.blackIdsByKeys(all);
     const after = new Set(await this.store.blackIdsByKeys(all, ids));
@@ -1279,23 +1275,70 @@ export class Engine {
       'fromBlack', { action, list: toList ?? null, entries, loads });
   }
 
-  /** Після зняття з чорного списку: актуальні — у new (+ черга), минулі — лишаються в архіві. */
-  async restoreUnblocked(s) {
+  /** [{id, list, label, keys}] записів ids; keys — лише спільні з keys (без них — усі ключі запису). */
+  async blockEntries(ids, keys = null) {
+    const entries = [];
+    for (const id of ids) {
+      const c = await this.store.getCustomer(id);
+      if (c) entries.push({ id: c.id, list: c.list, label: c.label ?? null, keys: keys ? c.keys.filter((k) => keys.includes(k)) : c.keys });
+    }
+    return entries;
+  }
+
+  /**
+   * Відмова loads.update, що вивела б заявку з чорного списку: RpcError('fromBlack') з {action: 'edit', list: null,
+   * loadId, entries — записи, що зараз її ховають (keys — ключі цієї заявки), loads: 1, outcome — що з нею станеться:
+   * 'queued' (у черзі на Lardi) | 'new' (у роботі) | 'archived' (в Архіві, дата минула) | 'inactive' (знята вручну)}.
+   */
+  async loadRefusal(cur, patch, ids, s) {
+    const entries = await this.blockEntries(ids, customerKeys(cur));
+    const draft = applyPatch(cur, patch, this.now());
+    const last = draft.dateTo || draft.dateFrom;
+    const hidden = cur.status === 'inactive' && cur.inactiveKind === 'blacklist';
+    const outcome = patch.status === 'inactive' ? 'inactive' : patch.status === 'queued' ? 'queued'
+      : !hidden ? cur.status : last && last < kyivDay(this.now()) ? 'archived' : s.lardi.autoPublish ? 'queued' : 'new';
+    const then = { queued: 'стане в чергу на Lardi', new: 'повернеться в роботу', archived: 'буде видно в Архіві', inactive: 'буде видно серед знятих' }[outcome] || 'знову буде видно';
+    const who = entries.map((e) => `«${e.label || e.keys[0]}»`).join(', ');
+    return new RpcError(`Заявку ховає чорний список (${who}); після цієї правки вона з нього вийде і ${then} — зберігаємо лише після підтвердження`,
+      'fromBlack', { action: 'edit', list: null, loadId: cur.id, entries, loads: 1, outcome });
+  }
+
+  /**
+   * Одна заявка, прихована чорним списком, після зняття з нього: актуальна — у new, минула — лишається в архіві.
+   * → 'restored' | 'archived' | null (заявку не ховав чорний список — не чіпаємо).
+   */
+  async restoreLoad(id, today = kyivDay(this.now())) {
+    let kind = null;
+    await this.store.updateLoad(id, (x) => {
+      if (x.status !== 'inactive' || x.inactiveKind !== 'blacklist') return null;
+      const last = x.dateTo || x.dateFrom;
+      if (last && last < today) {
+        kind = 'archived';
+        return { ...x, inactiveKind: 'date', statusReason: 'дата завантаження минула', updatedAt: this.now() };
+      }
+      kind = 'restored';
+      const next = { ...x, status: 'new', statusReason: 'замовника прибрано з чорного списку', lardi: (x.lardi || []).filter((e) => e.status !== 'removed'), updatedAt: this.now() };
+      delete next.inactiveKind;
+      return next;
+    });
+    return kind;
+  }
+
+  /**
+   * Після зняття з чорного списку: актуальні — у new (+ черга), минулі — лишаються в архіві. Лише заявки цієї дії
+   * (only — id, приховані до неї): залишок, вивільнений колись чимось іншим, не чіпаємо й не рахуємо.
+   */
+  async restoreUnblocked(s, only) {
     const today = kyivDay(this.now());
+    const mine = new Set(only);
     let restored = 0; let archived = 0; let queued = 0;
     for (const id of await this.store.unblockedIds()) {
-      const l = await this.store.updateLoad(id, (x) => {
-        const last = x.dateTo || x.dateFrom;
-        if (last && last < today) return { ...x, inactiveKind: 'date', statusReason: 'дата завантаження минула', updatedAt: this.now() };
-        const next = { ...x, status: 'new', statusReason: 'замовника прибрано з чорного списку', lardi: (x.lardi || []).filter((e) => e.status !== 'removed'), updatedAt: this.now() };
-        delete next.inactiveKind;
-        return next;
-      });
-      if (!l) continue;
-      if (l.status === 'new') {
+      if (!mine.has(id)) continue;
+      const kind = await this.restoreLoad(id, today);
+      if (kind === 'restored') {
         restored++;
         if (s.lardi.autoPublish && (await this.enqueue(id, false))?.status === 'queued') queued++;
-      } else archived++;
+      } else if (kind === 'archived') archived++;
     }
     return { restored, archived, queued };
   }
@@ -1312,7 +1355,7 @@ export class Engine {
       return { restored: 0 };
     }
     // навмисний перенос із чорного (fromBlack): правда для адмінки — скільки заявок знову видно і скільки в черзі
-    const a = await this.restoreUnblocked(s);
+    const a = await this.restoreUnblocked(s, hiddenBefore);
     a.visible = await this.nowVisible(customer.keys, hiddenBefore);
     await this.log('info', `Обрані: «${customer.label || customer.keys[0]}» — з чорного списку в «Обрані» (підтверджено): знову видно заявок ${a.visible}, у черзі ${a.queued}`);
     return a;
@@ -1324,30 +1367,48 @@ Engine.prototype.handlers = {
 
   async 'loads.list'(p) { return this.store.listLoads(p); },
 
-  async 'loads.update'({ id, patch } = {}) {
+  /**
+   * Правка заявки. Правка телефону / компанії / ЄДРПОУ, після якої заявку вже не ховав би чорний список, — лише з
+   * {fromBlack: true} (буквально true); інакше — відмова loadRefusal (action 'edit'), нічого не записано.
+   * З прапорцем — та сама дорога, що й зняття запису (restoreLoad + черга), і відповідь — заявка + affected
+   * {visible, restored, archived, queued, entries}. Правка, що з чорного списку не виводить, — як і була.
+   */
+  async 'loads.update'({ id, patch, fromBlack } = {}) {
     if (!id) throw new Error('id обовʼязковий');
     const s = await this.getSettings();
     const cur = await this.store.getLoad(id);
     if (!cur) throw new Error('заявку не знайдено');
     // лише коментар — тільки в нашу базу: без Lardi, черги й чорного списку
     if (isLocalPatch(patch)) return this.store.updateLoad(id, (l) => ({ ...applyPatch(l, patch, this.now()), updatedAt: l.updatedAt }));
+    // ховає зараз чорний список, а після правки вже не ховав би — лише з підтвердженням
+    const blockers = await this.blackIdsOf(customerKeys(cur));
+    let released = false;
+    if (blockers.length && !(await this.isBlackLoad(applyPatch(cur, patch || {}, this.now())))) {
+      if (fromBlack !== true) throw await this.loadRefusal(cur, patch || {}, blockers, s);
+      released = true;
+    }
     let next = await this.store.updateLoad(id, (l) => applyPatch(l, patch || {}, this.now()));
-    // правка телефону/компанії/ЄДРПОУ могла ввести заявку в чорний список або вивести з нього
+    // правка телефону/компанії/ЄДРПОУ могла ввести заявку в чорний список
     const black = await this.isBlackLoad(next);
     if (black) {
       if (patch && patch.status === 'queued') throw new Error('замовник у чорному списку');
       await this.markInactive(id, BLACK_REASON, 'blacklist', s);
       return this.store.getLoad(id);
     }
-    if (next.status === 'inactive' && next.inactiveKind === 'blacklist' && !(patch && patch.status)) {
-      await this.store.updateLoad(id, (l) => {
-        const x = { ...l, status: 'new', statusReason: 'замовника прибрано з чорного списку', lardi: (l.lardi || []).filter((e) => e.status !== 'removed'), updatedAt: this.now() };
-        delete x.inactiveKind;
-        return x;
-      });
-      if (s.lardi.autoPublish) await this.enqueue(id, false);
-    }
-    if (patch && patch.status === 'inactive') await this.markInactive(id, 'знято вручну', 'manual', s);
+    let affected = null;
+    if (released) {
+      const kind = await this.restoreLoad(id);
+      if (patch && patch.status === 'inactive') await this.markInactive(id, 'знято вручну', 'manual', s);
+      else if (patch && patch.status === 'queued') await this.enqueue(id, true);
+      else if (kind === 'restored' && s.lardi.autoPublish) await this.enqueue(id, false);
+      const after = await this.store.getLoad(id);
+      affected = {
+        visible: 1, restored: kind === 'restored' ? 1 : 0, archived: kind === 'archived' ? 1 : 0,
+        queued: after.status === 'queued' ? 1 : 0, entries: await this.blockEntries(blockers, customerKeys(cur)),
+      };
+      const who = affected.entries.map((e) => `«${e.label || e.keys[0]}»`).join(', ');
+      await this.log('info', `Заявка ${describe(after)} вийшла з чорного списку (${who}) правкою — підтверджено${affected.queued ? ', у черзі на Lardi' : ''}`);
+    } else if (patch && patch.status === 'inactive') await this.markInactive(id, 'знято вручну', 'manual', s);
     else if (patch && patch.status === 'queued') await this.enqueue(id, true);
     next = await this.store.getLoad(id);
     const live = (next.lardi || []).filter((e) => e.id && e.status === 'published');
@@ -1368,7 +1429,7 @@ Engine.prototype.handlers = {
       await this.enqueue(id, true);
       next = await this.store.getLoad(id);
     }
-    return next;
+    return affected ? { ...next, affected } : next; // affected — лише у відповіді, у базу не пишемо
   },
 
   async 'loads.delete'({ id, fromLardi = true } = {}) {
@@ -1594,7 +1655,7 @@ Engine.prototype.handlers = {
     const c = await this.store.removeCustomer(cur.id);
     if (!c) throw new Error('замовника не знайдено');
     const s = await this.getSettings();
-    const r = c.list === 'black' ? await this.restoreUnblocked(s) : { restored: 0, archived: 0, queued: 0 };
+    const r = c.list === 'black' ? await this.restoreUnblocked(s, hiddenBefore) : { restored: 0, archived: 0, queued: 0 };
     r.visible = c.list === 'black' ? await this.nowVisible(c.keys, hiddenBefore) : 0;
     await this.log('info', `${c.list === 'black' ? 'Чорний список' : 'Обрані'}: прибрано «${c.label || c.keys[0]}»${r.restored ? `, повернуто заявок ${r.restored}` : ''}`);
     return r;
