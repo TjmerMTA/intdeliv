@@ -476,10 +476,59 @@ const known = !!(session || cov);
 const broken = known && ((cov && cov.w === 0 && !(session === 'alive' && cov.t === 0)) || (!!session && session !== 'alive'));
 return { known, session, cov, broken, none: !!cov && cov.w === 0, checkedAt: d?.checkedAt || 0 };
 }
+// Що Della дає з входом: {phone, company, dellaCompanyId, edrpou} — з відповіді della.session.check (sample.has, по всіх
+// картках сторінки). status.get цього не несе, тож пам'ятаємо останню перевірку — доки не змінилась сама сесія
+// (settings.della.session.updatedAt). Якщо сервер колись додасть della.has / della.phoneSeen у status.get — беремо звідти.
+const HAS_LS = 'intdeliv.dellaHas';
+const sessStamp = () => String(S.settings?.della?.session?.updatedAt ?? '');
+function dellaHas() {
+const d = S.status?.della;
+if (d?.has && typeof d.has === 'object') return d.has;
+if (typeof d?.phoneSeen === 'boolean') return { phone: d.phoneSeen };
+if (custState().session !== 'alive') return null;
+let c = S.has;
+if (!c && !demo) { try { c = JSON.parse(LS.get(HAS_LS) || 'null'); } catch { c = null; } }
+return c && c.has && typeof c.has === 'object' && c.sess === sessStamp() ? c.has : null;
+}
+function noteHas(sample) {
+if (!sample?.has || typeof sample.has !== 'object') return;
+S.has = { has: sample.has, sess: sessStamp() };
+if (!demo) LS.set(HAS_LS, JSON.stringify(S.has));
+}
+// Чи працює блокування за телефоном: false — точно ні (входу немає / Della телефон не дає); старий сервер — не стверджуємо
+function phoneNo() {
+const c = custState();
+if (!c.known) return false;
+if (c.session && c.session !== 'alive') return true;
+if (c.session === 'alive') return dellaHas()?.phone === false;
+return c.none;
+}
+const nameOnly = () => custState().session === 'alive' && dellaHas()?.phone === false;
+// Живий вхід, а що дає Della — ще не перевіряли: одна тиха перевірка за відкриття сторінки
+let hasProbed = false;
+function probeHas() {
+if (hasProbed || custState().session !== 'alive' || dellaHas()) return;
+hasProbed = true;
+call('della.session.check', {}, { timeout: 60000, tries: 1 })
+.then((r) => { noteHas(r?.sample); if (S.customers) renderCustomers(); loadStatus(); })
+.catch(() => { /* старий сервер чи Della не відповіла — нічого не стверджуємо */ });
+}
+// Як сервер розпізнає ручне введення (parseCustomerInput): лише цифри/пробіли/дужки/+/-, номер України, не ЄДРПОУ/ІПН
+function isPhoneText(t) {
+t = String(t || '').trim();
+if (!/^[\d\s()+-]+$/.test(t)) return false;
+const d = t.replace(/\D/g, '');
+const tel = (d.length === 12 && d.startsWith('380')) || (d.length === 10 && d.startsWith('0')) || d.length === 9;
+return tel && !(d.length === 8 || (d.length === 10 && !d.startsWith('0')));
+}
+const telOnly = (x) => (x.keys || []).length > 0 && x.keys.every((k) => String(k).startsWith('tel:'));
+const PHONE_WARN = 'Це телефон. Della телефон не показує — краще додати назву компанії.';
+const NAME_ONLY = 'Вхід у Della працює, але Della дає лише назву компанії: блокуйте за назвою, за телефоном не спрацює.';
 // Чому кнопка списку неактивна — одне коротке речення
 function noCustWhy() {
 const c = custState();
-if (!c.known || c.session === 'alive') return 'Della не показала замовника цієї заявки — впишіть телефон у «Редагувати»';
+if (c.session === 'alive' && phoneNo()) return 'Della не показала компанію цієї заявки — впишіть назву компанії в «Редагувати»';
+if (!c.known || c.session === 'alive') return 'Della не показала замовника цієї заявки — впишіть телефон або назву компанії в «Редагувати»';
 if (c.session === 'blind') return 'Замовника не видно: акаунт Della не верифікований (Налаштування → Della)';
 if (c.session === 'expired') return 'Замовника не видно: сесія Della закінчилась (Налаштування → Della)';
 return 'Замовника не видно: немає входу в Della (Налаштування → Della)';
@@ -489,12 +538,12 @@ const offBtn = (html, why) => `<span class="ib-w" title="${esc(why)}">${html}</s
 // Чесна строка над «Замовниками»: null — список працює (або сервер ще не вміє сказати)
 function custWarnText() {
 const c = custState();
-if (!c.broken) return null;
+if (!c.broken) return nameOnly() ? { text: NAME_ONLY, button: false } : null;
 const head = c.cov && c.cov.w > 0
 ? `Чорний список працює лише частково: замовника видно в ${fmtN(c.cov.w)} з ${fmtN(c.cov.t)} заявок.`
 : `Чорний список зараз не працює: сервер не бачить замовника заявок${c.cov ? ` (${fmtN(c.cov.w)} з ${fmtN(c.cov.t)})` : ''}.`;
 const why = {
-alive: 'Вхід у Della є — замовник з\'явиться в нових заявках після наступного збору.',
+alive: nameOnly() ? NAME_ONLY : 'Вхід у Della є — замовник з\'явиться в нових заявках після наступного збору.',
 blind: 'Вхід у Della є, але замовник у картці не видно — схоже, акаунт Della не верифікований.',
 expired: 'Сесія Della закінчилась — вставте нову.',
 error: 'Не вдалося перевірити вхід у Della — натисніть «Перевірити» в налаштуваннях.',
@@ -503,7 +552,8 @@ return { text: head + ' ' + why, button: c.session !== 'alive' };
 }
 // Попередження в підтвердженні «В чорний список», поки список не працює
 function blackWarn(pv) {
-const parts = [pv?.weak ? WEAK : ''];
+// (що назва може збігтися з іншою фірмою — уже в самому тексті підтвердження, див. keyLead)
+const parts = [telOnly(pv || {}) && phoneNo() ? PHONE_WARN : ''];
 if (custState().none) parts.push('Зараз запис нічого не приховає: сервер не бачить замовника заявок. Він запрацює, щойно з\'явиться вхід у Della.');
 return parts.filter(Boolean).join(' ');
 }
@@ -818,11 +868,27 @@ if (t === 'edrpou') return 'ЄДРПОУ ' + v;
 if (t === 'della') return 'Della #' + v;
 return '«' + v + '»';
 }
+// Саме той ключ, за яким сервер блокуватиме: «Заблокуємо за назвою компанії «ТОВ Ромашка». Назва може збігтися з іншою фірмою.»
+function keyLead(pv) {
+const ks = (pv?.keys || []).map(String);
+const of = (t) => ks.filter((k) => k.startsWith(t + ':'));
+const val = (k) => k.slice(k.indexOf(':') + 1);
+const name = of('name')[0];
+const label = String(pv?.label || '').trim();
+const parts = [
+...of('della').map((k) => `кодом компанії на Della ${val(k)}`),
+...of('edrpou').map((k) => `ЄДРПОУ ${val(k)}`),
+...of('tel').map((k) => `телефоном ${keyLabel(k)}`),
+...(name ? [((n) => `назвою компанії ${/[«»]/.test(n) ? n : '«' + n + '»'}`)(label && !isPhoneText(label) ? label : val(name))] : []),
+];
+if (!parts.length) return `Замовник «${label}».`;
+const list = parts.length > 1 ? parts.slice(0, -1).join(', ') + ' і ' + parts[parts.length - 1] : parts[0];
+return `Заблокуємо за ${list}.${pv.weak ? ' Назва може збігтися з іншою фірмою.' : ''}`;
+}
 function blackText(pv) {
 const live = Object.entries(pv.live || {}).map(([n, c]) => `${n}: ${c}`).join(', ');
-return `Замовник «${pv.label}» (${pv.keys.map(keyLabel).join(', ')}). Приховаємо заявок у базі: ${pv.loads}; з Lardi буде знято публікацій: ${pv.liveTotal}${live ? ' (' + live + ')' : ''}. Нові заявки цього замовника з Della не збиратимуться.`;
+return `${keyLead(pv)} Приховаємо заявок у базі: ${pv.loads}; з Lardi буде знято публікацій: ${pv.liveTotal}${live ? ' (' + live + ')' : ''}. Нові заявки цього замовника з Della не збиратимуться.`;
 }
-const WEAK = 'Замовника визначено лише за назвою — може збігтися з іншою компанією з такою самою назвою.';
 function blackDone(a) {
 return `У чорному списку. Приховано: ${a?.hidden ?? 0}, знято з Lardi: ${a?.removed ?? 0}${a?.failed ? ', не вдалося зняти: ' + a.failed + ' (див. Журнал)' : ''}${!a?.hidden && custState().none ? ' — сервер поки не бачить замовника заявок' : ''}`;
 }
@@ -872,8 +938,14 @@ renderCustWarn();
 $('#c-add .btn').textContent = S.cList === 'black' ? 'В чорний список' : 'В обрані';
 const rows = c.items.filter((x) => x.list === S.cList);
 const zeroWhy = custState().none ? 'Сервер не бачить замовника в жодній заявці — потрібен вхід у Della' : '';
+// Записи лише з телефоном: Della телефон не показує — тихо позначаємо й підказуємо, самі записи не чіпаємо
+const blindTel = phoneNo() ? rows.filter(telOnly) : [];
+const telNote = ensureEl('c-tel-note', 'c-tel-note', (el) => $('#v-customers .ctbl').before(el));
+telNote.hidden = !blindTel.length;
+telNote.textContent = blindTel.length ? `Лише за телефоном: ${fmtN(blindTel.length)} (усього записів: ${fmtN(rows.length)}). Della телефон не показує, тож за ними ${S.cList === 'black' ? 'блокування' : 'вибір в обрані'} не спрацює. Додайте назву компанії — ваші записи лишаються як є.` : '';
+const telHint = S.cList === 'black' ? 'За телефоном Della замовника не показує — додайте назву компанії, щоб блокування спрацювало' : 'За телефоном Della замовника не показує — додайте назву компанії, щоб це спрацювало';
 $('#c-rows').innerHTML = rows.map((x) => `<tr data-cid="${esc(x.id)}">
-<td data-l="Замовник"><b>${esc(x.label || '—')}</b>${x.list === 'black' && x.live ? `<div class="c-sweep" title="Не вдалося зняти одразу (Lardi не відповідав) — рушій повторює кожні 10 хв">на Lardi ще ${esc(fmtN(x.live))} — знімаємо</div>` : ''}</td>
+<td data-l="Замовник"><b>${esc(x.label || '—')}</b>${blindTel.includes(x) ? `<span class="chip c-off tel-only">лише телефон</span><div class="c-tel">${esc(telHint)} · <button type="button" class="lnk" data-c="addname">Додати назву</button></div>` : ''}${x.list === 'black' && x.live ? `<div class="c-sweep" title="Не вдалося зняти одразу (Lardi не відповідав) — рушій повторює кожні 10 хв">на Lardi ще ${esc(fmtN(x.live))} — знімаємо</div>` : ''}</td>
 <td data-l="Ключі">${(x.keys || []).map((k) => `<span class="key">${esc(keyLabel(k))}</span>`).join('')}</td>
 <td data-l="Додано" class="num">${esc(new Date(x.createdAt).toLocaleDateString('uk-UA'))}</td>
 <td data-l="Нотатка"><input class="note-in" data-note value="${esc(x.note || '')}" placeholder="—" aria-label="Нотатка"></td>
@@ -901,12 +973,16 @@ box.hidden = !w;
 box.innerHTML = w ? `<span>${esc(w.text)}</span>${w.button ? '<button type="button" class="btn" data-go-sess>Налаштувати вхід у Della</button>' : ''}` : '';
 const hint = ensureEl('c-add-hint', 'c-add-hint', (el) => $('#c-add').after(el));
 const c = custState();
-const ht = !c.broken || !c.cov ? '' : c.cov.w === 0
+// вписаний телефон — сказати ще до збереження (зберегти можна: спрацює, якщо Della колись покаже телефон)
+const typedTel = isPhoneText($('#c-add [name="text"]')?.value) && phoneNo();
+const ht = typedTel ? PHONE_WARN : !c.broken || !c.cov ? '' : c.cov.w === 0
 ? 'Запис збережеться, але спрацює лише тоді, коли сервер бачитиме замовника заявок — зараз не бачить у жодній.'
 : `Спрацює лише для заявок, де видно замовника: ${fmtN(c.cov.w)} з ${fmtN(c.cov.t)}.`;
 hint.hidden = !ht; hint.textContent = ht;
 $('#c-add .btn').title = ht;
+if (S.view === 'customers') probeHas();
 }
+$('#c-add [name="text"]').addEventListener('input', () => renderCustWarn());
 $('#v-customers').addEventListener('click', async (e) => {
 const b = e.target.closest('#c-reapply'); if (!b) return;
 if (!(await confirmBox('Застосувати чорний список до старих заявок?', 'Усі заявки, що вже лежать у базі, буде перевірено за чорним списком: заявки цих замовників зникнуть зі списку, а опубліковані — знімуться з Lardi.', 'Застосувати'))) return;
@@ -937,7 +1013,7 @@ if (!(await confirmBox('Додати в чорний список?', blackText(p
 }
 btn.disabled = true;
 const r = await call('customers.add', { list, text, note });
-e.target.reset();
+e.target.reset(); e.target.elements.text.placeholder = 'Телефон, ЄДРПОУ або назва компанії';
 toast(list === 'black' ? blackDone(r.affected) : `«${r.customer.label}» — в обраних ★`, !!r.affected?.failed);
 } catch (err) { toast(err.message, true); }
 btn.disabled = false; loadCustomers(); loadStatus();
@@ -952,6 +1028,13 @@ const id = Number(b.closest('tr').dataset.cid);
 const x = (S.customers?.items || []).find((c) => c.id === id); if (!x) return;
 try {
 if (b.dataset.c === 'loads') return showCustomerLoads(x);
+if (b.dataset.c === 'addname') { // новий запис за назвою поруч зі старим — старий не змінюємо
+const f = $('#c-add');
+f.elements.note.value = `до ${x.label || 'запису'}`;
+f.scrollIntoView({ block: 'center', behavior: 'smooth' });
+f.elements.text.value = ''; f.elements.text.placeholder = 'Назва компанії, як на Della'; f.elements.text.focus();
+renderCustWarn(); return;
+}
 if (b.dataset.c === 'remove') {
 const txt = x.list === 'black' ? `«${x.label}» прибрати з чорного списку? Актуальні заявки повернуться в роботу (і в чергу публікації), минулі лишаться в Архіві.` : `«${x.label}» прибрати з обраних?`;
 if (!(await confirmBox('Прибрати зі списку?', txt, 'Прибрати'))) return;
@@ -1095,7 +1178,12 @@ if (v.text) return `<div class="${v.cls || 'muted'}">${esc(v.text)}</div>`;
 const [cls, , text] = DS[v.state] || DS.error;
 const sm = v.sample && [v.sample.company, v.sample.phone, v.sample.edrpou ? 'ЄДРПОУ ' + v.sample.edrpou : ''].filter(Boolean).join(' · ');
 const icon = v.state === 'alive' ? '✓ ' : v.state === 'none' ? '' : '✗ ';
-return `<div class="${cls === 'c-ok' || cls === 'c-err' ? cls : ''}"><b>${esc(icon + text)}</b></div>${sm ? `<div class="smp">Зараз сервер бачить про замовника: ${esc(sm)}</div>` : ''}`;
+// що Della дає (по всіх картках сторінки) і як тоді блокувати
+const has = v.state === 'alive' && v.sample?.has && typeof v.sample.has === 'object' ? v.sample.has : null;
+const gives = has ? [['phone', 'телефон'], ['company', 'назву компанії'], ['dellaCompanyId', 'код компанії'], ['edrpou', 'ЄДРПОУ']].filter(([k]) => has[k]).map(([, t]) => t) : [];
+const givesTxt = !has ? '' : (gives.length ? 'Della показує: ' + (gives.length > 1 ? gives.slice(0, -1).join(', ') + ' і ' + gives[gives.length - 1] : gives[0]) : 'Della не показує жодних даних про замовника')
++ (has.phone ? '.' : ' — телефону немає, тож блокуйте за назвою компанії.');
+return `<div class="${cls === 'c-ok' || cls === 'c-err' ? cls : ''}"><b>${esc(icon + text)}</b></div>${sm ? `<div class="smp">Зараз сервер бачить про замовника: ${esc(sm)}</div>` : ''}${givesTxt ? `<div class="smp">${esc(givesTxt)}</div>` : ''}`;
 }
 function renderDellaSess() {
 const st = $('#ds-st'); if (!st) return;
@@ -1104,12 +1192,16 @@ const old = !!S.status && !demo && !c.session && !S.dsVerdict?.state; // ста�
 let h = '';
 if (c.session) {
 const [cls, label] = DS[c.session];
-h += `<span class="chip ${c.session === 'none' ? 'c-off' : 'c-info'}">Сесія: ${c.session === 'none' ? 'немає' : 'встановлено'}</span><span class="chip ${cls}">${esc(label)}</span>`;
+const ss = S.settings?.della?.session; // новий сервер: {set, state, checkedAt, updatedAt} — без самого значення
+const stored = typeof ss?.set === 'boolean' ? ss.set : c.session !== 'none';
+h += `<span class="chip ${stored ? 'c-info' : 'c-off'}">Сесія: ${stored ? 'встановлено' : 'немає'}</span><span class="chip ${cls}">${esc(label)}</span>`;
 if (c.checkedAt) h += `<span class="muted">перевірено ${esc(rel(c.checkedAt))}</span>`;
 if (c.cov) h += `<span class="muted">· замовника видно в ${esc(fmtN(c.cov.w))} з ${esc(fmtN(c.cov.t))} заявок</span>`;
 } else h += `<span class="muted">${old ? esc(DS_OLD) : 'Сесія: …'}</span>`;
 st.innerHTML = h;
-$$('[data-ds]').forEach((b) => { b.disabled = !!S.dsBusy || old || (b.dataset.ds === 'clear' && c.session === 'none'); });
+const ss = S.settings?.della?.session;
+const nothing = typeof ss?.set === 'boolean' ? !ss.set : c.session === 'none';
+$$('[data-ds]').forEach((b) => { b.disabled = !!S.dsBusy || old || (b.dataset.ds === 'clear' && nothing); });
 $('#ds-res').innerHTML = dsVerdictHtml(S.dsVerdict);
 }
 // Рядок із панелі Chrome: «cookie: a=1; b=2» або лише значення — серверу йде лише значення
@@ -1131,6 +1223,7 @@ const check = () => call('della.session.check', {}, { timeout: 60000, tries: 1 }
 try {
 if (kind === 'check') {
 const r = await check();
+noteHas(r?.sample);
 S.dsVerdict = { state: dsState(r, 'error'), sample: r?.sample || null };
 } else {
 const r = await call('della.session.set', { cookie }, { timeout: 60000, tries: 1 });
@@ -1139,7 +1232,9 @@ cookie = '';
 S.dsVerdict = { state: dsState(r, kind === 'clear' ? 'none' : 'error'), sample: null };
 toast(kind === 'clear' ? 'Вхід у Della прибрано' : 'Сесію збережено');
 if (kind === 'save' && S.dsVerdict.state !== 'none') { // одразу показуємо, що сервер тепер бачить про замовника
+await loadSettings(); // нова сесія — нова позначка updatedAt, до неї й прив'язуємо, що дає Della
 const ck = await check().catch(() => null);
+noteHas(ck?.sample);
 if (ck && DS_STATES.includes(ck.state)) S.dsVerdict = { state: ck.state, sample: ck.sample || null };
 }
 }
@@ -1148,6 +1243,7 @@ S.dsVerdict = { text: OLD_SERVER(err) ? DS_OLD : 'Не вдалося: ' + err.m
 }
 S.dsBusy = false;
 renderDellaSess();
+if (kind !== 'check') await loadSettings(); // «встановлено / немає» — із settings.della.session
 await loadStatus();
 }
 $('#sf').addEventListener('click', (e) => { const b = e.target.closest('[data-ds]'); if (b) dsRun(b.dataset.ds); });
@@ -1289,7 +1385,7 @@ $$('.view').forEach((v) => (v.hidden = v.id !== 'v-' + view));
 renderBanners();
 if (view === 'loads') loadLoads();
 if (view === 'settings') { renderSettings(); Promise.all([loadSettings(), loadStatus()]).then(renderSettings); }
-if (view === 'customers') { renderCustomers(); loadCustomers(); }
+if (view === 'customers') { renderCustomers(); loadCustomers(); loadStatus(); } // строка про вхід — зі свіжого охоплення
 if (view === 'log') loadLog();
 if (location.hash !== '#' + view) history.replaceState(null, '', '#' + view);
 }
@@ -1421,29 +1517,36 @@ seenAt: seen, firstSeenAt: seen - H, updatedAt: seen };
 });
 // Вхід у Della в демо: ?demo — входу немає; ?demo=alive|blind|expired|error — одразу цей стан.
 // Без живого входу Della не показує замовника — як на справжньому сервері: у заявках немає ні телефону, ні компанії.
-// У полі сесії: будь-який рядок «a=b» → вхід працює; зі словом blind / expired / error → цей стан.
+// ?demo=name-only — вхід працює, але Della дає лише назву й код компанії, телефону немає (як насправді з входом).
+// У полі сесії: будь-який рядок «a=b» → вхід працює; зі словом name / blind / expired / error → цей стан.
 const want = new URLSearchParams(location.search).get('demo');
-const sess = { state: DS_STATES.includes(want) ? want : 'none', checkedAt: now - 4 * 60e3 };
+const sess = { state: DS_STATES.includes(want) ? want : want === 'name-only' ? 'alive' : 'none', nameOnly: want === 'name-only', checkedAt: now - 4 * 60e3, updatedAt: want && want !== 'none' ? now - 86400e3 : null };
 const custSeen = () => sess.state === 'alive';
-const view = (l) => (custSeen() || l.edited ? l : { ...l, phone: undefined, company: undefined, edrpou: undefined });
-// замовник заявки в демо — за телефоном (і лише якщо його видно)
-const telKey = (l) => (l.phone ? 'tel:' + String(l.phone).replace(/\D/g, '').slice(-12) : null);
-const dKey = (l) => telKey(view(l));
+const view = (l) => (l.edited ? l : !custSeen() ? { ...l, phone: undefined, company: undefined, edrpou: undefined } : sess.nameOnly ? { ...l, phone: undefined } : l);
+// ключі замовника в демо — телефон і назва (лише те, що видно); запис списку збігається, якщо збігся хоч один ключ
+const telOf = (s) => { const d = String(s || '').replace(/\D/g, ''); const k = d.length === 12 && d.startsWith('380') ? d : d.length === 10 && d.startsWith('0') ? '38' + d : d.length === 9 ? '380' + d : ''; return k ? 'tel:' + k : null; };
+const nameOf = (s) => { const n = String(s || '').toLowerCase().replace(/[«»"'.]/g, '').replace(/^(тов|фоп|пп|ат)\s+/, '').trim(); return n.length >= 4 ? 'name:' + n : null; };
+const keysOf = (l) => [telOf(l.phone), nameOf(l.company)].filter(Boolean);
+const dKeys = (l) => keysOf(view(l));
+const dKey = (l) => dKeys(l)[0] || null;
+const hits = (c, l) => dKeys(l).some((k) => c.keys.includes(k));
 let customers = [];
 let custSeq = 1;
-const listOf = (l) => { const k = dKey(l); const c = k && customers.find((x) => x.keys.includes(k)); return c ? c.list : null; };
+const listOf = (l) => { const c = customers.find((x) => hits(x, l)); return c ? c.list : null; };
 const visible = () => items.filter((l) => listOf(l) !== 'black');
 const withFav = (l) => ({ ...clone(view(l)), ...(listOf(l) === 'white' ? { fav: true } : {}) });
-const demoAdd = (list, key, label) => {
-const c = customers.find((x) => x.keys.includes(key));
+const demoAdd = (list, keys, label) => {
+const c = customers.find((x) => x.keys.some((k) => keys.includes(k)));
 if (c) { c.list = list; return c; }
-const n = { id: custSeq++, list, label, note: '', keys: [key], createdAt: Date.now() };
+const n = { id: custSeq++, list, label, note: '', keys: [...keys], createdAt: Date.now() };
 customers.push(n); return n;
 };
-// заготовлені: обраний і два в чорному списку — у Вінниці зняття з Lardi ще не пройшло (на Lardi ще 1 — знімаємо)
-demoAdd('white', telKey(items[0]), items[0].company).note = 'стабільно платить, пріоритет';
-demoAdd('black', telKey(items[2]), '+380 67 123 6789').note = 'не оплатив рейс';
-Object.assign(demoAdd('black', 'tel:380509998877', '050 999 88 77'), { note: 'додано вручну', createdAt: now - 3 * 86400e3 });
+// заготовлені: обраний, три телефони в чорному списку (як у клієнтки) і один запис за назвою
+demoAdd('white', [telOf(items[0].phone)], items[0].company).note = 'стабільно платить, пріоритет';
+demoAdd('black', [telOf(items[2].phone)], '+380 67 123 6789').note = 'не оплатив рейс';
+Object.assign(demoAdd('black', ['tel:380509998877'], '050 999 88 77'), { note: 'додано вручну', createdAt: now - 3 * 86400e3 });
+Object.assign(demoAdd('black', ['tel:380631112233'], '063 111 22 33'), { note: 'зриває завантаження', createdAt: now - 5 * 86400e3 });
+Object.assign(demoAdd('black', [nameOf('ФОП Коваль')], 'ФОП Коваль'), { note: 'за назвою', createdAt: now - 86400e3 });
 let settings = { della: { searchUrls: ['https://della.com.ua/search/a204bd204eflolz1z21z3z4z51z6z7z8z9y1y2y3y4y5y6h0ilk0m1.html'], pollSeconds: 90, pagesPerPoll: 4 },
 filters: { minPrice: 8000, directOnly: true, bodies: [], fromRegions: [], toRegions: [], excludeRegions: [], stopWords: ['металобрухт'], maxAgeHours: 24 },
 lardi: { accounts: [{ name: 'Кілик В.', token: '••••4821', enabled: true, state: 'ok' }, { name: 'Друге Ларді', token: '', enabled: true, state: 'pending' }],
@@ -1452,11 +1555,13 @@ const counts = () => items.reduce((c, l) => ((c[l.status] = (c[l.status] || 0) +
 const logs = [['info', 'Зібрано 25 заявок зі сторінки 1, нових: 3'], ['info', 'Опубліковано на Lardi (Софія): Полтава → Харків'], ['warn', 'needs_review: не знайдено кузов «цільномет» на Lardi'], ['error', 'Lardi 429 — повтор через 30 с']]
 .map(([level, msg], i) => ({ t: now - i * 4 * 60e3, level, msg }));
 const clone = (x) => JSON.parse(JSON.stringify(x));
+// як новий сервер: settings.della.session — лише ознаки, без значення
+const withSess = (s) => { s.della.session = { set: sess.state !== 'none', state: sess.state, checkedAt: sess.checkedAt, updatedAt: sess.updatedAt }; return s; };
 const upd = (id, fn) => { const l = items.find((x) => x.id === id); if (!l) throw new Error('Заявку не знайдено'); fn(l); l.updatedAt = Date.now(); return clone(l); };
 const api = {
 ping: () => ({ version: 'demo', authed: true }),
 'loads.list': (p) => {
-if (p.customer) { const c = customers.find((x) => x.id === p.customer); const r = items.filter((l) => c && c.keys.includes(dKey(l))); return { items: clone(r), total: r.length }; }
+if (p.customer) { const c = customers.find((x) => x.id === p.customer); const r = items.filter((l) => c && hits(c, l)).map((l) => clone(view(l))); return { items: r, total: r.length }; }
 const sts = p.status && p.status !== 'all' ? [].concat(p.status) : null;
 const ok = loadFilter(p);
 const r = visible().filter((l) => (sts ? sts.includes(l.status) : l.status !== 'deleted')).map(withFav).filter(ok)
@@ -1464,19 +1569,21 @@ const r = visible().filter((l) => (sts ? sts.includes(l.status) : l.status !== '
 const offset = Math.max(0, Number(p.offset) || 0), limit = Math.max(1, Number(p.limit) || 500);
 return { items: r.slice(offset, offset + limit), total: r.length };
 },
-'customers.list': () => ({ items: clone(customers).map((c) => ({ ...c, loads: items.filter((l) => c.keys.includes(dKey(l))).length, live: items.filter((l) => c.keys.includes(dKey(l))).reduce((n, l) => n + l.lardi.filter((e) => e.id && e.status === 'published').length, 0) })), hiddenBlack: items.filter((l) => listOf(l) === 'black').length }),
+'customers.list': () => ({ items: clone(customers).map((c) => ({ ...c, loads: items.filter((l) => hits(c, l)).length, live: items.filter((l) => hits(c, l)).reduce((n, l) => n + l.lardi.filter((e) => e.id && e.status === 'published').length, 0) })), hiddenBlack: items.filter((l) => listOf(l) === 'black').length }),
 'customers.preview': (p) => {
 const l = p.loadId && items.find((x) => x.id === p.loadId);
-const key = l ? dKey(l) : p.keys ? p.keys[0] : p.text && /\d{9}/.test(p.text.replace(/\D/g, '')) ? 'tel:380' + p.text.replace(/\D/g, '').slice(-9) : p.text ? 'name:' + p.text.toLowerCase() : null;
-if (!key) throw new Error('Немає даних про замовника — впишіть телефон або компанію в редагуванні заявки');
-const own = items.filter((x) => dKey(x) === key);
-const c = customers.find((x) => x.keys.includes(key));
-return { label: (l && (l.company || l.phone)) || p.label || p.text, keys: [key], weak: key.startsWith('name:'), loads: own.length, queued: own.filter((x) => x.status === 'queued').length,
+const t = String(p.text || '').trim();
+const keys = l ? dKeys(l) : p.keys ? p.keys : t ? [isPhoneText(t) ? telOf(t) : nameOf(t)].filter(Boolean) : [];
+if (!keys.length) throw new Error('Немає даних про замовника — впишіть телефон або компанію в редагуванні заявки');
+const own = items.filter((x) => dKeys(x).some((k) => keys.includes(k)));
+const c = customers.find((x) => x.keys.some((k) => keys.includes(k)));
+const v = l && view(l);
+return { label: (v && (v.company || v.phone)) || p.label || t, keys, weak: keys.every((k) => k.startsWith('name:')), loads: own.length, queued: own.filter((x) => x.status === 'queued').length,
 live: { 'Кілик В.': own.filter((x) => x.status === 'published').length }, liveTotal: own.filter((x) => x.status === 'published').length, list: c ? c.list : null, customerId: c ? c.id : null };
 },
 'customers.add': (p) => {
 const pv = api['customers.preview'](p);
-const c = demoAdd(p.list, pv.keys[0], p.label || pv.label);
+const c = demoAdd(p.list, pv.keys, p.label || pv.label);
 if (p.note) c.note = p.note;
 return { customer: clone(c), affected: p.list === 'black' ? { hidden: pv.loads, removed: pv.liveTotal, failed: 0 } : { restored: 0 } };
 },
@@ -1492,13 +1599,15 @@ return { hidden: own.length, removed, failed: 0 };
 'della.session.set': ({ cookie }) => {
 const c = String(cookie || '');
 sess.state = !c ? 'none' : /blind/i.test(c) ? 'blind' : /expired/i.test(c) ? 'expired' : /error/i.test(c) ? 'error' : 'alive';
-sess.checkedAt = Date.now();
+sess.nameOnly = sess.state === 'alive' && /name/i.test(c);
+sess.checkedAt = Date.now(); sess.updatedAt = c ? Date.now() : null;
 return { state: sess.state };
 },
 'della.session.check': () => {
 sess.checkedAt = Date.now();
-const l = items.find((x) => x.company && x.phone);
-return { state: sess.state, customerSeen: custSeen(), sample: custSeen() && l ? { company: l.company, phone: l.phone, edrpou: null, dellaCompanyId: null } : null, message: '' };
+const l = items.map(view).find((x) => x.company && (x.phone || sess.nameOnly));
+const has = { phone: !sess.nameOnly, company: true, dellaCompanyId: sess.nameOnly, edrpou: false };
+return { state: sess.state, customerSeen: custSeen(), sample: custSeen() && l ? { company: l.company, phone: l.phone || null, edrpou: null, dellaCompanyId: sess.nameOnly ? '4417' : null, has } : null, message: '' };
 },
 'lardi.accounts': () => api['status.get']().accounts,
 'lardi.backfill': ({ dryRunOnly }) => (dryRunOnly ? { candidates: 3 } : { queued: 3 }),
@@ -1506,14 +1615,14 @@ return { state: sess.state, customerSeen: custSeen(), sample: custSeen() && l ? 
 'loads.delete': ({ id }) => { items = items.filter((l) => l.id !== id); return { ok: true }; },
 'loads.publish': ({ id }) => upd(id, (l) => { l.status = 'queued'; l.lardi = [0, 1].map((a) => ({ account: a, status: settings.lardi.dryRun ? 'dry' : 'queued' })); }),
 'loads.unpublish': ({ id }) => upd(id, (l) => { l.status = 'inactive'; l.statusReason = 'Знято вручну'; l.lardi = l.lardi.map((a) => ({ ...a, status: 'removed' })); }),
-'settings.get': () => clone(settings),
+'settings.get': () => withSess(clone(settings)),
 'settings.set': (p) => {
 for (const k in p) settings[k] = typeof p[k] === 'object' && !Array.isArray(p[k]) ? { ...settings[k], ...p[k] } : p[k];
 settings.lardi.accounts = settings.lardi.accounts.map((a) => {
 const t = a.archived ? '' : a.token && !String(a.token).startsWith('••') ? '••••' + String(a.token).slice(-4) : a.token || '';
 return { ...a, token: t, state: a.archived || !a.enabled ? 'disabled' : t ? 'ok' : 'pending' };
 });
-return clone(settings);
+return withSess(clone(settings));
 },
 'status.get': () => ({ della: { session: sess.state, checkedAt: sess.checkedAt, customerSeen: custSeen() },
 custCoverage: { withCustomer: items.filter((l) => l.status !== 'deleted' && dKey(l)).length, total: items.filter((l) => l.status !== 'deleted').length },
