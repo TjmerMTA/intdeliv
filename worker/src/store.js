@@ -582,14 +582,23 @@ export class Store {
 
   /**
    * Позначки «чорний список» без жодного чорного ключа (за колонкою custKeys і customer_keys у базі): id, давніші
-   * першими, не більше limit. Перевірку за даними замовника робить Engine.reconcileBlackMarks.
+   * першими, не більше limit. Лише ті, де є дані про замовника — без них не знаємо, чия заявка (blackMarksNobody).
+   * Перевірку за даними замовника робить Engine.reconcileBlackMarks.
    */
   async staleBlackMarks(limit) {
     const { results } = await this.db.prepare(
-      `SELECT id FROM loads WHERE status = 'inactive' AND json_extract(data, '$.inactiveKind') = 'blacklist' AND NOT ${IS_BLACK}
-       ORDER BY updatedAt ASC, id ASC LIMIT ?`,
+      `SELECT id FROM loads WHERE status = 'inactive' AND json_extract(data, '$.inactiveKind') = 'blacklist'
+       AND custKeys <> '' AND NOT ${IS_BLACK} ORDER BY updatedAt ASC, id ASC LIMIT ?`,
     ).bind(limit).all();
     return (results || []).map((r) => r.id);
+  }
+
+  /** Скільки заявок позначено «чорний список», але даних про замовника в них немає (custKeys порожній). */
+  async blackMarksNobody() {
+    const row = await this.db.prepare(
+      "SELECT COUNT(*) AS n FROM loads WHERE status = 'inactive' AND json_extract(data, '$.inactiveKind') = 'blacklist' AND custKeys = ''",
+    ).first();
+    return Number(row && row.n) || 0;
   }
 
   // ---------- settings / meta ----------

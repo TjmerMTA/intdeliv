@@ -121,6 +121,7 @@ export function maskSettings(s, session = NO_SESSION) {
 
 const SESSION_KEY = 'della.session'; // {cookie, updatedAt, id}
 const SESSION_META = 'dellaSession'; // meta: {id, state, checkedAt, customerSeen, phoneSeen, message}
+const NOBODY_META = 'blackMarksNobody'; // meta: скільки позначок «чорний список» без даних про замовника вже названо в журналі
 const CONTACTS_META = 'dellaContacts'; // meta: {id, refused?, ok?, at} — що Della відповіла на запит контактів цієї сесії
 export const CONTACTS_PER_POLL = 10;
 const SESSION_STATES = ['none', 'alive', 'blind', 'expired', 'error'];
@@ -1357,17 +1358,26 @@ export class Engine {
    * автопублікація), в Архів — якщо дата минула або Della її давно не показує. Це не зняття блокування: правда — з
    * чорного списку в базі, не з позначки; заявку, що підпадає під будь-який чорний ключ (за колонкою чи за даними
    * замовника), не чіпаємо. Не більше limit за прохід, кожна — раз. seenBefore — як у staleCheck (-1 — збору ще не було).
-   * → {ids — розглянуті, restored, archived, queued}
+   * Позначку без жодних даних про замовника не повертаємо (не знаємо, чия заявка) і місця в межі вона не займає;
+   * вголос — рядок журналу, скільки їх, щойно це число змінилося (не щопроходу).
+   * → {ids — розглянуті, restored, archived, queued, nobody — позначених без даних про замовника}
    */
   async reconcileBlackMarks(s, seenBefore, limit = SWEEP_LIMIT) {
     const ids = await this.store.staleBlackMarks(limit);
-    const r = { ids, restored: 0, archived: 0, queued: 0 };
+    const r = { ids, restored: 0, archived: 0, queued: 0, nobody: await this.store.blackMarksNobody() };
+    if (r.nobody !== (await this.store.getMeta(NOBODY_META, 0))) {
+      await this.store.setMeta(NOBODY_META, r.nobody);
+      if (r.nobody) {
+        await this.log('warn', `Чорний список: ${r.nobody} заявок позначено «чорний список», але даних про замовника в них немає — лишили як є: не знаємо, чиї вони, тож не повертаємо. Перевірте їх вручну (Архів, «чорний список»)`);
+      }
+    }
     if (!ids.length) return r;
     const today = kyivDay(this.now());
     const unseen = { before: seenBefore, reason: `не видно в Della понад ${s.staleHours} год` };
     for (const id of ids) {
       const cur = await this.store.getLoad(id);
-      if (!cur || (await this.isBlackLoad(cur))) continue;
+      // правда — з даних: без даних про замовника або під будь-яким чорним ключем — не чіпаємо
+      if (!cur || !customerKeys(cur).length || (await this.isBlackLoad(cur))) continue;
       const kind = await this.restoreLoad(id, today, { unseen, reason: 'більше не підпадає під чорний список' });
       if (kind === 'restored') {
         r.restored++;

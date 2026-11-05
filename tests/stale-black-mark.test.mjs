@@ -111,3 +111,63 @@ test('звичайний стан — тиша: без таких позначо
   await h.engine().staleCheck();
   assert.ok(!(await h.call('log.list', {})).some((x) => LOG.test(x.msg)));
 });
+
+// ---- позначка без жодних даних про замовника: не повертаємо, а кажемо вголос ----
+const NOBODY = /позначено «чорний список», але даних про замовника в них немає — лишили як є/;
+/** Заявки Бети, яким стерто дані замовника (телефон, назва, код, ЄДРПОУ), — позначені «чорний список». */
+async function nobody(st, ids) {
+  for (const id of ids) {
+    await st.updateLoad(id, (x) => {
+      const y = { ...x };
+      for (const k of ['phone', 'company', 'dellaCompanyId', 'edrpou']) delete y[k];
+      return y;
+    });
+  }
+  for (const id of ids) {
+    const row = await st.db.prepare('SELECT custKeys FROM loads WHERE id = ?').bind(id).first();
+    assert.equal(row.custKeys, '', 'передумова: даних про замовника немає');
+  }
+}
+
+test('позначка без даних про замовника — не повертаємо, лишаємо як є; один рядок журналу, скільки їх, — і не щопроходу', async () => {
+  const { h, st, betas } = await base();
+  const anon = betas.slice(0, 2);
+  await nobody(st, anon);
+  const before = await loadsOf(st, anon);
+  for (let i = 0; i < 3; i++) {
+    h.clock.t += 61e3;
+    await h.engine().staleCheck();
+    assert.deepEqual(await loadsOf(st, anon), before, `прохід ${i + 1}: байт у байт`);
+    await h.engine().publishTick(h.clock.t + 60e3);
+  }
+  assert.ok((await loadsOf(st, anon)).every((x) => !(x.lardi || []).some((e) => e.status === 'published')), 'на Lardi їх немає');
+  const lines = (await h.call('log.list', {})).filter((x) => NOBODY.test(x.msg));
+  assert.equal(lines.length, 1, 'вголос, але один раз, поки їх стільки ж');
+  assert.match(lines[0].msg, /^Чорний список: 2 заявок/);
+  // решту (з даними, під чорний список не підпадають) повернуто як і було
+  assert.equal(marks(await loadsOf(st, betas.slice(2))), 0);
+  // з'явилась ще одна — новий рядок з новим числом
+  await nobody(st, [betas[2]]);
+  await st.updateLoad(betas[2], (x) => ({ ...x, status: 'inactive', inactiveKind: 'blacklist', statusReason: 'чорний список' }));
+  h.clock.t += 61e3;
+  await h.engine().staleCheck();
+  const again = (await h.call('log.list', {})).filter((x) => NOBODY.test(x.msg));
+  assert.equal(again.length, 2);
+  assert.ok(again.some((x) => /^Чорний список: 3 заявок/.test(x.msg)));
+});
+
+test('позначки без даних не займають місця в межі проходу — решту однаково повертаємо', async () => {
+  const { h, st, betas } = await base();
+  const anon = betas.slice(0, 3);
+  await nobody(st, anon); // найдавніші — саме вони були б першими в черзі звірки
+  const e = h.engine();
+  const s = await e.getSettings();
+  const r = await e.reconcileBlackMarks(s, -1, 2);
+  assert.equal(r.ids.length, 2);
+  assert.ok(r.ids.every((id) => !anon.includes(id)), 'у межі — лише ті, що з даними');
+  assert.equal(r.restored, 2);
+  assert.equal(r.nobody, 3);
+  await e.reconcileBlackMarks(s, -1, 2);
+  assert.equal(marks(await loadsOf(st, betas.slice(3))), 0, 'усі з даними повернуто');
+  assert.equal(marks(await loadsOf(st, anon)), 3, 'без даних — на місці');
+});
