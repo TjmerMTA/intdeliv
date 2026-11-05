@@ -8,7 +8,7 @@ import { applyFilters } from '../../extension/lib/filters.js';
 import { LardiClient, NeedsReviewError } from '../../extension/lib/lardi.js';
 import {
   STATUSES, applyPatch, isLocalPatch, maskToken, isMasked, accountsNeeded, upsertLardiEntry, describe,
-  customerKeys, weakKeys, parseCustomerInput,
+  customerKeys, custKeysColumn, weakKeys, parseCustomerInput,
 } from '../../extension/lib/model.js';
 import { Store, MANUAL_QUEUE } from './store.js';
 
@@ -65,6 +65,8 @@ export const BROWSER_HEADERS = {
 const RUN_BUDGET_MS = 25000;
 const STALE_EVERY_MS = 10 * 60e3;
 export const SWEEP_LIMIT = 100; // публікацій за один прохід добору зняття
+/** Звірка позначок: переглядаємо до RECONCILE_SCAN × limit рядків за прохід (пропущені колонку виправляють і виходять). */
+export const RECONCILE_SCAN = 5;
 const clone = (o) => JSON.parse(JSON.stringify(o));
 
 // ---------- час за Києвом (Worker працює в UTC, Della — київські дати) ----------
@@ -121,6 +123,7 @@ export function maskSettings(s, session = NO_SESSION) {
 
 const SESSION_KEY = 'della.session'; // {cookie, updatedAt, id}
 const SESSION_META = 'dellaSession'; // meta: {id, state, checkedAt, customerSeen, phoneSeen, message}
+const CURSOR_META = 'blackMarksCursor'; // meta: {updatedAt, id} — звідки наступний прохід звірки позначок продовжує
 const NOBODY_META = 'blackMarksNobody'; // meta: скільки позначок «чорний список» без даних про замовника вже названо в журналі
 const CONTACTS_META = 'dellaContacts'; // meta: {id, refused?, ok?, at} — що Della відповіла на запит контактів цієї сесії
 export const CONTACTS_PER_POLL = 10;
@@ -1356,39 +1359,66 @@ export class Engine {
    * Звірка позначок (staleCheck): заявка позначена «чорний список», але вже не підпадає під жоден ключ чорного списку
    * в базі (позначку лишило недороблене зняття тощо) — повертаємо туди, де їй місце: у роботу (і в чергу, якщо
    * автопублікація), в Архів — якщо дата минула або Della її давно не показує. Це не зняття блокування: правда — з
-   * чорного списку в базі, не з позначки; заявку, що підпадає під будь-який чорний ключ (за колонкою чи за даними
-   * замовника), не чіпаємо. Не більше limit за прохід, кожна — раз. seenBefore — як у staleCheck (-1 — збору ще не було).
-   * Позначку без жодних даних про замовника не повертаємо (не знаємо, чия заявка) і місця в межі вона не займає;
+   * чорного списку в базі й з даних заявки, не з позначки; заявку, що підпадає під будь-який чорний ключ (за колонкою чи
+   * за даними замовника), не чіпаємо. Позначку без жодних даних про замовника не повертаємо (не знаємо, чия заявка);
    * вголос — рядок журналу, скільки їх, щойно це число змінилося (не щопроходу).
-   * → {ids — розглянуті, restored, archived, queued, nobody — позначених без даних про замовника}
+   * Кандидатів вибираємо за колонкою custKeys; якщо дані з нею не згодні (заявку лишаємо як є), виправляємо саму колонку
+   * (setCustKeys — дані, статус, seenAt, updatedAt не змінюються): така заявка виходить із кандидатів назавжди і не
+   * займає місця перед іншими. Прохід іде вперед курсором: до limit заявок повертаємо, до SCAN × limit переглядаємо;
+   * зупинився на межі — наступний прохід іде далі з того ж місця (meta), дійшов до кінця — наступний знову з початку.
+   * Тож рядок, який звірка відхилила, ніколи не стає перед рядками, яких вона ще не бачила.
+   * seenBefore — як у staleCheck (-1 — збору ще не було).
+   * → {ids — повернуті кандидати, restored, archived, queued, repaired — виправлено колонок, nobody — позначених без даних}
    */
   async reconcileBlackMarks(s, seenBefore, limit = SWEEP_LIMIT) {
-    const ids = await this.store.staleBlackMarks(limit);
-    const r = { ids, restored: 0, archived: 0, queued: 0, nobody: await this.store.blackMarksNobody() };
-    if (r.nobody !== (await this.store.getMeta(NOBODY_META, 0))) {
-      await this.store.setMeta(NOBODY_META, r.nobody);
-      if (r.nobody) {
-        await this.log('warn', `Чорний список: ${r.nobody} заявок позначено «чорний список», але даних про замовника в них немає — лишили як є: не знаємо, чиї вони, тож не повертаємо. Перевірте їх вручну (Архів, «чорний список»)`);
-      }
-    }
-    if (!ids.length) return r;
+    const r = { ids: [], restored: 0, archived: 0, queued: 0, repaired: 0, nobody: 0 };
     const today = kyivDay(this.now());
     const unseen = { before: seenBefore, reason: `не видно в Della понад ${s.staleHours} год` };
-    for (const id of ids) {
-      const cur = await this.store.getLoad(id);
-      // правда — з даних: без даних про замовника або під будь-яким чорним ключем — не чіпаємо
-      if (!cur || !customerKeys(cur).length || (await this.isBlackLoad(cur))) continue;
-      const kind = await this.restoreLoad(id, today, { unseen, reason: 'більше не підпадає під чорний список' });
-      if (kind === 'restored') {
-        r.restored++;
-        if (s.lardi.autoPublish && (await this.enqueue(id, false))?.status === 'queued') r.queued++;
-      } else if (kind === 'archived') r.archived++;
+    const cap = limit * RECONCILE_SCAN;
+    let after = (await this.store.getMeta(CURSOR_META, null)) || null;
+    let scanned = 0; let more = false;
+    walk: while (scanned < cap) {
+      const rows = await this.store.staleBlackMarks(Math.min(limit, cap - scanned), after);
+      if (!rows.length) break;
+      for (const row of rows) {
+        if (r.ids.length >= limit) { more = true; break walk; }
+        after = row; scanned++;
+        const cur = await this.store.getLoad(row.id);
+        if (!cur) continue;
+        // правда — з даних: без даних про замовника або під будь-яким чорним ключем — заявку не чіпаємо,
+        // а колонку, що з ними розійшлася, виправляємо — інакше вона вічно займала б перші місця
+        if (!customerKeys(cur).length || (await this.isBlackLoad(cur))) {
+          const col = custKeysColumn(cur);
+          if (col !== row.custKeys) { await this.store.setCustKeys(row.id, col); r.repaired++; }
+          continue;
+        }
+        r.ids.push(row.id);
+        const kind = await this.restoreLoad(row.id, today, { unseen, reason: 'більше не підпадає під чорний список' });
+        if (kind === 'restored') {
+          r.restored++;
+          if (s.lardi.autoPublish && (await this.enqueue(row.id, false))?.status === 'queued') r.queued++;
+        } else if (kind === 'archived') r.archived++;
+      }
+    }
+    if (scanned >= cap && !more) more = (await this.store.staleBlackMarks(1, after)).length > 0;
+    // зупинились на межі — наступний прохід продовжить звідси; дійшли до кінця — почне з початку
+    await this.store.setMeta(CURSOR_META, more && after ? { updatedAt: after.updatedAt, id: after.id } : null);
+    if (r.repaired) {
+      await this.log('info', `Чорний список: у ${r.repaired} заявок ключі замовника в базі розходилися з даними — виправлено; ці заявки лишаються як є (під чорним списком або без даних про замовника)`);
     }
     const n = r.restored + r.archived;
     if (n) {
       const parts = [`у роботі ${r.restored}${r.queued ? `, з них у черзі на Lardi ${r.queued}` : ''}`];
       if (r.archived) parts.push(`в Архіві ${r.archived} (дата минула або давно не видно в Della)`);
-      await this.log('info', `Чорний список: ${n} заявок більше не підпадають під чорний список — повернулися: ${parts.join('; ')}${ids.length >= limit ? ` (по ${limit} за прохід, решта — наступним)` : ''}`);
+      await this.log('info', `Чорний список: ${n} заявок більше не підпадають під чорний список — повернулися: ${parts.join('; ')}${more ? ` (по ${limit} за прохід, решта — наступним)` : ''}`);
+    }
+    // наприкінці: виправлені колонки вже серед «без даних»
+    r.nobody = await this.store.blackMarksNobody();
+    if (r.nobody !== (await this.store.getMeta(NOBODY_META, 0))) {
+      await this.store.setMeta(NOBODY_META, r.nobody);
+      if (r.nobody) {
+        await this.log('warn', `Чорний список: ${r.nobody} заявок позначено «чорний список», але даних про замовника в них немає — лишили як є: не знаємо, чиї вони, тож не повертаємо. Перевірте їх вручну (Архів, «чорний список»)`);
+      }
     }
     return r;
   }

@@ -171,3 +171,101 @@ test('позначки без даних не займають місця в м�
   assert.equal(marks(await loadsOf(st, betas.slice(3))), 0, 'усі з даними повернуто');
   assert.equal(marks(await loadsOf(st, anon)), 3, 'без даних — на місці');
 });
+
+// ---- голодування за пропущеними кандидатами (S5 / S6 тестувальника): колонка custKeys розійшлася з даними ----
+/** n давніх позначок «чорний список», колонка яких бреше: kind 'black' — дані під чорним ключем, колонка каже «ні»;
+ *  'nobody' — даних про замовника немає, колонка каже «є». Далі 5 справжніх позначок (дані є, під чорний не підпадають). */
+async function liars(kind, n = 150) {
+  const h = setup(); await live(h);
+  const e = h.engine(); await e.ready();
+  await h.call('customers.add', { list: 'black', text: '067 111 22 33' });
+  const st = e.store;
+  const day = new Date(h.clock.t + 2 * 864e5).toISOString().slice(0, 10);
+  const put = async (id, data, column, updatedAt) => {
+    await st.putStmt({ id, source: 'della', status: 'inactive', inactiveKind: 'blacklist', statusReason: 'чорний список', fromCity: 'Київ', toCity: 'Львів', dateFrom: day, price: 9000, currency: 'UAH', seenAt: h.clock.t, firstSeenAt: h.clock.t, updatedAt, lardi: [], ...data }).run();
+    if (column !== undefined) await st.db.prepare('UPDATE loads SET custKeys = ? WHERE id = ?').bind(column, id).run();
+  };
+  const bad = [];
+  for (let i = 0; i < n; i++) {
+    const id = `liar_${i}`;
+    await put(id, kind === 'black' ? { phone: '067 111 22 33' } : {}, `|tel:38050990${String(i).padStart(4, '0')}|`, h.clock.t - 10e6 + i);
+    bad.push(id);
+  }
+  const real = [];
+  for (let i = 0; i < 5; i++) { const id = `real_${i}`; await put(id, { phone: `050 200 00 0${i}` }, undefined, h.clock.t - 1000); real.push(id); }
+  const raw = async (ids) => Promise.all(ids.map((id) => st.db.prepare('SELECT status, seenAt, firstSeenAt, updatedAt, queuedAt, data, lardi FROM loads WHERE id = ?').bind(id).first()));
+  return { h, e, st, bad, real, raw };
+}
+
+for (const kind of ['black', 'nobody']) {
+  test(`голодування (${kind}): 150 давніх позначок, які звірка лишає як є, не займають місць — 5 справжніх повертаються в межах проходів; пропущені — байт у байт`, async () => {
+    const { h, e, st, bad, real, raw } = await liars(kind);
+    const before = await raw(bad);
+    const s = await e.getSettings();
+    let back = 0;
+    const seen = new Set();
+    for (let p = 0; p < 2; p++) {
+      const r = await e.reconcileBlackMarks(s, -1);
+      for (const id of r.ids) { assert.ok(!seen.has(id), `${id} двічі`); seen.add(id); assert.ok(real.includes(id), `${id} — не справжня позначка`); }
+      back += r.restored;
+    }
+    assert.equal(back, 5, `повернулося ${back} з 5`);
+    assert.ok((await Promise.all(real.map((id) => st.getLoad(id)))).every((x) => x.status === 'queued'));
+    // пропущені — ті самі статус, дані, seenAt, updatedAt, публікації (виправлено лише похідну колонку custKeys)
+    assert.deepEqual(await raw(bad), before, 'пропущені заявки — байт у байт');
+    for (const x of await Promise.all(bad.map((id) => st.getLoad(id)))) assert.equal(x.edited, undefined, 'не «редагувала клієнтка»');
+    // колонку виправлено за даними — з кандидатів вони вийшли назавжди
+    assert.deepEqual(await st.staleBlackMarks(1000), []);
+    if (kind === 'nobody') assert.equal(await st.blackMarksNobody(), 150, 'тепер — серед «без даних», про них каже журнал');
+    else assert.equal(await st.hiddenBlackCount(), 150, 'тепер чорний список бачить їх і за колонкою');
+    assert.ok((await h.call('log.list', {})).some((x) => /ключі замовника в базі розходилися з даними — виправлено/.test(x.msg)));
+  });
+}
+
+test('прохід іде вперед: навіть коли пропущених більше, ніж займає один запит, справжня позначка за ними повертається в ТОМУ Ж проході', async () => {
+  const { e, real } = await liars('black', 120);
+  const r = await e.reconcileBlackMarks(await e.getSettings(), -1);
+  assert.equal(r.restored, 5);
+  assert.equal(r.repaired, 120);
+  assert.deepEqual([...r.ids].sort(), [...real].sort());
+});
+
+test('курсор: рядок, який звірка відхилила, а виправити колонку нема чого, не стає перед ще не баченими — у тому ж проході ідемо далі', async () => {
+  // імітуємо розбіжність, якої колонка не пояснює: перевірка за даними каже «чорна» для 150 давніх, колонка з даними згодна
+  const { h, e, st, real } = await liars('black', 0);
+  const day = new Date(h.clock.t + 2 * 864e5).toISOString().slice(0, 10);
+  const sticky = [];
+  for (let i = 0; i < 150; i++) {
+    const id = `sticky_${String(i).padStart(3, '0')}`;
+    await st.putStmt({ id, status: 'inactive', inactiveKind: 'blacklist', statusReason: 'чорний список', dateFrom: day, phone: `063 000 ${String(i).padStart(4, '0')}`, seenAt: h.clock.t, firstSeenAt: h.clock.t, updatedAt: h.clock.t - 10e6 + i, lardi: [] }).run();
+    sticky.push(id);
+  }
+  const orig = e.isBlackLoad.bind(e);
+  e.isBlackLoad = async (l) => sticky.includes(l.id) || orig(l);
+  const r = await e.reconcileBlackMarks(await e.getSettings(), -1);
+  assert.equal(r.repaired, 0, 'колонки правильні — виправляти нічого');
+  assert.equal(r.restored, 5, 'справжні за відхиленими — повернулися в тому ж проході');
+  assert.ok((await Promise.all(sticky.map((id) => st.getLoad(id)))).every((x) => x.inactiveKind === 'blacklist'), 'відхилені — на місці');
+  assert.deepEqual([...r.ids].sort(), [...real].sort());
+});
+
+test('курсор між проходами: навіть 600 відхилених (більше, ніж прохід переглядає) не закривають справжніх — наступний прохід іде далі з місця, де зупинився попередній', async () => {
+  const { h, e, st, real } = await liars('black', 0);
+  const day = new Date(h.clock.t + 2 * 864e5).toISOString().slice(0, 10);
+  const sticky = new Set();
+  for (let i = 0; i < 600; i++) {
+    const id = `sticky_${String(i).padStart(3, '0')}`;
+    await st.putStmt({ id, status: 'inactive', inactiveKind: 'blacklist', statusReason: 'чорний список', dateFrom: day, phone: `063 000 ${String(i).padStart(4, '0')}`, seenAt: h.clock.t, firstSeenAt: h.clock.t, updatedAt: h.clock.t - 10e6 + i, lardi: [] }).run();
+    sticky.add(id);
+  }
+  const orig = e.isBlackLoad.bind(e);
+  e.isBlackLoad = async (l) => sticky.has(l.id) || orig(l);
+  const s = await e.getSettings();
+  const r1 = await e.reconcileBlackMarks(s, -1);
+  assert.equal(r1.restored, 0, 'перший прохід — 500 відхилених (межа перегляду)');
+  const r2 = await e.reconcileBlackMarks(s, -1);
+  assert.equal(r2.restored, 5, 'другий — далі з курсора: решта відхилених і 5 справжніх');
+  assert.deepEqual([...r2.ids].sort(), [...real].sort());
+  // дійшли до кінця — наступний прохід знову з початку, і справжніх більше немає
+  assert.equal((await e.reconcileBlackMarks(s, -1)).restored, 0);
+});

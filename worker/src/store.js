@@ -583,14 +583,24 @@ export class Store {
   /**
    * Позначки «чорний список» без жодного чорного ключа (за колонкою custKeys і customer_keys у базі): id, давніші
    * першими, не більше limit. Лише ті, де є дані про замовника — без них не знаємо, чия заявка (blackMarksNobody).
-   * Перевірку за даними замовника робить Engine.reconcileBlackMarks.
+   * after — курсор {updatedAt, id}: лише рядки після нього (прохід іде вперед, переглянуте не бере вдруге).
+   * Перевірку за даними замовника робить Engine.reconcileBlackMarks. → [{id, updatedAt, custKeys}]
    */
-  async staleBlackMarks(limit) {
+  async staleBlackMarks(limit, after = null) {
+    const cur = after ? ' AND (updatedAt > ? OR (updatedAt = ? AND id > ?))' : '';
     const { results } = await this.db.prepare(
-      `SELECT id FROM loads WHERE status = 'inactive' AND json_extract(data, '$.inactiveKind') = 'blacklist'
-       AND custKeys <> '' AND NOT ${IS_BLACK} ORDER BY updatedAt ASC, id ASC LIMIT ?`,
-    ).bind(limit).all();
-    return (results || []).map((r) => r.id);
+      `SELECT id, updatedAt, custKeys FROM loads WHERE status = 'inactive' AND json_extract(data, '$.inactiveKind') = 'blacklist'
+       AND custKeys <> '' AND NOT ${IS_BLACK}${cur} ORDER BY updatedAt ASC, id ASC LIMIT ?`,
+    ).bind(...(after ? [after.updatedAt, after.updatedAt, after.id] : []), limit).all();
+    return results || [];
+  }
+
+  /**
+   * Лише похідна колонка custKeys — з даних заявки (як її рахує кожен запис putLoad). Дані, статус, seenAt, updatedAt
+   * не змінюються: це виправлення індексу, не правка заявки.
+   */
+  async setCustKeys(id, column) {
+    await this.db.prepare('UPDATE loads SET custKeys = ? WHERE id = ?').bind(column, id).run();
   }
 
   /** Скільки заявок позначено «чорний список», але даних про замовника в них немає (custKeys порожній). */
