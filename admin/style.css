@@ -199,3 +199,22 @@ body.locked .side,body.locked .main{display:none}
 .acc-card.pending{border-style:dashed}
 details.arch summary{cursor:pointer;color:var(--mut);font-size:12.5px;margin-top:6px}
 @media (max-width:760px){.c-add{grid-template-columns:1fr}.acc-top,.log-head{flex-wrap:wrap}.ctbl td.c-ac .acts{flex-wrap:wrap}}
+/* вхід у Della: чесна строка на «Замовниках», підказки, блок сесії в налаштуваннях */
+.c-warn-line{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px}
+.c-warn-line span{flex:1 1 320px}
+.c-add-hint{padding:8px 12px;border-bottom:1px solid var(--line);font-size:12.5px;color:#7a3e00;background:var(--warn-b)}
+.c-hidden:not([hidden]){display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px}
+.c-hidden .btn{padding:6px 12px}
+.ib-w{display:inline-grid}.ib-w .ib:disabled{pointer-events:none}
+.ds-st{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;margin-bottom:10px;font-size:12.5px}
+.ds-st .chip{margin:0}
+.ds-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;gap:10px;align-items:center}
+.ds-row input{width:100%}
+.ds-res{margin-top:10px;font-size:13px;line-height:1.5}
+.ds-res:empty{display:none}
+.ds-res .smp{color:var(--tx);margin-top:2px}
+details.ds-how{margin-top:12px;font-size:13px}
+details.ds-how summary{cursor:pointer;color:var(--pri);font-weight:500}
+details.ds-how ol{margin:8px 0 6px;padding-left:22px;line-height:1.6}
+details.ds-how p{margin:4px 0 0;font-size:12.5px;color:var(--mut)}
+@media (max-width:760px){.ds-row{grid-template-columns:repeat(3,minmax(0,1fr))}.ds-row input{grid-column:1/-1}}

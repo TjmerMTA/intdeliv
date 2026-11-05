@@ -93,6 +93,7 @@
 </section>
 
 <section id="v-customers" class="view" hidden>
+<div id="c-warn" class="banner warn c-warn-line" role="status" hidden></div>
 <div class="log-head"><h2>Замовники</h2><span class="muted">обрані — завжди вгорі й публікуються першими; чорний список — не показуються й не публікуються</span></div>
 <div class="tabs" id="c-tabs" role="tablist"></div>
 <div class="tbl-wrap c-wrap">
@@ -101,6 +102,7 @@
 <input name="note" placeholder="Нотатка (необов'язково)">
 <button class="btn pri">Додати</button>
 </form>
+<div id="c-add-hint" class="c-add-hint" hidden></div>
 <div id="c-hidden" class="c-hidden muted" hidden></div>
 <table class="tbl ctbl"><thead><tr><th>Замовник</th><th>Ключі</th><th>Додано</th><th>Нотатка</th><th>Заявок у базі</th><th>На Lardi зараз</th><th></th></tr></thead><tbody id="c-rows"></tbody></table>
 <div id="c-empty" class="empty" hidden></div>
@@ -109,6 +111,7 @@
 
 <section id="v-settings" class="view" hidden>
 <form id="sf" class="sf" autocomplete="off"></form>
+<form id="ds-f" autocomplete="off" hidden></form>
 </section>
 
 <section id="v-log" class="view" hidden>
