@@ -70,6 +70,8 @@ export class Store {
     if (!(results || []).some((c) => c.name === 'custKeys')) {
       await this.db.prepare('ALTER TABLE loads ADD COLUMN custKeys TEXT').run();
     }
+    // лише заявки із замовником: охоплення в status.get і пошук чорних не перебирають усю базу
+    await this.db.prepare("CREATE INDEX IF NOT EXISTS loads_custKeys ON loads(custKeys) WHERE custKeys <> ''").run();
     let n = 0;
     for (;;) {
       const { results: rows } = await this.db.prepare('SELECT id, data FROM loads WHERE custKeys IS NULL LIMIT 500').all();
@@ -310,6 +312,30 @@ export class Store {
       out.push({ ...c, keys: await this.keysOf(c.id), loads: Number(row && row.n) || 0, live: Number(row && row.live) || 0 });
     }
     return out;
+  }
+
+  /** Охоплення замовником: {withCustomer, total} — у скількох заявок (з усіх у базі) є ключі замовника. Лише COUNT. */
+  async custCoverage() {
+    const r = await this.db.prepare(
+      "SELECT (SELECT COUNT(*) FROM loads) AS total, (SELECT COUNT(*) FROM loads WHERE custKeys <> '') AS withCustomer",
+    ).first();
+    return { withCustomer: Number(r && r.withCustomer) || 0, total: Number(r && r.total) || 0 };
+  }
+
+  /**
+   * Заявки замовників із чорного списку, до яких його ще не застосовано: не приховані чорним списком
+   * або (крім active) приховані, але з живими публікаціями на Lardi. active — лише робочі статуси.
+   * Живі публікації — першими. Легкі рядки {id, status, dateLast, lardi[]}.
+   */
+  async blackPending({ active = false, limit = 1e6 } = {}) {
+    const LIVE = `loads.lardi LIKE '%"status":"published"%'`;
+    const st = active
+      ? "status IN ('new', 'queued', 'published', 'needs_review', 'error')"
+      : `status <> 'deleted' AND (status <> 'inactive' OR COALESCE(json_extract(data, '$.inactiveKind'), '') <> 'blacklist' OR ${LIVE})`;
+    const { results } = await this.db.prepare(
+      `SELECT id, status, dateLast, lardi FROM loads WHERE ${IS_BLACK} AND ${st} ORDER BY (${LIVE}) DESC, seenAt DESC LIMIT ?`,
+    ).bind(limit).all();
+    return (results || []).map((r) => ({ ...r, lardi: parse(r.lardi, []) }));
   }
 
   /** Скільки заявок зараз приховано чорним списком. */

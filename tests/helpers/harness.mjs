@@ -30,17 +30,19 @@ export function withCompanies(html, pick) {
 /**
  * Токени Lardi: 'tok…' — дійсні, будь-які інші — 401. h.lardiDown = true — basket/throw відповідає 503;
  * h.lardiDownFor — множина токенів, для яких basket/throw відповідає 503 (збій одного акаунта).
+ * h.della(url, headers, init) → HTML | Response — фейкова Della, що відповідає залежно від куки й методу (інакше — h.html).
  */
 export function setup({ html = HTML, env: extraEnv = {} } = {}) {
   const clock = { t: T0 };
   const calls = { della: [], lardi: [] };
-  const h = { clock, calls, html, lardiDown: false, lardiDownFor: new Set() };
+  const h = { clock, calls, html, della: null, lardiDown: false, lardiDownFor: new Set() };
   let nextId = 1000;
   const fetch = async (url, init = {}) => {
     const u = new URL(url);
     if (u.hostname === 'della.com.ua') {
-      calls.della.push({ url, headers: init.headers });
-      return new Response(h.html, { status: 200, headers: { 'Content-Type': 'text/html' } });
+      calls.della.push({ url, headers: init.headers, method: init.method || 'GET', body: init.body });
+      const r = h.della ? await h.della(url, init.headers || {}, init) : h.html;
+      return r instanceof Response ? r : new Response(r, { status: 200, headers: { 'Content-Type': 'text/html' } });
     }
     if (u.hostname === 'api.lardi-trans.com') {
       const method = init.method || 'GET';
