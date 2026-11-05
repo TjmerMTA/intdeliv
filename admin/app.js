@@ -6,6 +6,10 @@ const esc = (v) => (v == null ? '' : String(v)).replace(/[&<>"']/g, (c) => ESC[c
 const nf = new Intl.NumberFormat('uk-UA');
 const fmtN = (n) => (n == null || n === '' || isNaN(n) ? '' : nf.format(n));
 const CUR = { UAH: '₴', USD: '$', EUR: '€' };
+// Українські форми після числа: 1 / 2–4 / 5+ (11–14 — як 5+): plural(3, 'заявка', 'заявки', 'заявок') → 'заявки'
+const plural = (n, one, few, many) => { const a = Math.abs(Number(n)) % 100, b = a % 10; return a > 10 && a < 15 ? many : b === 1 ? one : b >= 2 && b <= 4 ? few : many; };
+// «з N …» (родовий): 1, 21, 31… → однина («з 1 заявки»), решта — множина («з 2 заявок», «з 5 заявок»)
+const zOf = (n, one, many) => { const a = Math.abs(Number(n)) % 100; return a % 10 === 1 && a !== 11 ? one : many; };
 const PAGE = 300;
 
 // Сервер (GitHub Actions + тунель): POST {API}/api/rpc {method, params} → {ok, result|error}
@@ -82,7 +86,7 @@ const d = await r.json().catch(() => null); // таймаут t діє і на �
 const late = ac.signal.aborted; // відповідь почалась, але не встигла завантажитись за timeout
 clearTimeout(t);
 if (!d) { if (await again()) continue; throw netError(late ? 'Відповідь сервера не встигла завантажитись (' + method + ')' : 'Сервер перезапускається… (' + r.status + ')'); }
-if (!d.ok) throw new Error(d.error || 'Помилка сервера');
+if (!d.ok) throw Object.assign(new Error(d.error || 'Помилка сервера'), { code: d.code, data: d.data }); // code/data — напр. відмова fromBlack
 return d.result;
 }
 }
@@ -343,21 +347,35 @@ function fmtDay(t) { const d = new Date(t); return String(d.getDate()).padStart(
 function fmtDate(d) { const m = /^(\d{4})-(\d\d)-(\d\d)/.exec(d || ''); return m ? m[3] + '.' + m[2] : esc(d); }
 const hhmm = (ts) => new Date(ts).toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit' });
 
+// onClose — що зробити, коли вікно закрили будь-як (Esc, клік повз, кнопка): діалог-питання тоді відповідає «ні»
 const modal = {
-open(html, onMount) { $('#m-body').innerHTML = html; $('#modal').hidden = false; onMount && onMount($('#m-body')); },
-close() { $('#modal').hidden = true; $('#m-body').innerHTML = ''; },
+onClose: null,
+// без this: modal.close віддають як обробник (onclick = modal.close)
+open(html, onMount, onClose) { modal.dismiss(); $('#m-body').innerHTML = html; $('#modal').hidden = false; modal.onClose = onClose || null; onMount && onMount($('#m-body')); },
+close() { $('#modal').hidden = true; $('#m-body').innerHTML = ''; modal.dismiss(); },
+dismiss() { const f = modal.onClose; modal.onClose = null; f && f(); },
 };
 $('#modal').addEventListener('mousedown', (e) => { if (e.target.id === 'modal') modal.close(); });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('#modal').hidden) modal.close(); });
 
-function confirmBox(title, text, okLabel = 'Видалити', warn = '') {
+// Питання з кількома відповідями → ключ натиснутої кнопки або null (скасовано / закрито).
+// buttons: [[key, label, cls]]; focus — яка кнопка вибрана наперед (Enter). Для небезпечних дій — завжди «Скасувати».
+// Ключі кнопок — сталі для перевірок: '0' — Скасувати/Закрити, '1' — головна дія, 'show' — «Показати запис».
+function askBox({ title, text, warn = '', buttons, focus }) {
 return new Promise((resolve) => {
-modal.open(`<h3>${esc(title)}</h3><p>${esc(text)}</p>${warn ? `<div class="warnline">${esc(warn)}</div>` : ''}<div class="m-foot"><button class="btn" data-x="0">Скасувати</button><button class="btn dan" data-x="1">${esc(okLabel)}</button></div>`,
+let done = false;
+const answer = (v) => { if (!done) { done = true; resolve(v); } };
+modal.open(`<div class="ask"><h3>${esc(title)}</h3>${[].concat(text).filter(Boolean).map((t) => `<p>${esc(t)}</p>`).join('')}${warn ? `<div class="warnline">${esc(warn)}</div>` : ''}<div class="m-foot">${buttons.map(([k, label, cls]) => `<button type="button" class="btn${cls ? ' ' + cls : ''}" data-x="${esc(k)}">${esc(label)}</button>`).join('')}</div></div>`,
 (b) => {
-b.addEventListener('click', (e) => { const x = e.target.closest('[data-x]'); if (!x) return; modal.close(); resolve(x.dataset.x === '1'); });
-$('[data-x="1"]', b).focus();
+// слухач — на свіжому елементі цього вікна, а не на #m-body: інакше слухачі старих вікон накопичуються й закривають нове
+const box = $('.ask', b);
+box.addEventListener('click', (e) => { const x = e.target.closest('[data-x]'); if (!x) return; const v = x.dataset.x; answer(v === '0' ? null : v); modal.close(); });
+$(`[data-x="${focus}"]`, box)?.focus();
+}, () => answer(null));
 });
-});
+}
+async function confirmBox(title, text, okLabel = 'Видалити', warn = '', safe = false) {
+return (await askBox({ title, text, warn, buttons: [['0', 'Скасувати'], ['1', okLabel, 'dan']], focus: safe ? '0' : '1' })) === '1';
 }
 
 // Банери
@@ -513,7 +531,10 @@ const tel = (d.length === 12 && d.startsWith('380')) || (d.length === 10 && d.st
 return tel && !(d.length === 8 || (d.length === 10 && !d.startsWith('0')));
 }
 const telOnly = (x) => (x.keys || []).length > 0 && x.keys.every((k) => String(k).startsWith('tel:'));
-const PHONE_WARN = 'Це телефон. Della телефон не показує — краще додати назву компанії.';
+const loggedIn = () => custState().session === 'alive';
+const PHONE_WARN_TXT = 'Це телефон. Della телефон не показує — краще додати назву компанії.';
+const PHONE_WARN_NOLOGIN = 'Це телефон. Della телефон не показує — потрібні вхід у Della і назва компанії.';
+const phoneWarn = () => (loggedIn() ? PHONE_WARN_TXT : PHONE_WARN_NOLOGIN);
 const NAME_ONLY = 'Вхід у Della працює, але Della дає лише назву компанії: блокуйте за назвою, за телефоном не спрацює.';
 // Чому кнопка списку неактивна — одне коротке речення
 function noCustWhy() {
@@ -531,7 +552,7 @@ function custWarnText() {
 const c = custState();
 if (!c.broken) return nameOnly() ? { text: NAME_ONLY, button: false } : null;
 const head = c.cov && c.cov.w > 0
-? `Чорний список працює лише частково: замовника видно в ${fmtN(c.cov.w)} з ${fmtN(c.cov.t)} заявок.`
+? `Чорний список бачить замовника лише в старих заявках (${fmtN(c.cov.w)} з ${fmtN(c.cov.t)}): у нових його не буде.`
 : `Чорний список зараз не працює: сервер не бачить замовника заявок${c.cov ? ` (${fmtN(c.cov.w)} з ${fmtN(c.cov.t)})` : ''}.`;
 const why = {
 alive: nameOnly() ? NAME_ONLY : 'Вхід у Della є — замовник з\'явиться в нових заявках після наступного збору.',
@@ -544,7 +565,7 @@ return { text: head + ' ' + why, button: c.session !== 'alive' };
 // Попередження в підтвердженні «В чорний список», поки список не працює
 function blackWarn(pv) {
 // (що назва може збігтися з іншою фірмою — уже в самому тексті підтвердження, див. keyLead)
-const parts = [telOnly(pv || {}) && phoneNo() ? PHONE_WARN : ''];
+const parts = [telOnly(pv || {}) && phoneNo() ? phoneWarn() : ''];
 if (custState().none) parts.push('Зараз запис нічого не приховає: сервер не бачить замовника заявок. Він запрацює, щойно з\'явиться вхід у Della.');
 return parts.filter(Boolean).join(' ');
 }
@@ -837,6 +858,12 @@ if ('price' in patch || 'distanceKm' in patch) {
 const p = patch.price ?? l.price, d = patch.distanceKm ?? l.distanceKm;
 patch.pricePerKm = p && d ? Math.round((p / d) * 100) / 100 : null;
 }
+// заявку ховає чорний список, а нові телефон/назва/ЄДРПОУ під нього вже не підпадають — сказати до збереження
+if (e.target.dataset.releaseOk !== '1') {
+const rel = await releaseCheck(l, patch);
+if (rel) { showRelease(e.target, rel); return; }
+}
+delete e.target.dataset.releaseOk;
 const btn = $('.btn.pri', b); btn.disabled = true;
 try {
 const saved = await call('loads.update', { id: l.id, patch });
@@ -849,6 +876,37 @@ loadLoads(); loadStatus();
 catch (err) { toast(err.message, true); btn.disabled = false; }
 };
 });
+}
+
+// Правка замовника в заявці може вивести її з чорного списку (це законне виправлення — не забороняємо, але кажемо):
+// → {ex: запис, що зараз її ховає, what: «телефону» / «назви компанії» / …} або null
+const CUST_F = { phone: 'телефону', company: 'назви компанії', edrpou: 'ЄДРПОУ' };
+async function releaseCheck(l, patch) {
+const ch = Object.keys(CUST_F).filter((k) => k in patch);
+if (!ch.length) return null;
+let before;
+try { before = await call('customers.preview', { loadId: l.id }); } catch { return null; }
+if (before?.list !== 'black') return null;
+const next = { ...l, ...patch };
+let after = null; // без жодного ключа (усе стерто) — під список теж не підпадає
+try { after = await call('customers.preview', { phone: next.phone || '', name: next.company || '', edrpou: next.edrpou || '', dellaId: next.dellaCompanyId || '' }); } catch { after = null; }
+if (after?.list === 'black') return null;
+const what = ch.map((k) => CUST_F[k]);
+return { ex: await hitEntry(before), what: what.length > 1 ? what.slice(0, -1).join(', ') + ' й ' + what[what.length - 1] : what[0] };
+}
+// Попередження всередині «Редагувати» (не окремим вікном — інакше пропали б її правки); «Скасувати» — наперед
+function showRelease(form, rel) {
+$('.rel-warn', form)?.remove();
+const box = document.createElement('div');
+box.className = 'warnline rel-warn';
+box.innerHTML = `<p>${esc(`Ця заявка зараз прихована чорним списком (запис ${labelQ(rel.ex?.label)}). Після зміни ${rel.what} вона перестане підпадати під нього й може піти на Lardi.`)}</p><div class="m-foot"><button type="button" class="btn" data-x="0">Скасувати</button><button type="button" class="btn dan" data-x="1">Все одно зберегти</button></div>`;
+$('.m-foot', form).before(box);
+box.addEventListener('click', (ev) => {
+const x = ev.target.closest('[data-x]'); if (!x) return;
+box.remove();
+if (x.dataset.x === '1') { form.dataset.releaseOk = '1'; form.requestSubmit(); }
+});
+$('[data-x="0"]', box).focus();
 }
 
 // Обрані / чорний список
@@ -883,33 +941,119 @@ return `${keyLead(pv)} Приховаємо заявок у базі: ${pv.loads
 function blackDone(a) {
 return `У чорному списку. Приховано: ${a?.hidden ?? 0}, знято з Lardi: ${a?.removed ?? 0}${a?.failed ? ', не вдалося зняти: ' + a.failed + ' (див. Журнал)' : ''}${!a?.hidden && custState().none ? ' — сервер поки не бачить замовника заявок' : ''}`;
 }
+// ---- Зміна списку для наявного запису. Правило: вивести замовника з чорного списку можна лише після питання,
+// де наперед вибрано «Скасувати»; наявний запис ніколи не зливаємо й не переписуємо (лише customers.move — нотатка,
+// назва й ключі лишаються як є); якщо такий запис уже є в тому ж списку — кажемо це й пропонуємо його показати.
+const labelQ = (s) => { const t = String(s || '—').trim(); return /[«»]/.test(t) ? t : `«${t}»`; };
+const entryLine = (x) => `Запис: ${labelQ(x.label)}${x.note ? `, нотатка «${x.note}»` : ''}.`;
+const UNBLOCK = 'Цей замовник зараз у чорному списку. Перенести в «Обрані»? Його заявки знову підуть на Lardi.';
+const TO_BLACK = 'Цей замовник зараз в «Обраних». Перенести в чорний список?';
+// Наявний запис, якого стосується відповідь customers.preview (у чорному — першим), або null
+async function hitEntry(pv) {
+if (!pv?.list && !pv?.customerId) return null;
+const keys = pv.keys || [];
+const ownOf = () => (S.customers?.items || []).filter((x) => (x.keys || []).some((k) => keys.includes(k)));
+// немає списку або в ньому ще немає запису з того списку, що каже preview (додали деінде) — перечитуємо раз
+if (!S.customers || (pv.list && !ownOf().some((x) => x.list === pv.list))) {
+try { S.customers = await call('customers.list', {}); } catch { /* без списку — з того, що дав preview */ }
+}
+const items = S.customers?.items || [];
+const own = ownOf();
+const e = own.find((x) => x.list === pv.list) || items.find((x) => x.id === pv.customerId) || own[0];
+// список у панелі міг застаріти — правда про список у живої відповіді preview (чорний важливіший)
+return e ? { ...e, list: pv.list || e.list } : { id: pv.customerId, list: pv.list, label: pv.label, note: '' };
+}
+// Показати запис у «Замовниках»: потрібна вкладка списку, прокрутка до рядка, коротке підсвічування
+async function showEntry(x) {
+S.cList = x.list === 'black' ? 'black' : 'white';
+S.hl = { id: x.id, until: Date.now() + 3000 }; // у стані: список може перемалюватися одразу після — підсвічування лишиться
+if (S.view !== 'customers') go('customers'); else renderCustomers();
+await loadCustomers();
+$(`#c-rows tr[data-cid="${CSS.escape(String(x.id))}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+setTimeout(() => { if (S.hl?.id === x.id) { S.hl = null; $$('#c-rows tr.c-hl').forEach((tr) => tr.classList.remove('c-hl')); } }, 3000);
+}
+// fromBlack: true — лише після її «Перенести в «Обрані»» (askUnblock): рушій без нього з чорного списку не випускає
+async function moveEntry(x, list, { fromBlack = false } = {}) {
+const r = await call('customers.move', { id: x.id, list, ...(fromBlack ? { fromBlack: true } : {}) });
+toast(list === 'black' ? blackDone(r.affected) : `${labelQ(x.label)} — в «Обраних» ★${fromBlack ? unblockedTail(r.affected) : ''}`, !!r.affected?.failed);
+return r;
+}
+// Що рушій каже після навмисного переносу з чорного: скільки заявок знову видно і скільки пішло в чергу на Lardi
+function unblockedTail(a) {
+if (!a) return '';
+if (a.visible === undefined && a.queued === undefined) return a.restored ? `. Повернуто заявок: ${fmtN(a.restored)}` : ''; // старий рушій
+return `. Знову видно заявок: ${fmtN(a.visible ?? a.restored ?? 0)}, у черзі на Lardi: ${fmtN(a.queued ?? 0)}`;
+}
+// Вивести з чорного списку в «Обрані» — питання, «Скасувати» наперед; show — ще кнопка «Показати запис»;
+// loads — скільки заявок повернеться (зі списку, preview чи відмови рушія), якщо відомо
+async function askUnblock(x, show = false, loads = x.loads) {
+const a = await askBox({ title: 'Цей замовник у чорному списку', text: [UNBLOCK, entryLine(x), Number.isFinite(Number(loads)) && loads !== null && loads !== undefined ? `Повернеться заявок: ${fmtN(loads)}.` : ''],
+buttons: [['0', 'Скасувати'], ...(show ? [['show', 'Показати запис']] : []), ['1', 'Перенести в «Обрані»', 'dan']], focus: '0' });
+if (a === 'show') { showEntry(x); return false; }
+return a === '1';
+}
+// Рушій відмовив (code 'fromBlack'): ключ зараз у чорному списку, а панель цього не знала (список застарів) —
+// питаємо так само й переносимо лише після «так». → true, якщо це була така відмова (відповідь уже дано)
+async function unblockRefused(e) {
+if (e?.code !== 'fromBlack') return false;
+const ents = (e.data?.entries || []).filter((x) => x && x.id != null);
+if (!ents.length) { toast(e.message, true); return true; }
+const known = (S.customers?.items || []);
+const x = { ...ents[0], ...(known.find((c) => c.id === ents[0].id) || {}) };
+if (await askUnblock(x, false, e.data?.loads)) for (const en of ents) await moveEntry({ ...en, ...(known.find((c) => c.id === en.id) || {}) }, 'white', { fromBlack: true });
+return true;
+}
+// З «Обраних» у чорний список — що саме й за яким ключем, з цифрами; теж «Скасувати» наперед
+async function askToBlack(x, pv, show = false) {
+const a = await askBox({ title: 'Додати в чорний список?', text: [TO_BLACK, entryLine(x), blackText(pv)], warn: blackWarn(pv),
+buttons: [['0', 'Скасувати'], ...(show ? [['show', 'Показати запис']] : []), ['1', 'Перенести в чорний список', 'dan']], focus: '0' });
+if (a === 'show') { showEntry(x); return false; }
+return a === '1';
+}
+// Такий запис уже є в цьому ж списку — нічого не додаємо й не зливаємо
+async function tellExists(x) {
+const where = x.list === 'black' ? 'в чорному списку' : 'в «Обраних»';
+const a = await askBox({ title: 'Такий запис уже є', text: `${labelQ(x.label)} уже є ${where}${x.note ? `, нотатка «${x.note}»` : ''}. Новий запис не додаємо — наявний лишається як є.`,
+buttons: [['0', 'Закрити'], ['show', 'Показати запис', 'pri']], focus: '0' });
+if (a === 'show') showEntry(x);
+}
 async function toBlack(l, b) {
 let pv;
 try { pv = await call('customers.preview', { loadId: l.id }); } catch (e) { return toast(e.message, true); }
-if (!(await confirmBox('Додати в чорний список?', blackText(pv), 'В чорний список', blackWarn(pv)))) return;
 if (b) b.disabled = true;
-try { const r = await call('customers.add', { list: 'black', loadId: l.id }); toast(blackDone(r.affected), !!r.affected?.failed); }
-catch (e) { toast(e.message, true); }
+let changed = false; // скасувала — нічого не перечитуємо
+try {
+const ex = pv.list ? await hitEntry(pv) : null;
+if (ex && ex.list === 'black') await tellExists(ex);
+else if (ex && ex.list === 'white') { if (await askToBlack(ex, pv)) { changed = true; await moveEntry(ex, 'black'); } }
+else if (await confirmBox('Додати в чорний список?', blackText(pv), 'В чорний список', blackWarn(pv))) {
+changed = true;
+const r = await call('customers.add', { list: 'black', loadId: l.id }); toast(blackDone(r.affected), !!r.affected?.failed);
+}
+} catch (e) { toast(e.message, true); }
 if (b) b.disabled = false;
-loadLoads(); loadStatus(); if (S.customers) loadCustomers();
+if (changed) { loadLoads(); loadStatus(); if (S.customers) loadCustomers(); }
 }
 async function toggleFav(l, b) {
 if (b) b.disabled = true;
 try {
 const pv = await call('customers.preview', { loadId: l.id });
-if (pv.list === 'white') {
-await call('customers.remove', { id: pv.customerId });
+const ex = pv.list ? await hitEntry(pv) : null;
+if (ex && ex.list === 'black') {
+if (await askUnblock(ex, false, pv.loads)) await moveEntry(ex, 'white', { fromBlack: true });
+} else if (pv.list === 'white') {
+await call('customers.remove', { id: ex?.id ?? pv.customerId });
 toast('Прибрано з обраних');
 } else {
 const r = await call('customers.add', { list: 'white', loadId: l.id });
 const undo = async () => {
-try { await call(pv.list === 'black' ? 'customers.move' : 'customers.remove', { id: r.customer.id, list: 'black' }); toast('Скасовано'); }
+try { await call('customers.remove', { id: r.customer.id }); toast('Скасовано'); }
 catch (e) { toast(e.message, true); }
-loadLoads(); loadStatus();
+loadLoads(); loadStatus(); if (S.customers) loadCustomers();
 };
-toast(`«${r.customer.label || 'Замовник'}» — в обраних ★`, false, { label: 'Скасувати', run: undo });
+toast(`${labelQ(r.customer.label || 'Замовник')} — в «Обраних» ★`, false, { label: 'Скасувати', run: undo });
 }
-} catch (e) { toast(e.message, true); }
+} catch (e) { if (!(await unblockRefused(e))) toast(e.message, true); }
 if (b) b.disabled = false;
 loadLoads(); loadStatus(); if (S.customers) loadCustomers();
 }
@@ -937,7 +1081,8 @@ const lines = marked.filter(([, xs]) => xs.length).map(([mk, xs]) => mk.count(xs
 note.hidden = !lines.length;
 note.innerHTML = lines.map((t) => `<div>${esc(t)}</div>`).join('');
 const marksOf = (x) => marked.filter(([, xs]) => xs.includes(x)).map(([mk]) => mk);
-$('#c-rows').innerHTML = rows.map((x) => `<tr data-cid="${esc(x.id)}">
+const hl = S.hl && Date.now() < S.hl.until ? S.hl.id : null;
+$('#c-rows').innerHTML = rows.map((x) => `<tr data-cid="${esc(x.id)}"${x.id === hl ? ' class="c-hl"' : ''}>
 <td data-l="Замовник"><b>${esc(x.label || '—')}</b>${marksOf(x).map((mk) => `<span class="chip c-off c-mark ${mk.cls}">${esc(mk.chip)}</span>`).join('')}${marksOf(x).map((mk) => `<div class="c-tel">${esc(mk.hint(bl))}${mk.act ? ` · <button type="button" class="lnk" data-c="${mk.act[0]}">${esc(mk.act[1])}</button>` : ''}</div>`).join('')}${x.list === 'black' && x.live ?`<div class="c-sweep" title="Не вдалося зняти одразу (Lardi не відповідав) — рушій повторює кожні 10 хв">на Lardi ще ${esc(fmtN(x.live))} — знімаємо</div>` : ''}</td>
 <td data-l="Ключі">${(x.keys || []).map((k) => `<span class="key">${esc(keyLabel(k))}</span>`).join('')}</td>
 <td data-l="Додано" class="num">${esc(new Date(x.createdAt).toLocaleDateString('uk-UA'))}</td>
@@ -956,8 +1101,9 @@ em.textContent = S.cList === 'black'
 const CUST_MARKS = [
 { id: 'tel', cls: 'tel-only', chip: 'лише телефон', act: ['addname', 'Додати назву'],
 on: (x) => phoneNo() && telOnly(x),
-hint: (bl) => `За телефоном Della замовника не показує — додайте назву компанії, щоб ${bl ? 'блокування спрацювало' : 'це спрацювало'}`,
-count: (n, m, bl) => `Лише за телефоном: ${fmtN(n)} (усього записів: ${fmtN(m)}). Della телефон не показує, тож за такими записами ${bl ? 'блокування' : 'вибір в обрані'} не спрацює. Додайте назву компанії — ваші записи лишаються як є.` },
+// без живого входу не спрацює й назва — тоді радимо обидва кроки
+hint: (bl) => `За телефоном Della замовника не показує — ${loggedIn() ? 'додайте назву компанії' : 'потрібні вхід у Della і назва компанії'}, щоб ${bl ? 'блокування спрацювало' : 'це спрацювало'}`,
+count: (n, m, bl) => `Лише за телефоном: ${fmtN(n)} (усього записів: ${fmtN(m)}). Della телефон не показує, тож за такими записами ${bl ? 'блокування' : 'вибір в обрані'} не спрацює. ${loggedIn() ? 'Додайте назву компанії' : 'Потрібні вхід у Della і назва компанії'} — ваші записи лишаються як є.` },
 { id: 'nokey', cls: 'no-key', chip: 'без ключа', act: ['addname', 'Додати замовника'],
 on: (x) => Array.isArray(x.keys) && !x.keys.length,
 hint: () => 'У записі не лишилось ні телефону, ні назви — він ні з чим не порівнюється. Додайте замовника ще раз',
@@ -980,7 +1126,7 @@ const hint = ensureEl('c-add-hint', 'c-add-hint', (el) => $('#c-add').after(el))
 const c = custState();
 // вписаний телефон — сказати ще до збереження (зберегти можна: спрацює, якщо Della колись покаже телефон)
 const typedTel = isPhoneText($('#c-add [name="text"]')?.value) && phoneNo();
-const ht = typedTel ? PHONE_WARN : !c.broken || !c.cov ? '' : c.cov.w === 0
+const ht = typedTel ? phoneWarn() : !c.broken || !c.cov ? '' : c.cov.w === 0
 ? 'Запис збережеться, але спрацює лише тоді, коли сервер бачитиме замовника заявок — зараз не бачить у жодній.'
 : `Спрацює лише для заявок, де видно замовника: ${fmtN(c.cov.w)} з ${fmtN(c.cov.t)}.`;
 hint.hidden = !ht; hint.textContent = ht;
@@ -995,7 +1141,7 @@ try {
 const r = await call('customers.reapply', {}, { timeout: 120000, tries: 1 });
 const n = r?.hidden ?? 0, m = r?.removed ?? 0;
 toast(`Приховано ${fmtN(n)}, знято з Lardi ${fmtN(m)}${r?.failed ? ', не вдалося зняти: ' + fmtN(r.failed) + ' (див. Журнал)' : ''}${!n && custState().none ? ' — сервер поки не бачить замовника заявок' : ''}`, !!r?.failed);
-} catch (err) { toast(OLD_SERVER(err) ? 'Ця кнопка запрацює після оновлення сервера' : err.message, true); }
+} catch (err) { toast(OLD_SERVER(err) ? 'Ця кнопка запрацює після оновлення сервера' : err.net && /не відповідає/.test(err.message) ? 'Сервер ще працює — перевірте Журнал за хвилину' : err.message, true); }
 b.disabled = false; loadCustomers(); loadStatus(); loadLoads();
 });
 // «Налаштувати вхід у Della» — у налаштування, одразу до блока сесії з розгорнутою інструкцією
@@ -1010,16 +1156,21 @@ $('#c-add').addEventListener('submit', async (e) => {
 e.preventDefault();
 const fd = new FormData(e.target); const text = String(fd.get('text') || '').trim(); const note = String(fd.get('note') || '').trim();
 const list = S.cList; const btn = $('.btn', e.target);
-try {
-if (list === 'black') {
-const pv = await call('customers.preview', { text });
-if (!(await confirmBox('Додати в чорний список?', blackText(pv), 'В чорний список', blackWarn(pv)))) return;
-}
+const clear = () => { e.target.reset(); e.target.elements.text.placeholder = 'Телефон, ЄДРПОУ або назва компанії'; renderCustWarn(); };
 btn.disabled = true;
-const r = await call('customers.add', { list, text, note });
-e.target.reset(); e.target.elements.text.placeholder = 'Телефон, ЄДРПОУ або назва компанії';
-toast(list === 'black' ? blackDone(r.affected) : `«${r.customer.label}» — в обраних ★`, !!r.affected?.failed);
-} catch (err) { toast(err.message, true); }
+try {
+// спершу — чи є вже такий замовник: тоді не додаємо (сервер злив би записи й переписав нотатку), а питаємо
+const pv = await call('customers.preview', { text });
+const ex = pv.list ? await hitEntry(pv) : null;
+if (ex && ex.list === list) await tellExists(ex);
+else if (ex && ex.list === 'black') { if (await askUnblock(ex, true, pv.loads)) { await moveEntry(ex, 'white', { fromBlack: true }); clear(); } }
+else if (ex && ex.list === 'white') { if (await askToBlack(ex, pv, true)) { await moveEntry(ex, 'black'); clear(); } }
+else if (list === 'white' || await confirmBox('Додати в чорний список?', blackText(pv), 'В чорний список', blackWarn(pv))) {
+const r = await call('customers.add', { list, text, note }); // новий запис — нотатка (і «до …» з «Додати назву») лише його
+clear();
+toast(list === 'black' ? blackDone(r.affected) : `${labelQ(r.customer.label)} — в «Обраних» ★`, !!r.affected?.failed);
+}
+} catch (err) { if (!(await unblockRefused(err))) toast(err.message, true); }
 btn.disabled = false; loadCustomers(); loadStatus();
 });
 $('#c-rows').addEventListener('change', async (e) => {
@@ -1032,28 +1183,27 @@ const id = Number(b.closest('tr').dataset.cid);
 const x = (S.customers?.items || []).find((c) => c.id === id); if (!x) return;
 try {
 if (b.dataset.c === 'loads') return showCustomerLoads(x);
-if (b.dataset.c === 'addname') { // новий запис за назвою поруч зі старим — старий не змінюємо
+if (b.dataset.c === 'addname') { // новий запис за назвою поруч зі старим — старий не змінюємо; її власну нотатку не чіпаємо
 const f = $('#c-add');
-f.elements.note.value = `до ${x.label || 'запису'}`;
+if (!f.elements.note.value.trim()) f.elements.note.value = `до ${x.label || 'запису'}`;
 f.scrollIntoView({ block: 'center', behavior: 'smooth' });
 f.elements.text.value = ''; f.elements.text.placeholder = 'Назва компанії, як на Della'; f.elements.text.focus();
 renderCustWarn(); return;
 }
 if (b.dataset.c === 'remove') {
-const txt = x.list === 'black' ? `«${x.label}» прибрати з чорного списку? Актуальні заявки повернуться в роботу (і в чергу публікації), минулі лишаться в Архіві.` : `«${x.label}» прибрати з обраних?`;
-if (!(await confirmBox('Прибрати зі списку?', txt, 'Прибрати'))) return;
+const ok = x.list === 'black'
+? (await askBox({ title: 'Цей замовник у чорному списку', text: ['Цей замовник зараз у чорному списку. Прибрати його зі списку? Його заявки знову підуть на Lardi.', entryLine(x), 'Минулі заявки лишаться в Архіві.'],
+buttons: [['0', 'Скасувати'], ['1', 'Прибрати з чорного списку', 'dan']], focus: '0' })) === '1'
+: await confirmBox('Прибрати з «Обраних»?', `${labelQ(x.label)} прибрати з «Обраних»? Його заявки більше не будуть угорі списку.`, 'Прибрати', '', true);
+if (!ok) return;
 b.disabled = true;
 const r = await call('customers.remove', { id });
-toast(r?.restored ? `Прибрано, повернуто заявок: ${r.restored}` : 'Прибрано зі списку');
+toast(r?.restored ? `Прибрано, повернуто заявок: ${fmtN(r.restored)}` : 'Прибрано зі списку');
+} else if (x.list === 'black') { // «В обрані» — вивести з чорного списку: лише після питання
+if (await askUnblock(x)) { b.disabled = true; await moveEntry(x, 'white', { fromBlack: true }); }
 } else {
-const to = x.list === 'black' ? 'white' : 'black';
-if (to === 'black') {
 const pv = await call('customers.preview', { keys: x.keys, label: x.label });
-if (!(await confirmBox('Перенести в чорний список?', blackText(pv), 'В чорний список', blackWarn(pv)))) return;
-}
-b.disabled = true;
-const r = await call('customers.move', { id, list: to });
-toast(to === 'black' ? blackDone(r.affected) : `Перенесено в обрані${r.affected?.restored ? ', повернуто заявок: ' + r.affected.restored : ''}`, !!r.affected?.failed);
+if (await askToBlack(x, pv)) { b.disabled = true; await moveEntry(x, 'black'); }
 }
 } catch (err) { toast(err.message, true); }
 loadCustomers(); loadStatus();
@@ -1216,7 +1366,7 @@ const ss = S.settings?.della?.session; // новий сервер: {set, state, 
 const stored = typeof ss?.set === 'boolean' ? ss.set : c.session !== 'none';
 h += `<span class="chip ${stored ? 'c-info' : 'c-off'}">Сесія: ${stored ? 'встановлено' : 'немає'}</span><span class="chip ${cls}">${esc(label)}</span>`;
 if (c.checkedAt) h += `<span class="muted">перевірено ${esc(rel(c.checkedAt))}</span>`;
-if (c.cov) h += `<span class="muted">· замовника видно в ${esc(fmtN(c.cov.w))} з ${esc(fmtN(c.cov.t))} заявок</span>`;
+if (c.cov) h += `<span class="muted">· замовника видно в ${esc(fmtN(c.cov.w))} з ${esc(fmtN(c.cov.t))} ${zOf(c.cov.t, 'заявки', 'заявок')}</span>`;
 } else h += `<span class="muted">${old ? esc(DS_OLD) : 'Сесія: …'}</span>`;
 st.innerHTML = h;
 const ss = S.settings?.della?.session;
@@ -1369,7 +1519,7 @@ const i = Number(bf.dataset.backfill);
 try {
 const pv = await call('lardi.backfill', { accountIndex: i, dryRunOnly: true });
 if (!pv?.candidates) return toast('Немає актуальних заявок, яких бракує на цьому акаунті');
-if (!(await confirmBox('Опублікувати й на цей акаунт?', `У чергу стане ${pv.candidates} актуальних опублікованих заявок, яких на «${accName(i)}» ще немає (обрані — першими, у межах добового ліміту).`, 'Поставити в чергу'))) return;
+if (!(await confirmBox('Опублікувати й на цей акаунт?', `У чергу ${plural(pv.candidates, `стане ${fmtN(pv.candidates)} актуальна опублікована заявка, якої`, `стануть ${fmtN(pv.candidates)} актуальні опубліковані заявки, яких`, `стане ${fmtN(pv.candidates)} актуальних опублікованих заявок, яких`)} на «${accName(i)}» ще немає (обрані — першими, у межах добового ліміту).`, 'Поставити в чергу'))) return;
 const r = await call('lardi.backfill', { accountIndex: i });
 toast(`У черзі: ${r?.queued ?? 0}`); loadStatus();
 } catch (err) { toast(err.message, true); }
