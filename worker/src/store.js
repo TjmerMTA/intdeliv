@@ -548,6 +548,21 @@ export class Store {
     return (results || []).map((r) => ({ ...r, lardi: parse(r.lardi, []) }));
   }
 
+  /**
+   * Id заявок (не видалених) із будь-яким із ключів, які зараз ховає чорний список. except — id записів, яких
+   * не рахувати: «що лишилося б прихованим, якби цих записів у чорному списку не було».
+   */
+  async blackIdsByKeys(keys, except = []) {
+    if (!keys.length) return [];
+    const cond = keys.map(() => "instr(custKeys, '|' || ? || '|') > 0").join(' OR ');
+    const ex = except.length ? ` AND ck.customerId NOT IN (${except.map(() => '?').join(',')})` : '';
+    const { results } = await this.db.prepare(
+      `SELECT id FROM loads WHERE custKeys <> '' AND (${cond}) AND status <> 'deleted'
+       AND EXISTS (SELECT 1 FROM customer_keys ck WHERE ck.list = 'black'${ex} AND instr(loads.custKeys, '|' || ck.key || '|') > 0)`,
+    ).bind(...keys, ...except.map(Number)).all();
+    return (results || []).map((r) => r.id);
+  }
+
   /** Догін: актуальні опубліковані заявки без живого запису на акаунті account; обрані першими, чорні — ні. */
   async backfillCandidates(account, today) {
     const { results } = await this.db.prepare(
@@ -563,6 +578,37 @@ export class Store {
       `SELECT id FROM loads WHERE status = 'inactive' AND json_extract(data, '$.inactiveKind') = 'blacklist' AND NOT ${IS_BLACK}`,
     ).all();
     return (results || []).map((r) => r.id);
+  }
+
+  /**
+   * Позначки «чорний список» без жодного чорного ключа (за колонкою custKeys і customer_keys у базі): id, давніші
+   * першими, не більше limit. Лише ті, де є дані про замовника — без них не знаємо, чия заявка (blackMarksNobody).
+   * after — курсор {updatedAt, id}: лише рядки після нього (прохід іде вперед, переглянуте не бере вдруге).
+   * Перевірку за даними замовника робить Engine.reconcileBlackMarks. → [{id, updatedAt, custKeys}]
+   */
+  async staleBlackMarks(limit, after = null) {
+    const cur = after ? ' AND (updatedAt > ? OR (updatedAt = ? AND id > ?))' : '';
+    const { results } = await this.db.prepare(
+      `SELECT id, updatedAt, custKeys FROM loads WHERE status = 'inactive' AND json_extract(data, '$.inactiveKind') = 'blacklist'
+       AND custKeys <> '' AND NOT ${IS_BLACK}${cur} ORDER BY updatedAt ASC, id ASC LIMIT ?`,
+    ).bind(...(after ? [after.updatedAt, after.updatedAt, after.id] : []), limit).all();
+    return results || [];
+  }
+
+  /**
+   * Лише похідна колонка custKeys — з даних заявки (як її рахує кожен запис putLoad). Дані, статус, seenAt, updatedAt
+   * не змінюються: це виправлення індексу, не правка заявки.
+   */
+  async setCustKeys(id, column) {
+    await this.db.prepare('UPDATE loads SET custKeys = ? WHERE id = ?').bind(column, id).run();
+  }
+
+  /** Скільки заявок позначено «чорний список», але даних про замовника в них немає (custKeys порожній). */
+  async blackMarksNobody() {
+    const row = await this.db.prepare(
+      "SELECT COUNT(*) AS n FROM loads WHERE status = 'inactive' AND json_extract(data, '$.inactiveKind') = 'blacklist' AND custKeys = ''",
+    ).first();
+    return Number(row && row.n) || 0;
   }
 
   // ---------- settings / meta ----------

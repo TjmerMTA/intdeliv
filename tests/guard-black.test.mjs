@@ -92,7 +92,7 @@ test('навмисно (fromBlack: true): move і add переносять і к
   }
 });
 
-test('у чорний список — як і було, без прапорця; «Прибрати» чорного — навмисна дія, звітує ті самі лічильники', async () => {
+test('у чорний список — як і було, без прапорця; «Прибрати» чорного — лише з fromBlack: true, звітує ті самі лічильники', async () => {
   const h = setup({ html: AB });
   await live(h);
   await h.engine().runCycle();
@@ -100,7 +100,9 @@ test('у чорний список — як і було, без прапорця
   const mv = await h.call('customers.move', { id: w.id, list: 'black' });
   assert.equal(mv.customer.list, 'black');
   assert.equal(mv.affected.hidden, 10);
-  const rm = await h.call('customers.remove', { id: w.id });
+  const no = await h.rpc('customers.remove', { id: w.id });
+  assert.equal(no.code, 'fromBlack', 'без прапорця — відмова (remove-guard-ta-lichba)');
+  const rm = await h.call('customers.remove', { id: w.id, fromBlack: true });
   assert.equal(rm.visible, 10);
   assert.equal(rm.restored + rm.archived, 10);
   assert.equal(typeof rm.queued, 'number');

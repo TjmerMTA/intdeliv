@@ -155,6 +155,6 @@ test('спір зникає з nameKeyIssues, щойно клієнтка при
   ]);
   await e.migrateNameKeys();
   assert.equal((await h.call('customers.list', {})).nameKeyIssues.length, 1);
-  await h.call('customers.remove', { id: 1 });
+  await h.call('customers.remove', { id: 1, fromBlack: true }); // чорний — навмисно
   assert.deepEqual((await h.call('customers.list', {})).nameKeyIssues, []);
 });

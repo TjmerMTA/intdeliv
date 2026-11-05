@@ -153,7 +153,7 @@ test('зняття з чорного списку: актуальні — зно
   const own = (await h.list({ customer: customer.id, status: 'all' })).items;
   const past = own[0];
   await h.engine().store.updateLoad(past.id, (l) => ({ ...l, dateFrom: '2026-09-01', dateTo: undefined }));
-  const r = await h.call('customers.remove', { id: customer.id });
+  const r = await h.call('customers.remove', { id: customer.id, fromBlack: true });
   assert.equal(r.restored, 9);
   assert.equal(r.archived, 1);
   const all = (await h.list({ status: 'all' })).items;
@@ -257,7 +257,11 @@ test('ручна правка телефону/компанії: заявка п
   assert.ok(!(await h.list({ status: 'all' })).items.some((x) => x.id === l.id), 'підхопила чорний список');
   const got = await h.engine().store.getLoad(l.id);
   assert.equal(got.inactiveKind, 'blacklist');
-  await h.call('loads.update', { id: l.id, patch: { phone: '0670000000' } });
+  // вийти з чорного списку правкою — лише з підтвердженням (close-g8)
+  const no = await h.rpc('loads.update', { id: l.id, patch: { phone: '0670000000' } });
+  assert.equal(no.code, 'fromBlack');
+  assert.equal(no.data.action, 'edit');
+  await h.call('loads.update', { id: l.id, patch: { phone: '0670000000' }, fromBlack: true });
   const back = (await h.list({ status: 'all' })).items.find((x) => x.id === l.id);
   assert.ok(back, 'знову видно');
   assert.ok(['new', 'queued'].includes(back.status));
