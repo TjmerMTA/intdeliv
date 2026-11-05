@@ -1,5 +1,5 @@
 // IntDeliv — Cloudflare Worker: cron (збір/публікація) + RPC для адмінки.
-import { Engine, VERSION } from './engine.js';
+import { Engine, VERSION, RpcError } from './engine.js';
 
 const ALLOWED_ORIGINS = new Set(['https://intdeliv.siteboosty.com', 'https://tjmermta.github.io']);
 const LOCAL_ORIGIN = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
@@ -73,7 +73,9 @@ export default {
       const result = await makeEngine(env, ctx).rpc(method, params);
       return json(req, { ok: true, result });
     } catch (e) {
-      return json(req, { ok: false, error: (e && e.message) || String(e) });
+      // RpcError — ще й код і подробиці (напр. fromBlack: який запис, у якому списку, які ключі)
+      const extra = e instanceof RpcError ? { code: e.code, data: e.data } : {};
+      return json(req, { ok: false, error: (e && e.message) || String(e), ...extra });
     }
   },
 
