@@ -522,6 +522,9 @@ if (c.session === 'alive') return dellaHas()?.phone === false;
 return c.none;
 }
 const nameOnly = () => custState().session === 'alive' && dellaHas()?.phone === false;
+// Частка карток, де Della показала замовника (status.get.della.cards — з останньої перевірки чи збору, без запиту до Della)
+const dellaCards = () => { const c = S.status?.della?.cards; return c && Number.isFinite(Number(c.total)) && Number(c.total) > 0 ? { w: Number(c.withCustomer) || 0, t: Number(c.total) } : null; };
+const cardsLine = (cards) => { const c = cards && cards.t !== undefined ? cards : cards && { w: Number(cards.withCustomer) || 0, t: Number(cards.total) || 0 }; return c && c.t > 0 ? `Della показала замовника в ${fmtN(c.w)} з ${fmtN(c.t)} ${zOf(c.t, 'картки', 'карток')}` : ''; };
 // Як сервер розпізнає ручне введення (parseCustomerInput): лише цифри/пробіли/дужки/+/-, номер України, не ЄДРПОУ/ІПН
 function isPhoneText(t) {
 t = String(t || '').trim();
@@ -1122,6 +1125,12 @@ const box = ensureEl('c-warn', 'banner warn c-warn-line', (el) => $('#v-customer
 const w = custWarnText();
 box.hidden = !w;
 box.innerHTML = w ? `<span>${esc(w.text)}</span>${w.button ? '<button type="button" class="btn" data-go-sess>Налаштувати вхід у Della</button>' : ''}` : '';
+// Тихий рядок під заголовком, коли вхід живий: у скількох картках Della показала замовника — поруч із охопленням бази.
+// Не попередження: лише цифри, щоб вона судила сама.
+const cov = ensureEl('c-cov', 'c-cov muted', (el) => $('#v-customers .log-head').after(el));
+const cs = custState(), cl = cardsLine(dellaCards());
+const covTxt = cs.session !== 'alive' || (!cl && !cs.cov) ? '' : [cl, cs.cov ? `у базі замовник є в ${fmtN(cs.cov.w)} з ${fmtN(cs.cov.t)} ${zOf(cs.cov.t, 'заявки', 'заявок')}` : ''].filter(Boolean).join('; ') + '.';
+cov.hidden = !covTxt; cov.textContent = covTxt.charAt(0).toUpperCase() + covTxt.slice(1);
 const hint = ensureEl('c-add-hint', 'c-add-hint', (el) => $('#c-add').after(el));
 const c = custState();
 // вписаний телефон — сказати ще до збереження (зберегти можна: спрацює, якщо Della колись покаже телефон)
@@ -1337,16 +1346,22 @@ const has = v.state === 'alive' && v.sample?.has && typeof v.sample.has === 'obj
 const gives = has ? [['phone', 'телефон'], ['company', 'назву компанії'], ['dellaCompanyId', 'код компанії'], ['edrpou', 'ЄДРПОУ']].filter(([k]) => has[k]).map(([, t]) => t) : [];
 const givesTxt = !has ? '' : (gives.length ? 'Della показує: ' + (gives.length > 1 ? gives.slice(0, -1).join(', ') + ' і ' + gives[gives.length - 1] : gives[0]) : 'Della не показує жодних даних про замовника')
 + (has.phone ? '.' : ' — телефону немає, тож блокуйте за назвою компанії.');
-const extra = serverExtra(v.state, v.message, !!has);
-return `<div class="${cls === 'c-ok' || cls === 'c-err' ? cls : ''}"><b>${esc(icon + text)}</b></div>${sm ? `<div class="smp">Зараз сервер бачить про замовника: ${esc(sm)}</div>` : ''}${givesTxt ? `<div class="smp">${esc(givesTxt)}</div>` : ''}${extra ? `<div class="smp muted ds-msg">${esc(extra)}</div>` : ''}`;
+const cardsTxt = v.state === 'alive' ? cardsLine(v.cards) : '';
+const extra = serverExtra(v.state, v.message, !!has, !!cardsTxt);
+return `<div class="${cls === 'c-ok' || cls === 'c-err' ? cls : ''}"><b>${esc(icon + text)}</b></div>${sm ? `<div class="smp">Зараз сервер бачить про замовника: ${esc(sm)}</div>` : ''}${givesTxt ? `<div class="smp">${esc(givesTxt)}</div>` : ''}${cardsTxt ? `<div class="smp">${esc(cardsTxt)}.</div>` : ''}${extra ? `<div class="smp muted ds-msg">${esc(extra)}</div>` : ''}`;
 }
 // Власне речення сервера (message з della.session.check) — під нашим вердиктом, лише коли воно додає те, чого ми
 // самі не виводимо: частку карток із замовником («видно в 1 з 25 карток»), скільки карток переглянуто, причину збою,
 // відмову Della за «Докладніше». Повтор нашого ж («вставте нову», «блокуйте за назвою», приклад) — не показуємо.
-function serverExtra(state, msg, hasDerived) {
+function serverExtra(state, msg, hasDerived, cardsShown = false) {
 let m = String(msg || '').replace(/\s+/g, ' ').trim();
 if (!m) return '';
-m = m.replace(/\s*\(приклад:[^)]*\)/g, '')            // приклад уже в «Зараз сервер бачить…»
+// дужки рушія: «(замовника видно в 13 з 16 карток; приклад: …)» — приклад уже в «Зараз сервер бачить…»,
+// а частку карток, коли ми її показуємо самі (cardsShown), теж не повторюємо
+m = m.replace(/\s*\(([^()]*)\)/g, (all, inner) => {
+const parts = inner.split(/;\s*/).map((t) => t.trim()).filter((t) => t && !/^приклад:/.test(t) && !(cardsShown && /^замовника видно в \d+ з \d+ карт/.test(t)));
+return parts.length ? ` (${parts.join('; ')})` : '';
+})
 .replace(/\s+для\s+https?:\/\/\S+/gi, '').replace(/https?:\/\/\S+/gi, '') // адреси — не для неї
 .replace(/\s+([.,;:])/g, '$1').trim();
 if (!/[.!?…]$/.test(m)) m += '.';
@@ -1367,6 +1382,7 @@ const stored = typeof ss?.set === 'boolean' ? ss.set : c.session !== 'none';
 h += `<span class="chip ${stored ? 'c-info' : 'c-off'}">Сесія: ${stored ? 'встановлено' : 'немає'}</span><span class="chip ${cls}">${esc(label)}</span>`;
 if (c.checkedAt) h += `<span class="muted">перевірено ${esc(rel(c.checkedAt))}</span>`;
 if (c.cov) h += `<span class="muted">· замовника видно в ${esc(fmtN(c.cov.w))} з ${esc(fmtN(c.cov.t))} ${zOf(c.cov.t, 'заявки', 'заявок')}</span>`;
+if (c.session === 'alive' && cardsLine(dellaCards())) h += `<span class="muted">· ${esc(cardsLine(dellaCards()))}</span>`;
 } else h += `<span class="muted">${old ? esc(DS_OLD) : 'Сесія: …'}</span>`;
 st.innerHTML = h;
 const ss = S.settings?.della?.session;
@@ -1394,7 +1410,7 @@ try {
 if (kind === 'check') {
 const r = await check();
 noteHas(r?.sample);
-S.dsVerdict = { state: dsState(r, 'error'), sample: r?.sample || null, message: r?.message || '' };
+S.dsVerdict = { state: dsState(r, 'error'), sample: r?.sample || null, message: r?.message || '', cards: r?.cards || null };
 } else {
 const r = await call('della.session.set', { cookie }, { timeout: 60000, tries: 1 });
 if ($('#ds-cookie')) $('#ds-cookie').value = ''; // значення більше ніде не тримаємо
@@ -1405,7 +1421,7 @@ if (kind === 'save' && S.dsVerdict.state !== 'none') { // одразу пока�
 await loadSettings(); // нова сесія — нова позначка updatedAt, до неї й прив'язуємо, що дає Della
 const ck = await check().catch(() => null);
 noteHas(ck?.sample);
-if (ck && DS_STATES.includes(ck.state)) S.dsVerdict = { state: ck.state, sample: ck.sample || null, message: ck.message || '' };
+if (ck && DS_STATES.includes(ck.state)) S.dsVerdict = { state: ck.state, sample: ck.sample || null, message: ck.message || '', cards: ck.cards || null };
 }
 }
 } catch (err) {
@@ -1725,6 +1741,8 @@ const counts = () => items.reduce((c, l) => ((c[l.status] = (c[l.status] || 0) +
 const logs = [['info', 'Зібрано 25 заявок зі сторінки 1, нових: 3'], ['info', 'Опубліковано на Lardi (Софія): Полтава → Харків'], ['warn', 'needs_review: не знайдено кузов «цільномет» на Lardi'], ['error', 'Lardi 429 — повтор через 30 с']]
 .map(([level, msg], i) => ({ t: now - i * 4 * 60e3, level, msg }));
 const clone = (x) => JSON.parse(JSON.stringify(x));
+// частка карток останньої перевірки — як у рушія (з входом Della показує замовника не в кожній картці)
+const demoCards = () => ({ withCustomer: sess.nameOnly ? 21 : 23, total: 25 });
 // як новий сервер: settings.della.session — лише ознаки, без значення
 const withSess = (s) => { s.della.session = { set: sess.state !== 'none', state: sess.state, checkedAt: sess.checkedAt, updatedAt: sess.updatedAt }; return s; };
 const upd = (id, fn) => { const l = items.find((x) => x.id === id); if (!l) throw new Error('Заявку не знайдено'); fn(l); l.updatedAt = Date.now(); return clone(l); };
@@ -1780,12 +1798,12 @@ const has = { phone: !sess.nameOnly, company: true, dellaCompanyId: sess.nameOnl
 // речення сервера — як у справжнього рушія (панель показує його лише тоді, коли воно щось додає)
 const message = {
 none: 'Сесію Della не задано — збір іде без входу, замовника в заявках не видно.',
-alive: sess.nameOnly ? `Вхід працює, але Della дає лише назву компанії і код компанії Della — блокуйте за назвою, телефон у картці не видно (приклад: ${l?.company}).` : `Вхід працює: Della дає телефон і назву компанії — чорний список спрацює і за телефоном, і за назвою (приклад: ${l?.company}).`,
+alive: sess.nameOnly ? `Вхід працює, але Della дає лише назву компанії і код компанії Della — блокуйте за назвою, телефон у картці не видно (замовника видно в 21 з 25 карток; приклад: ${l?.company}).` : `Вхід працює: Della дає телефон і назву компанії — чорний список спрацює і за телефоном, і за назвою (замовника видно в 23 з 25 карток; приклад: ${l?.company}).`,
 blind: 'Вхід є, але замовника в картці не видно: у 25 картках немає ні коду чи назви компанії, ні телефону, ні ЄДРПОУ — можливо, акаунт Della не верифікований.',
 expired: 'Della відповіла як без входу — сесію не прийнято або вона закінчилась. Вставте нову.',
 error: 'Не вдалося перевірити сесію: Della 502 для https://della.com.ua/search/demo.html.',
 }[sess.state];
-return { state: sess.state, customerSeen: custSeen(), sample: custSeen() && l ? { company: l.company, phone: l.phone || null, edrpou: null, dellaCompanyId: sess.nameOnly ? '4417' : null, has } : null, message };
+return { state: sess.state, cards: custSeen() ? demoCards() : sess.state === 'blind' ? { withCustomer: 0, total: 25 } : null, customerSeen: custSeen(), sample: custSeen() && l ? { company: l.company, phone: l.phone || null, edrpou: null, dellaCompanyId: sess.nameOnly ? '4417' : null, has } : null, message };
 },
 'lardi.accounts': () => api['status.get']().accounts,
 'lardi.backfill': ({ dryRunOnly }) => (dryRunOnly ? { candidates: 3 } : { queued: 3 }),
@@ -1802,7 +1820,7 @@ return { ...a, token: t, state: a.archived || !a.enabled ? 'disabled' : t ? 'ok'
 });
 return withSess(clone(settings));
 },
-'status.get': () => ({ della: { session: sess.state, checkedAt: sess.checkedAt, customerSeen: custSeen(), ...(custSeen() ? { has: { phone: !sess.nameOnly, company: true, dellaCompanyId: sess.nameOnly, edrpou: false }, phoneSeen: !sess.nameOnly } : {}) },
+'status.get': () => ({ della: { session: sess.state, checkedAt: sess.checkedAt, customerSeen: custSeen(), ...(custSeen() ? { has: { phone: !sess.nameOnly, company: true, dellaCompanyId: sess.nameOnly, edrpou: false }, phoneSeen: !sess.nameOnly, cards: demoCards() } : sess.state === 'blind' ? { cards: { withCustomer: 0, total: 25 } } : {}) },
 custCoverage: { withCustomer: items.filter((l) => l.status !== 'deleted' && dKey(l)).length, total: items.filter((l) => l.status !== 'deleted').length },
 running: true, autoPublish: settings.lardi.autoPublish, lastPollAt: now - 70e3, counts: counts(), today: { collected: 187, published: settings.lardi.accounts.map((a, i) => (i ? 0 : 142)), dry: settings.lardi.accounts.map(() => 0) }, queue: items.filter((l) => l.status === 'queued').length,
 accounts: settings.lardi.accounts.map((a, i) => ({ index: i, name: a.name, enabled: a.enabled, archived: !!a.archived, state: a.archived || !a.enabled ? 'disabled' : a.token ? 'ok' : 'pending', hasToken: !!a.token, today: { published: i ? 0 : 142, dry: 0, limit: settings.lardi.dailyLimit }, live: i ? 0 : 118, errors: i ? 0 : 2, lastPublishAt: i ? undefined : now - 95e3 })) }),
