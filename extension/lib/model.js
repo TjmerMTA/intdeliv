@@ -30,6 +30,9 @@ export function newLoad(parsed, now = Date.now()) {
   };
 }
 
+/** Поля замовника з Della — ключі чорного/білого списку. */
+const CUSTOMER_FIELDS = ['phone', 'company', 'edrpou', 'dellaCompanyId'];
+
 /**
  * Повторно увидели заявку в выдаче Della: обновляем только seenAt (и признак удаления на Della).
  * Поля не перезатираем никогда — ни при edited, ни без него (отпечаток и так совпадает).
@@ -37,9 +40,12 @@ export function newLoad(parsed, now = Date.now()) {
  */
 export function mergeSeen(existing, parsed, now = Date.now()) {
   const next = { ...existing, seenAt: now };
+  // замовник — завжди, навіть у відредагованої заявки (інакше чорний список її не впізнає): дописуємо лише те,
+  // чого немає; вписане клієнткою (і стерте нею — '' / null) не чіпаємо
+  for (const k of CUSTOMER_FIELDS) if (parsed && next[k] === undefined && parsed[k] !== undefined) next[k] = parsed[k];
   if (!existing.edited && parsed) {
-    // заполняем то, чего раньше не было (например, телефон у залогиненной сессии)
-    for (const k of ['phone', 'company', 'edrpou', 'dellaCompanyId', 'postedAt', 'volume', 'distanceKm', 'pricePerKm']) {
+    // заполняем то, чего раньше не было
+    for (const k of ['postedAt', 'volume', 'distanceKm', 'pricePerKm']) {
       if (next[k] === undefined && parsed[k] !== undefined) next[k] = parsed[k];
     }
   }
@@ -153,11 +159,29 @@ const LEGAL_FORMS = new Set(['тов', 'тзов', 'пп', 'фоп', 'флп', '
 const NAME_STOP = new Set(['фоп', 'приватна особа', 'частное лицо', 'фізична особа', 'физическое лицо', 'транспортна компанія',
   'транспортная компания', 'логістика', 'логистика', 'замовник', 'заказчик', 'компанія', 'компания']);
 
-/** «ТОВ «Логістик-Плюс»» і «логістик-плюс, тов» → «логістик-плюс». */
+/** Повні назви форм власності — прибираються цілком (після заміни дефісів на пробіли). */
+const LONG_FORMS = ['товариство з обмеженою відповідальністю', 'товариство з додатковою відповідальністю',
+  'фізична особа підприємець', 'приватне акціонерне товариство', 'публічне акціонерне товариство', 'акціонерне товариство',
+  'приватне підприємство', 'дочірнє підприємство', 'комунальне підприємство', 'державне підприємство',
+  'общество с ограниченной ответственностью', 'частное предприятие', 'физическое лицо предприниматель'];
+/**
+ * Латинські літери, схожі на кирилицю: «TOB Альфа» (TOB латиницею) — це «ТОВ». Лише в назві, де є кирилиця
+ * (англійська «AT Trans» лишається як є); саму назву двійники не змінюють.
+ */
+const LOOKALIKE = { a: 'а', b: 'в', c: 'с', e: 'е', h: 'н', i: 'і', k: 'к', m: 'м', o: 'о', p: 'р', t: 'т', x: 'х', y: 'у' };
+const isLegalForm = (t, cyr) => LEGAL_FORMS.has(t) || (cyr && LEGAL_FORMS.has(t.replace(/[a-z]/g, (ch) => LOOKALIKE[ch] || ch)));
+
+/**
+ * «ТОВ «Логістик-Плюс»», «логістик плюс, тов» і «Товариство з обмеженою відповідальністю „Логістик – Плюс“» → «логістик плюс».
+ * Будь-який апостроф → ', дефіс і тире = пробіл, форма власності (скорочена, повна, латиницею-двійником) прибирається.
+ */
 export function normCompany(s) {
-  return String(s || '').toLowerCase().replace(/ё/g, 'е').replace(/[’ʼ`]/g, "'").replace(/["«»„“”]/g, ' ')
-    .split(/[^\p{L}\p{N}'-]+/u).map((t) => t.replace(/^['-]+|['-]+$/g, ''))
-    .filter((t) => t && !LEGAL_FORMS.has(t)).join(' ');
+  const words = String(s || '').toLowerCase().replace(/ё/g, 'е').replace(/[’ʼ`‘ʹ′´]/g, "'")
+    .split(/[^\p{L}\p{N}']+/u).map((t) => t.replace(/^'+|'+$/g, '')).filter(Boolean).join(' ');
+  let t = ` ${words} `;
+  for (const f of LONG_FORMS) t = t.split(` ${f} `).join(' ');
+  const cyr = /\p{Script=Cyrillic}/u.test(words);
+  return t.trim().split(' ').filter((w) => w && !isLegalForm(w, cyr)).join(' ');
 }
 
 /** Телефон України → 380XXXXXXXXX (12 цифр): +38 (050) 123-45-67, 0501234567, 380501234567, 501234567. */

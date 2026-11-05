@@ -168,44 +168,55 @@ const SESSION_LOG = {
  * Доведено лише ознаки «без входу» (dellaLoginState); «вхід є» = цих ознак немає.
  */
 export function judgeDellaPage(html, opts = {}) {
-  const none = { customerSeen: false, sample: null };
+  const none = { customerSeen: false, sample: null, has: null, phoneSeen: null, cards: null };
   const login = dellaLoginState(html);
   if (login === 'out') {
     return { ...none, state: 'expired', message: 'Della відповіла як без входу — сесію не прийнято або вона закінчилась. Вставте нову.' };
   }
-  const cards = parseDellaSearch(html, opts);
-  if (!cards.length) {
+  const list = parseDellaSearch(html, opts);
+  if (!list.length) {
     const reason = 'карток на сторінці немає — можливо, капча або змінилась верстка';
     return { ...none, state: 'error', reason, message: `Della відповіла, але ${reason}.` };
   }
-  const keyed = cards.filter((c) => customerKeys(c).length);
-  if (!keyed.length) {
-    const what = `у ${cards.length} картках немає ні коду чи назви компанії, ні телефону, ні ЄДРПОУ`;
-    return {
-      ...none,
-      state: 'blind',
-      message: login === 'in'
-        ? `Вхід є, але замовника в картці не видно: ${what} — можливо, акаунт Della не верифікований.`
-        : `Ознак виходу немає, але замовника в картці не видно: ${what} — можливо, акаунт не верифікований або змінилась верстка.`,
-    };
+  const keyed = list.filter((c) => customerKeys(c).length);
+  // що саме дає Della — хоч в одній картці сторінки; cards — у скількох картках замовник є взагалі
+  const has = hasOf(list);
+  const cards = { withCustomer: keyed.length, total: list.length };
+  const seen = { has, phoneSeen: has.phone, cards, sample: null };
+  if (sessionVerdict(cards) === 'blind') {
+    const where = login === 'in' ? 'Вхід є' : 'Ознак виходу немає';
+    const tail = login === 'in' ? 'можливо, акаунт Della не верифікований' : 'можливо, акаунт не верифікований або змінилась верстка';
+    const message = keyed.length
+      ? `${where}, але замовника видно лише в ${keyed.length} з ${list.length} карток — схоже, це дані з тексту заявки, а не від Della; ${tail}.`
+      : `${where}, але замовника в картці не видно: у ${list.length} картках немає ні коду чи назви компанії, ні телефону, ні ЄДРПОУ — ${tail}.`;
+    return { ...seen, state: 'blind', customerSeen: false, message };
   }
-  // що саме дає Della з входом — хоч в одній картці сторінки
-  const has = Object.fromEntries(IDS.map(([k]) => [k, cards.some((x) => !!x[k])]));
   const c = keyed.find((x) => x.phone) || keyed[0];
   const sample = {
     company: c.company ?? null, phone: c.phone ?? null, edrpou: c.edrpou ?? null, dellaCompanyId: c.dellaCompanyId ?? null, has,
   };
   const who = [c.company, c.phone].filter(Boolean).join(', ') || (c.edrpou && `ЄДРПОУ ${c.edrpou}`) || `код Della ${c.dellaCompanyId}`;
-  return { state: 'alive', customerSeen: true, phoneSeen: has.phone, sample, message: yieldsMessage(has, who, opts.contactsRefused) };
+  return { ...seen, state: 'alive', customerSeen: true, sample, message: yieldsMessage(has, who, opts.contactsRefused, cards) };
+}
+
+/** Які ідентифікатори є хоч в одній картці: {phone, company, dellaCompanyId, edrpou}. */
+const hasOf = (list) => Object.fromEntries(IDS.map(([k]) => [k, list.some((x) => !!x[k])]));
+
+/**
+ * «Вхід працює» — лише коли замовника видно щонайменше в третині карток. Справжні дані Della стоять у розмітці
+ * кожної картки, а телефон, вписаний у текст заявки, — у поодиноких (H1: 1 з 25 — це не вхід).
+ */
+export function sessionVerdict({ withCustomer, total }) {
+  return withCustomer > 0 && withCustomer * 3 >= total ? 'alive' : 'blind';
 }
 
 const IDS = [['phone', 'телефон'], ['company', 'назву компанії'], ['dellaCompanyId', 'код компанії Della'], ['edrpou', 'ЄДРПОУ']];
 const listUk = (xs) => (xs.length > 1 ? `${xs.slice(0, -1).join(', ')} і ${xs[xs.length - 1]}` : xs[0] || '');
 
 /** Одне речення для клієнтки: що дає Della і як тоді блокувати (у живому чорному списку — самі телефони). */
-function yieldsMessage(has, who, contactsRefused) {
+function yieldsMessage(has, who, contactsRefused, cards) {
   const yes = IDS.filter(([k]) => has[k]).map(([, t]) => t);
-  const eg = who ? ` (приклад: ${who})` : '';
+  const eg = ` (замовника видно в ${cards.withCustomer} з ${cards.total} карток${who ? `; приклад: ${who}` : ''})`;
   if (has.phone && has.company) return `Вхід працює: Della дає ${listUk(yes)} — чорний список спрацює і за телефоном, і за назвою${eg}.`;
   if (has.phone) return `Вхід працює: Della дає ${listUk(yes)}, але не назву компанії — блокуйте за телефоном${eg}.`;
   const how = has.company ? 'за назвою' : has.edrpou ? 'за ЄДРПОУ' : 'кнопкою з картки заявки';
@@ -388,12 +399,17 @@ export class Engine {
     return sess;
   }
 
-  /** Збережений стан сесії без запиту до Della: {state, checkedAt, customerSeen}. */
+  /** Збережений стан сесії без запиту до Della: {state, checkedAt, customerSeen, has, phoneSeen, cards}. */
   async dellaSessionState(sessIn) {
     const sess = sessIn === undefined ? await this.dellaSession() : sessIn;
     const m = sess ? await this.store.getMeta(SESSION_META, null) : null;
-    if (!m || m.id !== sess.id || !SESSION_STATES.includes(m.state)) return { state: 'none', checkedAt: null, customerSeen: false };
-    return { state: m.state, checkedAt: m.checkedAt ?? null, customerSeen: !!m.customerSeen };
+    if (!m || m.id !== sess.id || !SESSION_STATES.includes(m.state)) {
+      return { state: 'none', checkedAt: null, customerSeen: false, has: null, phoneSeen: null, cards: null };
+    }
+    return {
+      state: m.state, checkedAt: m.checkedAt ?? null, customerSeen: !!m.customerSeen,
+      has: m.has || null, phoneSeen: typeof m.phoneSeen === 'boolean' ? m.phoneSeen : null, cards: m.cards || null,
+    };
   }
 
   /**
@@ -407,7 +423,9 @@ export class Engine {
     const was = prev && prev.id === id ? prev.state : 'none';
     const noPhone = info.state === 'alive' && info.phoneSeen === false;
     await this.store.setMeta(SESSION_META, {
-      id, state: info.state, checkedAt: this.now(), customerSeen: !!info.customerSeen, phoneSeen: info.phoneSeen, message: info.message,
+      id, state: info.state, checkedAt: this.now(), customerSeen: !!info.customerSeen,
+      has: info.has || null, phoneSeen: typeof info.phoneSeen === 'boolean' ? info.phoneSeen : null, cards: info.cards || null,
+      message: info.message,
     });
     const line = SESSION_LOG[info.state];
     if (was !== info.state && line) await this.log(line[0], line[1](info));
@@ -418,11 +436,11 @@ export class Engine {
     return info;
   }
 
-  /** Перевірка: ОДНА сторінка першого пошуку з сесією → {state, customerSeen, sample, message}. */
+  /** Перевірка: ОДНА сторінка першого пошуку з сесією → {state, customerSeen, sample, cards, message}. */
   async checkDellaSession() {
     const sess = await this.dellaSession();
     if (!sess) {
-      return { state: 'none', customerSeen: false, sample: null, message: 'Сесію Della не задано — збір іде без входу, замовника в заявках не видно.' };
+      return { state: 'none', customerSeen: false, sample: null, cards: null, message: 'Сесію Della не задано — збір іде без входу, замовника в заявках не видно.' };
     }
     const s = await this.getSettings();
     const url = buildPageUrl(dellaSearchUrl(s.della.searchUrls[0], s.filters.directOnly), 0);
@@ -433,10 +451,10 @@ export class Engine {
       r = judgeDellaPage(await this.fetchDella(url, sess), { url, now: kyivWall(this.now()), contactsRefused });
     } catch (e) {
       const reason = this.scrub(e.message || e);
-      r = { state: 'error', customerSeen: false, sample: null, reason, message: `Не вдалося перевірити сесію: ${reason}.` };
+      r = { state: 'error', customerSeen: false, sample: null, cards: null, reason, message: `Не вдалося перевірити сесію: ${reason}.` };
     }
     await this.noteDellaSession(sess.id, r);
-    return { state: r.state, customerSeen: r.customerSeen, sample: r.sample, message: this.scrub(r.message) };
+    return { state: r.state, customerSeen: r.customerSeen, sample: r.sample, cards: r.cards, message: this.scrub(r.message) };
   }
 
   /** Зберегти (і одразу перевірити) або стерти сесію. → {state} */
@@ -446,8 +464,14 @@ export class Engine {
     await this.store.setMeta(SESSION_META, null);
     if (!cookie) {
       await this.store.setKV(SESSION_KEY, null);
-      if (had && had.cookie) await this.log('info', 'Della: сесію видалено — збір іде без входу');
-      return { state: (await this.dellaSessionState()).state };
+      // запасна DELLA_COOKIE (секрет репозиторію) лишається в ділі — кажемо це й одразу перевіряємо саме її
+      const fallback = await this.dellaSession();
+      if (had && had.cookie) {
+        await this.log('info', fallback
+          ? 'Della: сесію з адмінки видалено — далі вхід із запасної DELLA_COOKIE (секрет репозиторію); прибрати її може лише власник у GitHub'
+          : 'Della: сесію видалено — збір іде без входу');
+      }
+      return { state: fallback ? (await this.checkDellaSession()).state : 'none' };
     }
     this.secrets.add(cookie);
     const now = this.now();
@@ -464,11 +488,11 @@ export class Engine {
     if (!pages.length) return null;
     const inPages = pages.filter((p) => p.login !== 'out');
     if (!inPages.length) return this.noteDellaSession(sess.id, { state: 'expired', customerSeen: false });
-    const cards = inPages.reduce((n, p) => n + p.cards, 0);
-    const withCustomer = inPages.reduce((n, p) => n + p.withCustomer, 0);
-    const withPhone = inPages.reduce((n, p) => n + p.withPhone, 0);
-    if (!cards) return null;
-    return this.noteDellaSession(sess.id, withCustomer ? { state: 'alive', customerSeen: true, phoneSeen: withPhone > 0 } : { state: 'blind', customerSeen: false });
+    const cards = { withCustomer: inPages.reduce((n, p) => n + p.withCustomer, 0), total: inPages.reduce((n, p) => n + p.cards, 0) };
+    if (!cards.total) return null;
+    const has = Object.fromEntries(IDS.map(([k]) => [k, inPages.some((p) => p.has[k])]));
+    const state = sessionVerdict(cards);
+    return this.noteDellaSession(sess.id, { state, customerSeen: state === 'alive', has, phoneSeen: has.phone, cards });
   }
 
   /** POST на Della з сесією (запит контактів) → JSON або null (не JSON). */
@@ -512,8 +536,8 @@ export class Engine {
       try {
         r = parseDellaContacts(await this.postDella(CONTACTS_PATH, contactsBody(call), sess));
       } catch (e) {
-        await this.log('warn', `Della: контакти не отримано — ${e.message}`);
-        break; // мережа/HTTP — цей збір більше не питає, заявки не повторюються
+        // 403/429/5xx чи мережа — теж відмова: повторювати з сесією клієнтки щозбору не можна
+        r = { refused: 'http', desc: this.scrub(e.message || e).slice(0, 200) };
       }
       if (r.refused) { refused = r; break; }
       if (!r.phone && !r.edrpou) continue;
@@ -524,7 +548,12 @@ export class Engine {
       if (await this.isBlackLoad(next)) await this.markInactive(l.id, BLACK_REASON, 'blacklist', s);
     }
     if (refused) {
-      const why = { captcha: 'Della вимагає капчу з браузера', access: `«${refused.desc || 'Обмеження доступу до інформації'}» — потрібна верифікація акаунта`, format: 'незрозуміла відповідь' }[refused.refused];
+      const why = {
+        captcha: 'Della вимагає капчу з браузера',
+        access: `«${refused.desc || 'Обмеження доступу до інформації'}» — потрібна верифікація акаунта`,
+        format: 'незрозуміла відповідь',
+        http: `помилка запиту: ${refused.desc}`,
+      }[refused.refused];
       await this.store.setMeta(CONTACTS_META, { id: sess.id, refused: refused.refused, at: this.now() });
       await this.log('warn', `Della: телефон за «Докладніше» не віддала (${why}) — запити контактів для цієї сесії зупинено; блокуйте за назвою компанії`);
     } else if (phones && !(prev && prev.id === sess.id && prev.ok)) {
@@ -645,7 +674,11 @@ export class Engine {
       autoPublish: s.lardi.autoPublish,
       mode: s.lardi.mode,
       accounts,
-      della: { session: sess.state, checkedAt: sess.checkedAt, customerSeen: sess.customerSeen },
+      // з останньої перевірки чи збору — без запиту до Della (адмінці не треба щоразу кликати check)
+      della: {
+        session: sess.state, checkedAt: sess.checkedAt, customerSeen: sess.customerSeen,
+        has: sess.has, phoneSeen: sess.phoneSeen, cards: sess.cards,
+      },
       custCoverage, // {withCustomer, total}: у скількох заявок є замовник — без нього чорний список сліпий
       version: VERSION,
       archiveDays: ARCHIVE_DAYS,
@@ -739,7 +772,7 @@ export class Engine {
       const pages = await Promise.allSettled(jobs.map((j) => this.fetchDella(j.url, sess)));
       const byId = new Map();
       const wall = kyivWall(now);
-      const sessPages = []; // що показала Della з сесією: [{login, cards, withCustomer, withPhone}]
+      const sessPages = []; // що показала Della з сесією: [{login, cards, withCustomer, has}]
       const contactCalls = new Map(); // dellaRequestId → поля запиту контактів (лише з сесією й della.contacts)
       for (let i = 0; i < jobs.length; i++) {
         const r = pages[i];
@@ -756,7 +789,7 @@ export class Engine {
         if (sess) {
           const login = dellaLoginState(r.value);
           const keys = parsed.map((p) => customerKeys(p));
-          sessPages.push({ login, cards: parsed.length, withCustomer: keys.filter((k) => k.length).length, withPhone: keys.filter((k) => k.some((x) => x.startsWith('tel:'))).length });
+          sessPages.push({ login, cards: parsed.length, withCustomer: keys.filter((k) => k.length).length, has: hasOf(parsed) });
           if (s.della.contacts && login !== 'out') for (const [rid, call] of contactsCalls(r.value)) contactCalls.set(rid, call);
         }
       }
@@ -1088,8 +1121,9 @@ export class Engine {
   // ---------- RPC ----------
 
   async rpc(method, p = {}) {
-    const h = this.handlers[method];
-    if (!h) throw new Error(`невідомий метод ${method}`);
+    // лише власні обробники: valueOf / constructor / __proto__ з Object.prototype віддали б увесь рушій разом з env
+    const h = typeof method === 'string' && Object.hasOwn(this.handlers, method) ? this.handlers[method] : null;
+    if (typeof h !== 'function') throw new Error(`невідомий метод ${method}`);
     await this.ready();
     try {
       return await h.call(this, p || {});

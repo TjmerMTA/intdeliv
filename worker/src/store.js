@@ -1,7 +1,9 @@
 // Доступ до D1: заявки, налаштування/мета, кеш, журнал, лічильники.
-import { mergeSeen, newLoad, custKeysColumn } from '../../extension/lib/model.js';
+import { mergeSeen, newLoad, custKeysColumn, nameKey } from '../../extension/lib/model.js';
 
 export const LOG_MAX = 5000;
+/** Версія нормалізації назв (model.normCompany): 2 — дефіс = пробіл, усі апострофи, повні й латинські форми власності. */
+export const NAME_KEYS_V = 2;
 
 const lc = (v) => String(v ?? '').toLowerCase().replace(/[’ʼ`]/g, "'").trim();
 const nn = (v) => (v === undefined ? null : v);
@@ -80,6 +82,35 @@ export class Store {
         .bind(custKeysColumn(parse(r.data, null) || {}), r.id)));
       n += rows.length;
     }
+    await this.migrateNameKeys();
+    return n;
+  }
+
+  /**
+   * Нова нормалізація назв: ключі «name:…» у списках і в заявках переписуються на нове написання, щоб уже внесене
+   * клієнткою й надалі збігалося. Один раз (meta:nameKeysV). Ключ, що вже належить іншому запису, не перехоплюється.
+   * Повертає, скільки ключів у списках змінилось.
+   */
+  async migrateNameKeys() {
+    if ((await this.getKV('meta:nameKeysV', 0)) >= NAME_KEYS_V) return 0;
+    const { results: keys } = await this.db.prepare("SELECT key, customerId, list FROM customer_keys WHERE key LIKE 'name:%'").all();
+    const stmts = [];
+    let n = 0;
+    for (const r of keys || []) {
+      const nk = nameKey(r.key.slice(5));
+      const key = nk ? `name:${nk}` : '';
+      if (key === r.key) continue;
+      n++;
+      stmts.push(this.db.prepare('DELETE FROM customer_keys WHERE key = ?').bind(r.key));
+      if (key) stmts.push(this.db.prepare('INSERT OR IGNORE INTO customer_keys (key, customerId, list) VALUES (?, ?, ?)').bind(key, r.customerId, r.list));
+    }
+    const { results: rows } = await this.db.prepare("SELECT id, data, custKeys FROM loads WHERE custKeys <> '' AND custKeys LIKE '%|name:%'").all();
+    for (const r of rows || []) {
+      const ck = custKeysColumn(parse(r.data, null) || {});
+      if (ck !== r.custKeys) stmts.push(this.db.prepare('UPDATE loads SET custKeys = ? WHERE id = ?').bind(ck, r.id));
+    }
+    for (let i = 0; i < stmts.length; i += 100) await this.db.batch(stmts.slice(i, i + 100));
+    await this.setKV('meta:nameKeysV', NAME_KEYS_V);
     return n;
   }
 

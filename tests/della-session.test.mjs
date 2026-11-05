@@ -25,6 +25,7 @@ const noSecret = (v, what) => {
   for (const x of SECRETS) assert.ok(!s.includes(x), `${what}: значення сесії у виводі`);
 };
 const logOf = async (h) => (await h.call('log.list', { limit: 2000 })).map((x) => x.msg);
+const core = (d) => ({ session: d.session, checkedAt: d.checkedAt, customerSeen: d.customerSeen });
 
 test('сесія Della: рядок Cookie з DevTools нормалізується, порожньо — очистити, значення без назви — зрозуміла помилка', () => {
   assert.equal(normalizeDellaCookie('Cookie: a=1; b=2'), 'a=1; b=2');
@@ -91,20 +92,21 @@ test('della.session.check: вхід є і замовника видно → aliv
   assert.deepEqual(await h.call('della.session.set', { cookie: COOKIE }), { state: 'alive' });
   h.calls.della.length = 0;
   const r = await h.call('della.session.check', {});
-  assert.deepEqual(Object.keys(r).sort(), ['customerSeen', 'message', 'sample', 'state']);
+  assert.deepEqual(Object.keys(r).sort(), ['cards', 'customerSeen', 'message', 'sample', 'state']);
+  assert.deepEqual(r.cards, { withCustomer: 25, total: 25 });
   assert.equal(r.state, 'alive');
   assert.equal(r.customerSeen, true);
   assert.deepEqual(r.sample, {
     company: 'ТОВ «Альфа»', phone: '+38 (067) 111-22-33', edrpou: '12345678', dellaCompanyId: 'A1',
     has: { phone: true, company: true, dellaCompanyId: true, edrpou: true },
   });
-  assert.match(r.message, /^Вхід працює: Della дає телефон, назву компанії, код компанії Della і ЄДРПОУ — чорний список спрацює і за телефоном, і за назвою \(приклад: ТОВ «Альфа», \+38 \(067\) 111-22-33\)\.$/);
+  assert.match(r.message, /^Вхід працює: Della дає телефон, назву компанії, код компанії Della і ЄДРПОУ — чорний список спрацює і за телефоном, і за назвою \(замовника видно в 25 з 25 карток; приклад: ТОВ «Альфа», \+38 \(067\) 111-22-33\)\.$/);
   assert.equal(h.calls.della.length, 1, 'рівно одна сторінка');
   assert.equal(h.calls.della[0].url, DEFAULT_SEARCH_URL, 'перший пошук, перша сторінка');
   assert.equal(h.calls.della[0].headers.Cookie, COOKIE);
 
   const st = await h.call('status.get');
-  assert.deepEqual(st.della, { session: 'alive', checkedAt: T0, customerSeen: true });
+  assert.deepEqual(core(st.della), { session: 'alive', checkedAt: T0, customerSeen: true });
   const sg = await h.call('settings.get');
   assert.deepEqual(sg.della.session, { set: true, state: 'alive', checkedAt: T0, updatedAt: T0 });
   assert.equal(h.calls.della.length, 1, 'status.get і settings.get на Della не ходять');
@@ -114,7 +116,7 @@ test('della.session.check: вхід є і замовника видно → aliv
 test('della.session.check: none, expired, blind, error — чесна причина українською, стан зберігається', async () => {
   const h = setup();
   const n = await h.call('della.session.check', {});
-  assert.deepEqual({ ...n, message: '' }, { state: 'none', customerSeen: false, sample: null, message: '' });
+  assert.deepEqual({ ...n, message: '' }, { state: 'none', customerSeen: false, sample: null, cards: null, message: '' });
   assert.match(n.message, /не задано/);
   assert.equal(h.calls.della.length, 0, 'без сесії на Della не ходимо');
 
@@ -154,7 +156,7 @@ test('della.session.set: порожньо — сесію видалено (ст�
   const sg = await h.call('settings.get');
   assert.equal(sg.della.session.set, false);
   assert.equal(sg.della.session.state, 'none');
-  assert.deepEqual((await h.call('status.get')).della, { session: 'none', checkedAt: null, customerSeen: false });
+  assert.deepEqual(core((await h.call('status.get')).della), { session: 'none', checkedAt: null, customerSeen: false });
   h.calls.della.length = 0;
   await h.engine().runCycle();
   assert.ok(h.calls.della.length > 0 && h.calls.della.every((c) => !('Cookie' in c.headers)));
@@ -187,7 +189,7 @@ test('збір із сесією: Della «вийшла» — expired і один
   assert.equal((await h.call('status.get')).della.session, 'blind');
   page = LOGGED;
   for (let i = 0; i < 3; i++) { h.clock.t += 61e3; await h.engine().poll(); }
-  assert.deepEqual((await h.call('status.get')).della, { session: 'alive', checkedAt: h.clock.t, customerSeen: true });
+  assert.deepEqual(core((await h.call('status.get')).della), { session: 'alive', checkedAt: h.clock.t, customerSeen: true });
   log = await logOf(h);
   assert.equal(log.filter((m) => m === 'Della: вхід є, замовник у картці видно').length, 2, 'при збереженні і при поверненні');
   assert.equal(log.filter((m) => /^Della: вхід є, але замовника/.test(m)).length, 1);
@@ -220,7 +222,7 @@ test('status.get: custCoverage — скільки заявок мають зам
   await h.engine().runCycle();
   let st = await h.call('status.get');
   assert.deepEqual(st.custCoverage, { withCustomer: 0, total: 16 });
-  assert.deepEqual(st.della, { session: 'none', checkedAt: null, customerSeen: false });
+  assert.deepEqual(core(st.della), { session: 'none', checkedAt: null, customerSeen: false });
 
   const half = asLoggedIn(withCustomers(HTML, (i) => (i % 2 ? null : ALFA)));
   h.della = byCookie(half);
@@ -346,7 +348,7 @@ test('секретність: значення сесії немає ні в ж�
 
 test('ключ за назвою: ТОВ/ФОП, лапки, регістр, апостроф — одна назва; загальні й короткі назви ключем не стають', async () => {
   const k = (company) => customerKeys({ company });
-  for (const v of ['ТОВ «Мар’яна-Транс»', 'тов "МАР\'ЯНА-ТРАНС"', 'Марʼяна-Транс, ТзОВ', 'мар`яна-транс']) assert.deepEqual(k(v), ["name:мар'яна-транс"], v);
+  for (const v of ['ТОВ «Мар’яна-Транс»', 'тов "МАР\'ЯНА-ТРАНС"', 'Марʼяна-Транс, ТзОВ', 'мар`яна-транс']) assert.deepEqual(k(v), ["name:мар'яна транс"], v);
   assert.deepEqual(k('ФОП Коваль'), ['name:коваль']);
   assert.deepEqual(k('Коваль, фоп'), ['name:коваль']);
   for (const weak of ['ФОП', 'ТОВ', 'Приватна особа', 'Абв', 'ТОВ «Абв»', '']) assert.deepEqual(k(weak), [], `«${weak}» — не ключ`);
@@ -357,7 +359,7 @@ test('ключ за назвою: ТОВ/ФОП, лапки, регістр, а�
     assert.match(r.error, /назву компанії \(від 4 літер\)/);
   }
   const pv = await h.call('customers.preview', { text: 'Мар’яна-Транс' });
-  assert.deepEqual(pv.keys, ["name:мар'яна-транс"]);
+  assert.deepEqual(pv.keys, ["name:мар'яна транс"]);
   assert.equal(pv.weak, true, 'лише назва — попередження про можливий збіг');
 });
 
@@ -552,5 +554,174 @@ test('контакти: мережева помилка з кукою в тек�
   assert.equal(posts(h).length, 1);
   const log = await h.call('log.list', { limit: 2000 });
   noSecret(log, 'журнал');
-  assert.ok(log.some((x) => /^Della: контакти не отримано — Della: fetch failed/.test(x.msg)));
+  assert.ok(log.some((x) => /^Della: телефон за «Докладніше» не віддала \(помилка запиту: Della: fetch failed/.test(x.msg)), log.map((x) => x.msg).join('\n'));
+});
+
+// ---------- за звітом тестувальника (reports/della-session.md @ 5520e1b) ----------
+
+test('S2: RPC не викликає успадковані методи Object.prototype — ні рушія, ні DELLA_COOKIE, ні ADMIN_KEY у відповіді', async () => {
+  const h = setup({ env: { DELLA_COOKIE: COOKIE } });
+  for (const m of ['valueOf', 'toString', 'constructor', 'hasOwnProperty', 'isPrototypeOf', '__proto__', 'toLocaleString', '__defineGetter__']) {
+    const r = await h.rpc(m, {});
+    assert.equal(r.ok, false, m);
+    assert.match(r.error, /невідомий метод/, m);
+    noSecret(r, m);
+    assert.ok(!JSON.stringify(r).includes('secret-admin-key'), `${m}: ADMIN_KEY`);
+  }
+  assert.equal((await h.rpc('ping', {})).ok, true);
+});
+
+test('C1: HTTP-відмова Della на запит контактів (403/429/5xx, мережа) — теж відмова: сесія більше не питає, рядок журналу один', async () => {
+  for (const answer of [() => new Response('Forbidden', { status: 403 }), () => new Response('slow down', { status: 429 }), () => { throw new TypeError('fetch failed'); }]) {
+    const h = setup();
+    let page = CONTACTS_PAGE;
+    h.della = (url, headers, init) => (init.method === 'POST' ? answer() : headers.Cookie === COOKIE ? page : HTML);
+    await h.call('della.session.set', { cookie: COOKIE });
+    await h.call('settings.set', { della: { contacts: true } });
+    for (let i = 0; i < 5; i++) {
+      page = CONTACTS_PAGE.replace(/class="cargo_type">/g, `class="cargo_type">${i} `); // щоразу нові заявки
+      h.clock.t += 61e3;
+      await h.engine().poll();
+    }
+    assert.equal(posts(h).length, 1, 'одна спроба на сесію');
+    const lines = (await logOf(h)).filter((m) => /^Della: (контакти|телефон за «Докладніше»)/.test(m));
+    assert.equal(lines.length, 1, lines.join('\n'));
+    assert.match(lines[0], /запити контактів для цієї сесії зупинено/);
+  }
+});
+
+test('K7: заявка, яку клієнтка редагувала, однаково отримує замовника з Della — чорний список її ховає й знімає з Lardi', async () => {
+  const h = setup();
+  await live(h);
+  await h.engine().runCycle();
+  const all = (await h.list({ status: 'all' })).items;
+  const edited = all.filter((l) => l.lardi.some((e) => e.status === 'published')).slice(0, 3);
+  assert.ok(edited.length > 0);
+  for (const l of edited) {
+    await h.call('loads.update', { id: l.id, patch: { price: l.price + 500 } });
+    await h.call('loads.update', { id: l.id, patch: { comment: 'дзвонила, домовились' } });
+  }
+  // правку клієнтки Della не перезаписує, а вписаний нею телефон — не чіпає
+  const own = all.find((l) => !edited.includes(l));
+  await h.call('loads.update', { id: own.id, patch: { phone: '0441234567' } });
+  await h.call('customers.add', { list: 'black', text: '067 111 22 33' });
+  h.della = byCookie(LOGGED);
+  await h.call('della.session.set', { cookie: COOKIE });
+  h.clock.t += 61e3;
+  await h.engine().poll();
+  await h.engine().staleCheck();
+  const after = await h.engine().store.getMany(all.map((l) => l.id));
+  for (const l of edited) {
+    const x = after.get(l.id);
+    assert.equal(x.price, l.price + 500, 'правка лишилась');
+    assert.equal(x.comment, 'дзвонила, домовились', 'коментар лишився');
+    assert.equal(x.edited, true);
+    assert.equal(x.inactiveKind, 'blacklist');
+    assert.ok(x.lardi.every((e) => e.status !== 'published'), 'знято з Lardi');
+  }
+  assert.equal(after.get(own.id).phone, '0441234567', 'вписаний телефон не перезаписано');
+  assert.equal(after.get(own.id).company, 'ТОВ «Альфа»', 'а відсутнє — дописано');
+});
+
+test('H6: стерти сесію з адмінки, коли є DELLA_COOKIE, — відповідь і журнал кажуть правду: вхід іде далі із запасної', async () => {
+  const h = setup({ env: { DELLA_COOKIE: 'env_sess=E1E1E1E1E1' } });
+  h.della = (url, headers) => (headers.Cookie === 'env_sess=E1E1E1E1E1' ? LOGGED : HTML);
+  await h.call('della.session.set', { cookie: COOKIE });
+  const r = await h.call('della.session.set', { cookie: '' });
+  assert.deepEqual(r, { state: 'alive' }, 'стан запасної сесії, перевірений одразу');
+  const log = await logOf(h);
+  assert.ok(log.some((m) => /^Della: сесію з адмінки видалено — далі вхід із запасної DELLA_COOKIE/.test(m)), log.join('\n'));
+  assert.ok(!log.some((m) => /збір іде без входу/.test(m)));
+  assert.equal((await h.call('status.get')).della.session, 'alive');
+  const sg = await h.call('settings.get');
+  assert.equal(sg.della.session.set, false, 'в адмінці сесії немає');
+  assert.equal(sg.della.session.state, 'alive');
+});
+
+test('H1: один телефон у тексті однієї картки — не «вхід працює»: alive лише коли замовника видно в більшості карток', async () => {
+  const one = asLoggedIn(HTML.replace('двері металеві', 'двері металеві, дзвоніть +380671112233'));
+  const h = setup();
+  h.della = byCookie(one);
+  await h.call('della.session.set', { cookie: COOKIE });
+  const r = await h.call('della.session.check', {});
+  assert.equal(r.state, 'blind');
+  assert.equal(r.sample, null);
+  assert.match(r.message, /лише в 1 з 25 карток/);
+  h.clock.t += 61e3;
+  await h.engine().poll();
+  assert.equal((await h.call('status.get')).della.session, 'blind', 'збір судить так само');
+  // більшість карток — так
+  h.della = byCookie(asLoggedIn(withCustomers(HTML, (i) => (i % 2 ? null : ALFA))));
+  const ok = await h.call('della.session.check', {});
+  assert.equal(ok.state, 'alive');
+  assert.match(ok.message, /\(замовника видно в 13 з 25 карток/);
+});
+
+test('H2: зникли маркери кінця списку — остання картка однаково не забирає низ сторінки', () => {
+  let page = HTML;
+  for (const k of ['is_subscription_pending', 'id="deny_info"', 'class="pages"', 'class="footer']) page = page.split(k).join('x-gone');
+  page = page.replace('</body>', '<div>Підтримка Della: +38 (044) 000-00-00 <span data-company-code="Q1" data-company-name="Della"></span></div></body>');
+  const cards = parseDellaSearch(page, { now: NOW });
+  assert.equal(cards.length, 25);
+  assert.deepEqual(customerKeys(cards[24]), []);
+  assert.ok(cards[24].price > 0 && cards[24].toCity, 'остання картка розібрана повністю');
+});
+
+test('K2: назва — дефіс і пробіл, будь-який апостроф, латинські ТОВ, повна форма «Товариство з обмеженою відповідальністю» — один ключ', () => {
+  const k = (company) => customerKeys({ company });
+  const one = (xs) => { const ks = xs.map((x) => JSON.stringify(k(x))); assert.equal(new Set(ks).size, 1, xs.join(' | ') + ' → ' + ks.join(' | ')); assert.notEqual(ks[0], '[]'); };
+  one(['Логістик Плюс', 'Логістик-Плюс', 'ТОВ «Логістик – Плюс»']);
+  one(['Мар’яна', 'Мар‘яна', 'Марʹяна', "Мар'яна", 'Марʼяна', 'Мар`яна']);
+  one(['TOB Альфа Транс', 'ТОВ Альфа Транс', 'TOВ «Альфа Транс»', 'Товариство з обмеженою відповідальністю «Альфа Транс»', 'Альфа-Транс, LLC']);
+  one(['ФОП Коваль Петро', 'Фізична особа-підприємець Коваль Петро', 'Коваль Петро ФОП']);
+  assert.deepEqual(k('Товариство з обмеженою відповідальністю'), [], 'сама форма — не ключ');
+  assert.deepEqual(k('Транс'), ['name:транс']);
+  assert.notDeepEqual(k('Транс'), k('Транс Логістик Груп'), 'і далі лише повний збіг');
+});
+
+test('K2: міграція — збережені раніше ключі за назвою переходять на нове написання, заявки знову збігаються; повторно — нічого', async () => {
+  const h = setup();
+  await h.engine().runCycle();
+  const st = h.engine().store;
+  // як було до виправлення: ключ із дефісом, заявка з тією ж назвою
+  const { customer } = await st.upsertCustomer('black', ['name:логістик-плюс'], { label: 'Логістик-Плюс' });
+  const [l] = (await h.list({ status: 'all' })).items;
+  await h.env.DB.prepare("UPDATE loads SET custKeys = '|name:логістик-плюс|', data = json_set(data, '$.company', 'ТОВ «Логістик-Плюс»') WHERE id = ?").bind(l.id).run();
+  await h.env.DB.prepare("DELETE FROM settings WHERE k = 'meta:nameKeysV'").run();
+  await st.migrate(); // як під час старту сервера
+  assert.deepEqual((await st.getCustomer(customer.id)).keys, ['name:логістик плюс']);
+  assert.equal((await st.loadsByKeys(['name:логістик плюс'])).length, 1, 'заявка знову належить замовнику');
+  assert.equal(await st.migrateNameKeys(), 0, 'повторно — нічого (позначка версії)');
+  await h.env.DB.prepare("DELETE FROM settings WHERE k = 'meta:nameKeysV'").run();
+  assert.equal(await st.migrateNameKeys(), 0, 'і без позначки — уже нема чого міняти');
+});
+
+test('status-della-has: status.get.della — has, phoneSeen і частка карток з останньої перевірки чи збору, без запиту до Della', async () => {
+  const h = setup();
+  assert.deepEqual((await h.call('status.get')).della, { session: 'none', checkedAt: null, customerSeen: false, has: null, phoneSeen: null, cards: null });
+  h.della = byCookie(NAME_ONLY);
+  await h.call('della.session.set', { cookie: COOKIE });
+  const n = h.calls.della.length;
+  assert.deepEqual((await h.call('status.get')).della, {
+    session: 'alive', checkedAt: T0, customerSeen: true,
+    has: { phone: false, company: true, dellaCompanyId: false, edrpou: false }, phoneSeen: false, cards: { withCustomer: 25, total: 25 },
+  });
+  assert.equal(h.calls.della.length, n, 'status.get на Della не ходить');
+  // збір (3 сторінки) пише те саме
+  h.della = byCookie(LOGGED);
+  h.clock.t += 61e3;
+  await h.engine().poll();
+  const d = (await h.call('status.get')).della;
+  assert.deepEqual(d.has, { phone: true, company: true, dellaCompanyId: true, edrpou: true });
+  assert.equal(d.phoneSeen, true);
+  assert.deepEqual(d.cards, { withCustomer: 75, total: 75 });
+  // вхід зник — про картки нічого не відомо
+  h.della = () => HTML;
+  h.clock.t += 61e3;
+  await h.engine().poll();
+  assert.deepEqual((await h.call('status.get')).della, { session: 'expired', checkedAt: h.clock.t, customerSeen: false, has: null, phoneSeen: null, cards: null });
+  // і check віддає частку в самій відповіді
+  h.della = () => BLIND;
+  assert.deepEqual((await h.call('della.session.check', {})).cards, { withCustomer: 0, total: 25 });
+  assert.equal((await h.call('della.session.check', {})).state, 'blind');
 });

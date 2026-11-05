@@ -158,12 +158,18 @@ function splitCards(html) {
   const starts = [];
   let m;
   while ((m = re.exec(html))) starts.push({ index: m.index, cls: m[1] || '', rid: m[2] });
+  let longest = 0;
   return starts.map((s, i) => {
     const next = i + 1 < starts.length ? starts[i + 1].index : html.length;
     const seg = html.slice(s.index, next);
     let cut = seg.indexOf('requests_cards_delimiter');
     // остання картка без роздільника: інакше до неї потрапив би низ сторінки (телефони, data-company-* інших карток)
-    if (cut < 0 && i === starts.length - 1) cut = Math.min(...AFTER_LIST.map((k) => seg.indexOf(k)).filter((x) => x > 0), seg.length);
+    if (cut < 0 && i === starts.length - 1) {
+      cut = Math.min(...AFTER_LIST.map((k) => seg.indexOf(k)).filter((x) => x > 0), seg.length);
+      // маркерів немає (змінилась верстка) — не довше за найдовшу попередню картку вдвічі
+      if (cut === seg.length && longest) cut = Math.min(cut, longest * 2);
+    }
+    if (i < starts.length - 1) longest = Math.max(longest, cut > 0 ? cut : seg.length);
     return {
       cls: s.cls,
       rid: s.rid,
