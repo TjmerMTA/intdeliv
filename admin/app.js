@@ -942,7 +942,7 @@ const zeroWhy = custState().none ? 'Сервер не бачить замовн�
 const blindTel = phoneNo() ? rows.filter(telOnly) : [];
 const telNote = ensureEl('c-tel-note', 'c-tel-note', (el) => $('#v-customers .ctbl').before(el));
 telNote.hidden = !blindTel.length;
-telNote.textContent = blindTel.length ? `Лише за телефоном: ${fmtN(blindTel.length)} (усього записів: ${fmtN(rows.length)}). Della телефон не показує, тож за ними ${S.cList === 'black' ? 'блокування' : 'вибір в обрані'} не спрацює. Додайте назву компанії — ваші записи лишаються як є.` : '';
+telNote.textContent = blindTel.length ? `Лише за телефоном: ${fmtN(blindTel.length)} (усього записів: ${fmtN(rows.length)}). Della телефон не показує, тож за такими записами ${S.cList === 'black' ? 'блокування' : 'вибір в обрані'} не спрацює. Додайте назву компанії — ваші записи лишаються як є.` : '';
 const telHint = S.cList === 'black' ? 'За телефоном Della замовника не показує — додайте назву компанії, щоб блокування спрацювало' : 'За телефоном Della замовника не показує — додайте назву компанії, щоб це спрацювало';
 $('#c-rows').innerHTML = rows.map((x) => `<tr data-cid="${esc(x.id)}">
 <td data-l="Замовник"><b>${esc(x.label || '—')}</b>${blindTel.includes(x) ? `<span class="chip c-off tel-only">лише телефон</span><div class="c-tel">${esc(telHint)} · <button type="button" class="lnk" data-c="addname">Додати назву</button></div>` : ''}${x.list === 'black' && x.live ? `<div class="c-sweep" title="Не вдалося зняти одразу (Lardi не відповідав) — рушій повторює кожні 10 хв">на Lardi ще ${esc(fmtN(x.live))} — знімаємо</div>` : ''}</td>
@@ -1183,7 +1183,23 @@ const has = v.state === 'alive' && v.sample?.has && typeof v.sample.has === 'obj
 const gives = has ? [['phone', 'телефон'], ['company', 'назву компанії'], ['dellaCompanyId', 'код компанії'], ['edrpou', 'ЄДРПОУ']].filter(([k]) => has[k]).map(([, t]) => t) : [];
 const givesTxt = !has ? '' : (gives.length ? 'Della показує: ' + (gives.length > 1 ? gives.slice(0, -1).join(', ') + ' і ' + gives[gives.length - 1] : gives[0]) : 'Della не показує жодних даних про замовника')
 + (has.phone ? '.' : ' — телефону немає, тож блокуйте за назвою компанії.');
-return `<div class="${cls === 'c-ok' || cls === 'c-err' ? cls : ''}"><b>${esc(icon + text)}</b></div>${sm ? `<div class="smp">Зараз сервер бачить про замовника: ${esc(sm)}</div>` : ''}${givesTxt ? `<div class="smp">${esc(givesTxt)}</div>` : ''}`;
+const extra = serverExtra(v.state, v.message, !!has);
+return `<div class="${cls === 'c-ok' || cls === 'c-err' ? cls : ''}"><b>${esc(icon + text)}</b></div>${sm ? `<div class="smp">Зараз сервер бачить про замовника: ${esc(sm)}</div>` : ''}${givesTxt ? `<div class="smp">${esc(givesTxt)}</div>` : ''}${extra ? `<div class="smp muted ds-msg">${esc(extra)}</div>` : ''}`;
+}
+// Власне речення сервера (message з della.session.check) — під нашим вердиктом, лише коли воно додає те, чого ми
+// самі не виводимо: частку карток із замовником («видно в 1 з 25 карток»), скільки карток переглянуто, причину збою,
+// відмову Della за «Докладніше». Повтор нашого ж («вставте нову», «блокуйте за назвою», приклад) — не показуємо.
+function serverExtra(state, msg, hasDerived) {
+let m = String(msg || '').replace(/\s+/g, ' ').trim();
+if (!m) return '';
+m = m.replace(/\s*\(приклад:[^)]*\)/g, '')            // приклад уже в «Зараз сервер бачить…»
+.replace(/\s+для\s+https?:\/\/\S+/gi, '').replace(/https?:\/\/\S+/gi, '') // адреси — не для неї
+.replace(/\s+([.,;:])/g, '$1').trim();
+if (!/[.!?…]$/.test(m)) m += '.';
+const nums = /\d/.test(m); // частка, кількість карток, код помилки — цього наші речення не знають
+if (state === 'blind' || state === 'error') return m;
+if (state === 'alive') return !hasDerived || nums || /Докладніше/.test(m) ? m : '';
+return nums ? m : ''; // none / expired: наше речення каже те саме
 }
 function renderDellaSess() {
 const st = $('#ds-st'); if (!st) return;
@@ -1224,7 +1240,7 @@ try {
 if (kind === 'check') {
 const r = await check();
 noteHas(r?.sample);
-S.dsVerdict = { state: dsState(r, 'error'), sample: r?.sample || null };
+S.dsVerdict = { state: dsState(r, 'error'), sample: r?.sample || null, message: r?.message || '' };
 } else {
 const r = await call('della.session.set', { cookie }, { timeout: 60000, tries: 1 });
 if ($('#ds-cookie')) $('#ds-cookie').value = ''; // значення більше ніде не тримаємо
@@ -1235,7 +1251,7 @@ if (kind === 'save' && S.dsVerdict.state !== 'none') { // одразу пока�
 await loadSettings(); // нова сесія — нова позначка updatedAt, до неї й прив'язуємо, що дає Della
 const ck = await check().catch(() => null);
 noteHas(ck?.sample);
-if (ck && DS_STATES.includes(ck.state)) S.dsVerdict = { state: ck.state, sample: ck.sample || null };
+if (ck && DS_STATES.includes(ck.state)) S.dsVerdict = { state: ck.state, sample: ck.sample || null, message: ck.message || '' };
 }
 }
 } catch (err) {
@@ -1607,7 +1623,15 @@ return { state: sess.state };
 sess.checkedAt = Date.now();
 const l = items.map(view).find((x) => x.company && (x.phone || sess.nameOnly));
 const has = { phone: !sess.nameOnly, company: true, dellaCompanyId: sess.nameOnly, edrpou: false };
-return { state: sess.state, customerSeen: custSeen(), sample: custSeen() && l ? { company: l.company, phone: l.phone || null, edrpou: null, dellaCompanyId: sess.nameOnly ? '4417' : null, has } : null, message: '' };
+// речення сервера — як у справжнього рушія (панель показує його лише тоді, коли воно щось додає)
+const message = {
+none: 'Сесію Della не задано — збір іде без входу, замовника в заявках не видно.',
+alive: sess.nameOnly ? `Вхід працює, але Della дає лише назву компанії і код компанії Della — блокуйте за назвою, телефон у картці не видно (приклад: ${l?.company}).` : `Вхід працює: Della дає телефон і назву компанії — чорний список спрацює і за телефоном, і за назвою (приклад: ${l?.company}).`,
+blind: 'Вхід є, але замовника в картці не видно: у 25 картках немає ні коду чи назви компанії, ні телефону, ні ЄДРПОУ — можливо, акаунт Della не верифікований.',
+expired: 'Della відповіла як без входу — сесію не прийнято або вона закінчилась. Вставте нову.',
+error: 'Не вдалося перевірити сесію: Della 502 для https://della.com.ua/search/demo.html.',
+}[sess.state];
+return { state: sess.state, customerSeen: custSeen(), sample: custSeen() && l ? { company: l.company, phone: l.phone || null, edrpou: null, dellaCompanyId: sess.nameOnly ? '4417' : null, has } : null, message };
 },
 'lardi.accounts': () => api['status.get']().accounts,
 'lardi.backfill': ({ dryRunOnly }) => (dryRunOnly ? { candidates: 3 } : { queued: 3 }),
