@@ -1157,7 +1157,7 @@ note.innerHTML = lines.map((t) => `<div>${esc(t)}</div>`).join('');
 const marksOf = (x) => marked.filter(([, xs]) => xs.includes(x)).map(([mk]) => mk);
 const hl = S.hl && Date.now() < S.hl.until ? S.hl.id : null;
 $('#c-rows').innerHTML = rows.map((x) => `<tr data-cid="${esc(x.id)}"${x.id === hl ? ' class="c-hl"' : ''}>
-<td data-l="Замовник"><b>${esc(x.label || '—')}</b>${marksOf(x).map((mk) => `<span class="chip c-off c-mark ${mk.cls}">${esc(mk.chip)}</span>`).join('')}${marksOf(x).map((mk) => `<div class="c-tel">${esc(mk.hint(bl))}${mk.act ? ` · <button type="button" class="lnk" data-c="${mk.act[0]}">${esc(mk.act[1])}</button>` : ''}</div>`).join('')}${x.list === 'black' && x.live ?`<div class="c-sweep" title="Не вдалося зняти одразу (Lardi не відповідав) — рушій повторює кожні 10 хв">на Lardi ще ${esc(fmtN(x.live))} — знімаємо</div>` : ''}</td>
+<td data-l="Замовник"><b>${esc(x.label || '—')}</b>${marksOf(x).map((mk) => `<span class="chip c-off c-mark ${mk.cls}">${esc(mk.chip)}</span>`).join('')}${marksOf(x).map((mk) => { const a = typeof mk.act === 'function' ? mk.act(x) : mk.act; return `<div class="c-tel">${esc(mk.hint(bl, x))}${a ? ` · <button type="button" class="lnk" data-c="${a[0]}"${a[2] != null ? ` data-target="${esc(a[2])}"` : ''}>${esc(a[1])}</button>` : ''}</div>`; }).join('')}${x.list === 'black' && x.live ?`<div class="c-sweep" title="Не вдалося зняти одразу (Lardi не відповідав) — рушій повторює кожні 10 хв">на Lardi ще ${esc(fmtN(x.live))} — знімаємо</div>` : ''}</td>
 <td data-l="Ключі">${(x.keys || []).map((k) => `<span class="key">${esc(keyLabel(k))}</span>`).join('')}</td>
 <td data-l="Додано" class="num">${esc(new Date(x.createdAt).toLocaleDateString('uk-UA'))}</td>
 <td data-l="Нотатка"><input class="note-in" data-note value="${esc(x.note || '')}" placeholder="—" aria-label="Нотатка"></td>
@@ -1178,11 +1178,54 @@ on: (x) => phoneNo() && telOnly(x),
 // без живого входу не спрацює й назва — тоді радимо обидва кроки
 hint: (bl) => `За телефоном Della замовника не показує — ${loggedIn() ? 'додайте назву компанії' : 'потрібні вхід у Della і назва компанії'}, щоб ${bl ? 'блокування спрацювало' : 'це спрацювало'}`,
 count: (n, m, bl) => `Лише за телефоном: ${fmtN(n)} (усього записів: ${fmtN(m)}). Della телефон не показує, тож за такими записами ${bl ? 'блокування' : 'вибір в обрані'} не спрацює. ${loggedIn() ? 'Додайте назву компанії' : 'Потрібні вхід у Della і назва компанії'} — ваші записи лишаються як є.` },
-{ id: 'nokey', cls: 'no-key', chip: 'без ключа', act: ['addname', 'Додати замовника'],
+// Те, що не розв'язала міграція назв (customers.list → nameKeyIssues): два записи на одну фірму, лише форма власності, без ключа
+{ id: 'clash', cls: 'mark-clash', chip: 'та сама фірма двічі',
+on: (x) => !!clashOf(x),
+hint: (bl, x) => {
+const c = clashOf(x); const o = c.other || {};
+if (c.working === true) return `Цю саму фірму має ще запис ${labelQ(o.label)} (${listName(o.list)}) — працює цей, а той ні з чим не збігається`;
+if (c.working === false) {
+const h = c.holder;
+return `Цю саму фірму має запис ${labelQ(h.label)} (${listName(h.list)}) — працює він${h.list === 'black' && x.list === 'white' ? ': заявки цієї фірми приховано, тож в «Обраних» цей запис не діє' : ', а цей ні з чим не збігається'}`;
+}
+return `Цю саму фірму має ще запис ${labelQ(o.label)} (${listName(o.list)}) — працює лише один із двох`;
+},
+act: (x) => { const c = clashOf(x); const t = c.working === false ? c.holder : c.other; return t?.id != null ? ['showother', 'Показати той запис', t.id] : null; },
+count: (n, m) => `Записів, де та сама фірма записана двічі: ${fmtN(n)} (усього записів: ${fmtN(m)}). Працює лише один із пари — біля кожного написано, який.` },
+{ id: 'empty', cls: 'mark-empty', chip: 'немає назви фірми', act: ['addname', 'Додати назву'],
+on: (x) => issuesOf(x, 'empty').length > 0,
+hint: () => 'Тут лише форма власності, без назви фірми, — запис ні з чим не збігається. Допишіть справжню назву компанії',
+count: (n, m) => `Без назви фірми: ${fmtN(n)} (усього записів: ${fmtN(m)}) — там лише форма власності, тож такі записи ні з чим не збігаються. Допишіть справжню назву компанії.` },
+{ id: 'keyless', cls: 'no-key', chip: 'без ключа',
+// позначаємо лише сам запис без ключа; запис, що має цей ключ (теж є в entries відмітки), працює — його не чіпаємо
 on: (x) => Array.isArray(x.keys) && !x.keys.length,
-hint: () => 'У записі не лишилось ні телефону, ні назви — він ні з чим не порівнюється. Додайте замовника ще раз',
-count: (n, m) => `Без ключа: ${fmtN(n)} (усього записів: ${fmtN(m)}) — такі записи ні з чим не порівнюються; додайте замовника ще раз.` },
+hint: (bl, x) => {
+const o = keylessOwner(x);
+const what = bl ? 'нічого не блокує' : 'ні з чим не збігається';
+return o ? `Такого замовника вже має запис ${labelQ(o.label)} (${listName(o.list)}) — працює той, а цей ${what}` : `У записі немає ні телефону, ні назви — він ${what}. Додайте замовника ще раз`;
+},
+act: (x) => { const o = keylessOwner(x); return o ? ['showother', 'Показати той запис', o.id] : ['addname', 'Додати замовника']; },
+count: (n, m, bl) => `Без ключа: ${fmtN(n)} (усього записів: ${fmtN(m)}) — такі записи ${bl ? 'нічого не блокують' : 'ні з чим не збігаються'}.` },
 ];
+// ---- nameKeyIssues: нічого не міняємо в її записах — лише показуємо, що працює, а що ні
+const listName = (l) => (l === 'black' ? 'у чорному списку' : 'в «Обраних»');
+const entryById = (id) => (S.customers?.items || []).find((c) => c.id === id);
+const issuesOf = (x, kind) => (Array.isArray(S.customers?.nameKeyIssues) ? S.customers.nameKeyIssues : [])
+.filter((i) => i && i.kind === kind && (i.entries || []).some((e) => e.id === x.id));
+// У парі на одну назву працює той, у кого ключ зараз (чорний перемагає білий); working: true/false/null — не знаємо
+function clashOf(x) {
+const i = issuesOf(x, 'clash')[0]; if (!i) return null;
+const full = (i.entries || []).map((e) => ({ ...e, ...(entryById(e.id) || {}) }));
+const other = full.find((e) => e.id !== x.id) || null;
+const holder = full.find((e) => (e.keys || []).includes(i.key)) || (i.winner != null ? full.find((e) => e.id === i.winner) : null) || null;
+return { other, holder, working: holder ? holder.id === x.id : null };
+}
+// Запис без ключа, бо цей самий ключ уже має інший запис — той, що працює (або null)
+function keylessOwner(x) {
+const i = issuesOf(x, 'keyless')[0];
+const e = i && (i.entries || []).find((en) => en.id !== x.id);
+return e ? { ...e, ...(entryById(e.id) || {}) } : null;
+}
 $('#c-tabs').addEventListener('click', (e) => { const b = e.target.closest('[data-cl]'); if (!b) return; S.cList = b.dataset.cl; renderCustomers(); });
 // Елемент зі сторінки; якщо браузер ще тримає стару index.html без нього — створюємо
 function ensureEl(id, cls, place) {
@@ -1264,6 +1307,7 @@ const id = Number(b.closest('tr').dataset.cid);
 const x = (S.customers?.items || []).find((c) => c.id === id); if (!x) return;
 try {
 if (b.dataset.c === 'loads') return showCustomerLoads(x);
+if (b.dataset.c === 'showother') { const t = entryById(Number(b.dataset.target)); return t ? showEntry(t) : toast('Того запису вже немає — список оновлено'); }
 if (b.dataset.c === 'addname') { // новий запис за назвою поруч зі старим — старий не змінюємо; її власну нотатку не чіпаємо
 const f = $('#c-add');
 if (!f.elements.note.value.trim()) f.elements.note.value = `до ${x.label || 'запису'}`;
@@ -1789,7 +1833,8 @@ seenAt: seen, firstSeenAt: seen - H, updatedAt: seen };
 // ?demo=name-only — вхід працює, але Della дає лише назву й код компанії, телефону немає (як насправді з входом).
 // У полі сесії: будь-який рядок «a=b» → вхід працює; зі словом name / blind / expired / error → цей стан.
 const want = new URLSearchParams(location.search).get('demo');
-const sess = { state: DS_STATES.includes(want) ? want : want === 'name-only' ? 'alive' : 'none', nameOnly: want === 'name-only', checkedAt: now - 4 * 60e3, updatedAt: want && want !== 'none' ? now - 86400e3 : null };
+// ?demo=name-issues — вхід працює, а в списку є те, що не розв'язала міграція назв (як customers.list → nameKeyIssues)
+const sess = { state: DS_STATES.includes(want) ? want : want === 'name-only' || want === 'name-issues' ? 'alive' : 'none', nameOnly: want === 'name-only', checkedAt: now - 4 * 60e3, updatedAt: want && want !== 'none' ? now - 86400e3 : null };
 const custSeen = () => sess.state === 'alive';
 const view = (l) => (l.edited ? l : !custSeen() ? { ...l, phone: undefined, company: undefined, edrpou: undefined } : sess.nameOnly ? { ...l, phone: undefined } : l);
 // ключі замовника в демо — телефон і назва (лише те, що видно); запис списку збігається, якщо збігся хоч один ключ
@@ -1816,6 +1861,26 @@ demoAdd('black', [telOf(items[2].phone)], '+380 67 123 6789').note = 'не оп�
 Object.assign(demoAdd('black', ['tel:380509998877'], '050 999 88 77'), { note: 'додано вручну', createdAt: now - 3 * 86400e3 });
 Object.assign(demoAdd('black', ['tel:380631112233'], '063 111 22 33'), { note: 'зриває завантаження', createdAt: now - 5 * 86400e3 });
 Object.assign(demoAdd('black', [nameOf('ФОП Коваль')], 'ФОП Коваль'), { note: 'за назвою', createdAt: now - 86400e3 });
+let nameIssues = [];
+if (want === 'name-issues') {
+// та сама фірма двічі: чорний «ТОВ Альфа Транс» має ключ, білий «Альфа-Транс» лишився зі старим написанням
+const a1 = Object.assign(demoAdd('black', ['name:альфа транс'], 'ТОВ Альфа Транс'), { note: 'не платить' });
+const a2 = Object.assign(demoAdd('white', ['name:альфа-транс'], 'Альфа-Транс'), { note: 'давній клієнт' });
+// лише форма власності
+const e1 = Object.assign(demoAdd('black', ['name:приватне підприємство'], 'Приватне підприємство'), { note: 'зриває завантаження' });
+// без ключа: цей самий замовник уже записаний в іншому записі
+const k1 = Object.assign(demoAdd('black', ['name:бета логістик'], 'Бета Логістик'), { note: '' });
+const k2 = { id: custSeq++, list: 'white', label: 'ТОВ «Бета Логістик»', note: 'старий запис', keys: [], createdAt: now - 7 * 86400e3 };
+customers.push(k2);
+nameIssues = [
+{ kind: 'clash', key: 'name:альфа транс', winner: a1.id, ids: [a1.id, a2.id] },
+{ kind: 'empty', key: 'name:приватне підприємство', winner: null, ids: [e1.id] },
+{ kind: 'keyless', key: 'name:бета логістик', winner: null, ids: [k2.id, k1.id] },
+];
+}
+// як рушій: лише те, що досі стоїть (запис прибрали — позначка зникає)
+const demoIssues = () => nameIssues.filter((i) => i.ids.every((id) => customers.some((c) => c.id === id)))
+.map((i) => ({ kind: i.kind, key: i.key, winner: i.winner, entries: i.ids.map((id) => { const c = customers.find((x) => x.id === id); return { id: c.id, list: c.list, label: c.label }; }) }));
 let settings = { della: { searchUrls: ['https://della.com.ua/search/a204bd204eflolz1z21z3z4z51z6z7z8z9y1y2y3y4y5y6h0ilk0m1.html'], pollSeconds: 90, pagesPerPoll: 4 },
 filters: { minPrice: 8000, directOnly: true, bodies: [], fromRegions: [], toRegions: [], excludeRegions: [], stopWords: ['металобрухт'], maxAgeHours: 24 },
 lardi: { accounts: [{ name: 'Кілик В.', token: '••••4821', enabled: true, state: 'ok' }, { name: 'Друге Ларді', token: '', enabled: true, state: 'pending' }],
@@ -1840,7 +1905,7 @@ const r = visible().filter((l) => (sts ? sts.includes(l.status) : l.status !== '
 const offset = Math.max(0, Number(p.offset) || 0), limit = Math.max(1, Number(p.limit) || 500);
 return { items: r.slice(offset, offset + limit), total: r.length };
 },
-'customers.list': () => ({ items: clone(customers).map((c) => ({ ...c, loads: items.filter((l) => hits(c, l)).length, live: items.filter((l) => hits(c, l)).reduce((n, l) => n + l.lardi.filter((e) => e.id && e.status === 'published').length, 0) })), hiddenBlack: items.filter((l) => listOf(l) === 'black').length }),
+'customers.list': () => ({ items: clone(customers).map((c) => ({ ...c, loads: items.filter((l) => hits(c, l)).length, live: items.filter((l) => hits(c, l)).reduce((n, l) => n + l.lardi.filter((e) => e.id && e.status === 'published').length, 0) })), hiddenBlack: items.filter((l) => listOf(l) === 'black').length, nameKeyIssues: demoIssues() }),
 'customers.preview': (p) => {
 const l = p.loadId && items.find((x) => x.id === p.loadId);
 const t = String(p.text || '').trim();
