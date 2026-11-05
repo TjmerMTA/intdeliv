@@ -123,3 +123,40 @@ test('server: LARDI_TOKEN_* injected into empty settings, never logged', async (
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('server: рядок «della session» при старті — з того ж джерела, що й рушій (база → DELLA_COOKIE → без входу), без значення', async () => {
+  const DB_COOKIE = 'PHPSESSID=srvDbSess1on77; della_auth=srvDbAuthTok99';
+  const ENV_COOKIE = 'PHPSESSID=srvEnvSess1on55';
+  const parts = ['srvDbSess1on77', 'srvDbAuthTok99', 'srvEnvSess1on55'];
+  const line = (lines) => lines.filter((l) => l.startsWith('della session:'));
+  const clean = (lines) => assert.ok(!parts.some((p) => lines.join('\n').includes(p)), 'значення сесії в журналі сервера');
+
+  // без жодної
+  const a = await boot();
+  try { assert.deepEqual(line(a.lines), ['della session: anonymous']); } finally { await a.srv.stop('test'); }
+
+  // лише DELLA_COOKIE
+  const b = await boot({ DELLA_COOKIE: ENV_COOKIE });
+  try {
+    assert.deepEqual(line(b.lines), ['della session: DELLA_COOKIE (repository secret), last check: none']);
+    clean(b.lines);
+    // сесія в базі — через адмінку
+    const r = await b.rpc('della.session.set', { cookie: DB_COOKIE });
+    assert.equal(r.body.ok, true, r.body.error);
+  } finally { await b.srv.stop('test'); }
+
+  // перезапуск на тій самій базі: сесія з бази важливіша за DELLA_COOKIE, стан — з останньої перевірки
+  const c = await boot({ DB_PATH: join(b.dir, 'db.sqlite'), DELLA_COOKIE: ENV_COOKIE });
+  try {
+    assert.deepEqual(line(c.lines), ['della session: database (set in admin), last check: expired']);
+    clean(c.lines);
+  } finally { await c.srv.stop('test'); }
+
+  // DELLA_COOKIE, з якої рушій кукі не складе, — так і сказати
+  const d = await boot({ DELLA_COOKIE: 'justAValueWithoutName' });
+  try {
+    assert.deepEqual(line(d.lines), ['della session: anonymous (DELLA_COOKIE is set but is not a Cookie line, ignored)']);
+    assert.ok(!d.lines.join('\n').includes('justAValueWithoutName'));
+  } finally { await d.srv.stop('test'); }
+  for (const x of [a, b, c, d]) rmSync(x.dir, { recursive: true, force: true });
+});

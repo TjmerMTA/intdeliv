@@ -16,7 +16,7 @@ test('customerKeys: телефон, назва, порожньо; request_id к�
   for (const p of ['+38 (050) 123-45-67', '0501234567', '380501234567']) assert.deepEqual(customerKeys({ phone: p }), ['tel:380501234567']);
   assert.equal(phoneKey('12345'), '');
   assert.deepEqual(customerKeys({ company: 'ТОВ «Логістик-Плюс»' }), customerKeys({ company: 'логістик-плюс, тов' }));
-  assert.deepEqual(customerKeys({ company: 'ТОВ «Логістик-Плюс»' }), ['name:логістик-плюс']);
+  assert.deepEqual(customerKeys({ company: 'ТОВ «Логістик-Плюс»' }), ['name:логістик плюс']); // дефіс = пробіл (K2)
   assert.equal(normCompany('ТзОВ "Рога і Копита"'), 'рога і копита');
   assert.deepEqual(customerKeys({}), []);
   assert.deepEqual(customerKeys({ company: 'ФОП' }), [], 'загальна назва — не ключ');

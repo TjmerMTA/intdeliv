@@ -1,6 +1,9 @@
 // IntDeliv — хмарний рушій: збір Della → D1 → черга публікації на Lardi.
 // Порт extension/background.js без chrome.*: замість alarms — cron щохвилини, замість IndexedDB — D1.
-import { parseDellaSearchWithIds, buildPageUrl } from '../../extension/lib/della.js';
+import {
+  parseDellaSearch, parseDellaSearchWithIds, buildPageUrl, dellaLoginState, contactsCalls, contactsBody, parseDellaContacts,
+  CONTACTS_PATH, DELLA_ORIGIN,
+} from '../../extension/lib/della.js';
 import { applyFilters } from '../../extension/lib/filters.js';
 import { LardiClient, NeedsReviewError } from '../../extension/lib/lardi.js';
 import {
@@ -25,7 +28,9 @@ export function dellaSearchUrl(url, directOnly) {
 }
 
 export const DEFAULT_SETTINGS = {
-  della: { searchUrls: [DEFAULT_SEARCH_URL], pollSeconds: 60, pagesPerPoll: 3 },
+  // contacts — питати телефон за «Докладніше» (див. CONTACTS_PATH у della.js): Della вимагає капчу з браузера, тож
+  // вимкнено, доки власник не вирішить інакше
+  della: { searchUrls: [DEFAULT_SEARCH_URL], pollSeconds: 60, pagesPerPoll: 3, contacts: false },
   filters: {
     minPrice: 8000, directOnly: true, bodies: [], fromRegions: [], toRegions: [], excludeRegions: [],
     stopWords: [], maxAgeHours: 0,
@@ -91,10 +96,132 @@ export function mergeDefaults(s) {
   return out;
 }
 
-export function maskSettings(s) {
+/** Сесія Della в адмінці — лише ознаки, ніколи не значення. */
+const NO_SESSION = { set: false, state: 'none', checkedAt: null, updatedAt: null };
+
+export function maskSettings(s, session = NO_SESSION) {
   const m = clone(s);
   m.lardi.accounts = m.lardi.accounts.map((a, i) => ({ ...a, index: i, token: maskToken(a.token), hasToken: !!a.token, state: accountState(a) }));
+  m.della.session = { set: !!session.set, state: session.state, checkedAt: session.checkedAt ?? null, updatedAt: session.updatedAt ?? null };
   return m;
+}
+
+// ---------- сесія Della (кука залогіненого браузера клієнтки) ----------
+// Пароль із сервера не підходить (на вході Della reCAPTCHA v3) — лише кука з браузера, де клієнтка вже увійшла.
+// Зберігається тільки в базі (settings: SESSION_KEY), у журнал, відповіді RPC і помилки не потрапляє.
+
+const SESSION_KEY = 'della.session'; // {cookie, updatedAt, id}
+const SESSION_META = 'dellaSession'; // meta: {id, state, checkedAt, customerSeen, phoneSeen, message}
+const CONTACTS_META = 'dellaContacts'; // meta: {id, refused?, ok?, at} — що Della відповіла на запит контактів цієї сесії
+export const CONTACTS_PER_POLL = 10;
+const SESSION_STATES = ['none', 'alive', 'blind', 'expired', 'error'];
+const COOKIE_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+/**
+ * Сесія Della, як її вставляють із Chrome DevTools: заголовок цілком («Cookie: a=1; b=2»), лише його значення
+ * або одна пара «назва=значення». → рядок для заголовка Cookie; '' — очистити.
+ * Голого значення без назви не приймаємо: назви сесійної куки Della ми не знаємо, а вгадувати не можна.
+ * Значення в текст помилки не потрапляє.
+ */
+export function normalizeDellaCookie(raw) {
+  let t = String(raw ?? '').trim();
+  if (/^(["']).*\1$/s.test(t)) t = t.slice(1, -1).trim();
+  t = t.replace(/^cookie\s*:/i, '').trim();
+  if (!t) return '';
+  if (t.length > 8192) throw new Error('Сесія Della задовга — вставте лише рядок Cookie');
+  const out = [];
+  for (const part of t.split(/[;\r\n]+/).map((x) => x.trim()).filter(Boolean)) {
+    if (/[\u0000-\u001f\u007f]/.test(part)) throw new Error('У сесії Della недопустимі символи — скопіюйте рядок Cookie ще раз');
+    const i = part.indexOf('=');
+    if (i <= 0 || !COOKIE_NAME.test(part.slice(0, i).trim())) {
+      throw new Error('Вставте рядок Cookie з DevTools цілком («назва=значення; …»), а не лише значення');
+    }
+    out.push(`${part.slice(0, i).trim()}=${part.slice(i + 1).trim()}`);
+  }
+  return out.join('; ');
+}
+
+/**
+ * Прибрати з тексту значення куки — усю й кожне її значення окремо — для журналу й помилок.
+ * Короткі значення (< 8 символів: lang=uk, agree=true) секретом не є й не нищать решту тексту.
+ */
+export function scrubSecret(msg, cookie) {
+  let m = String(msg ?? '');
+  if (!cookie) return m;
+  const c = String(cookie);
+  const parts = [c, ...c.split(/;\s*/).flatMap((p) => [p, p.slice(p.indexOf('=') + 1)]).filter((x) => x.length >= 8)]
+    .sort((a, b) => b.length - a.length);
+  for (const x of parts) m = m.split(x).join('•••');
+  return m;
+}
+
+/** Рядок журналу на зміну стану сесії (раз, а не щоопитування). */
+const SESSION_LOG = {
+  alive: ['info', () => 'Della: вхід є, замовник у картці видно'],
+  blind: ['warn', () => 'Della: вхід є, але замовника в картці не видно — можливо, акаунт Della не верифікований'],
+  expired: ['warn', () => 'Della: сесія закінчилась або її не прийнято — Della відповідає як без входу, збір іде без замовника. Вставте нову в «Налаштування → Della»'],
+  error: ['warn', (i) => `Della: не вдалося перевірити сесію — ${i.reason || i.message}`],
+};
+
+/**
+ * Висновок про сторінку Della, взяту з сесією: {state, customerSeen, sample, message, reason?}.
+ * Доведено лише ознаки «без входу» (dellaLoginState); «вхід є» = цих ознак немає.
+ */
+export function judgeDellaPage(html, opts = {}) {
+  const none = { customerSeen: false, sample: null, has: null, phoneSeen: null, cards: null };
+  const login = dellaLoginState(html);
+  if (login === 'out') {
+    return { ...none, state: 'expired', message: 'Della відповіла як без входу — сесію не прийнято або вона закінчилась. Вставте нову.' };
+  }
+  const list = parseDellaSearch(html, opts);
+  if (!list.length) {
+    const reason = 'карток на сторінці немає — можливо, капча або змінилась верстка';
+    return { ...none, state: 'error', reason, message: `Della відповіла, але ${reason}.` };
+  }
+  const keyed = list.filter((c) => customerKeys(c).length);
+  // що саме дає Della — хоч в одній картці сторінки; cards — у скількох картках замовник є взагалі
+  const has = hasOf(list);
+  const cards = { withCustomer: keyed.length, total: list.length };
+  const seen = { has, phoneSeen: has.phone, cards, sample: null };
+  if (sessionVerdict(cards) === 'blind') {
+    const where = login === 'in' ? 'Вхід є' : 'Ознак виходу немає';
+    const tail = login === 'in' ? 'можливо, акаунт Della не верифікований' : 'можливо, акаунт не верифікований або змінилась верстка';
+    const message = keyed.length
+      ? `${where}, але замовника видно лише в ${keyed.length} з ${list.length} карток — схоже, це дані з тексту заявки, а не від Della; ${tail}.`
+      : `${where}, але замовника в картці не видно: у ${list.length} картках немає ні коду чи назви компанії, ні телефону, ні ЄДРПОУ — ${tail}.`;
+    return { ...seen, state: 'blind', customerSeen: false, message };
+  }
+  const c = keyed.find((x) => x.phone) || keyed[0];
+  const sample = {
+    company: c.company ?? null, phone: c.phone ?? null, edrpou: c.edrpou ?? null, dellaCompanyId: c.dellaCompanyId ?? null, has,
+  };
+  const who = [c.company, c.phone].filter(Boolean).join(', ') || (c.edrpou && `ЄДРПОУ ${c.edrpou}`) || `код Della ${c.dellaCompanyId}`;
+  return { ...seen, state: 'alive', customerSeen: true, sample, message: yieldsMessage(has, who, opts.contactsRefused, cards) };
+}
+
+/** Які ідентифікатори є хоч в одній картці: {phone, company, dellaCompanyId, edrpou}. */
+const hasOf = (list) => Object.fromEntries(IDS.map(([k]) => [k, list.some((x) => !!x[k])]));
+
+/**
+ * «Вхід працює» — лише коли замовника видно щонайменше в третині карток. Справжні дані Della стоять у розмітці
+ * кожної картки, а телефон, вписаний у текст заявки, — у поодиноких (H1: 1 з 25 — це не вхід).
+ */
+export function sessionVerdict({ withCustomer, total }) {
+  return withCustomer > 0 && withCustomer * 3 >= total ? 'alive' : 'blind';
+}
+
+const IDS = [['phone', 'телефон'], ['company', 'назву компанії'], ['dellaCompanyId', 'код компанії Della'], ['edrpou', 'ЄДРПОУ']];
+const listUk = (xs) => (xs.length > 1 ? `${xs.slice(0, -1).join(', ')} і ${xs[xs.length - 1]}` : xs[0] || '');
+
+/** Одне речення для клієнтки: що дає Della і як тоді блокувати (у живому чорному списку — самі телефони). */
+function yieldsMessage(has, who, contactsRefused, cards) {
+  const yes = IDS.filter(([k]) => has[k]).map(([, t]) => t);
+  const eg = ` (замовника видно в ${cards.withCustomer} з ${cards.total} карток${who ? `; приклад: ${who}` : ''})`;
+  if (has.phone && has.company) return `Вхід працює: Della дає ${listUk(yes)} — чорний список спрацює і за телефоном, і за назвою${eg}.`;
+  if (has.phone) return `Вхід працює: Della дає ${listUk(yes)}, але не назву компанії — блокуйте за телефоном${eg}.`;
+  const how = has.company ? 'за назвою' : has.edrpou ? 'за ЄДРПОУ' : 'кнопкою з картки заявки';
+  const more = contactsRefused ? ', а за «Докладніше» Della його серверу не віддає (потрібні капча й верифікація)' : '';
+  return `Вхід працює, але Della дає лише ${listUk(yes)} — блокуйте ${how}, телефон у картці не видно${more}${eg}.`;
 }
 
 const num = (v, dflt, min, max = Infinity) => {
@@ -135,6 +262,14 @@ export class Engine {
     this.sleep = opts.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.budgetMs = opts.budgetMs ?? RUN_BUDGET_MS;
     this.store = new Store(env.DB, this.now);
+    // значення сесій Della, відомі цьому запуску, — вичищаються з журналу й помилок
+    this.secrets = new Set(env && env.DELLA_COOKIE ? [String(env.DELLA_COOKIE)] : []);
+  }
+
+  scrub(msg) {
+    let m = String(msg ?? '');
+    for (const c of this.secrets) m = scrubSecret(m, c);
+    return m;
   }
 
   /** Міграція схеми (додає колонку й заповнює її) — перед першим зверненням до заявок. */
@@ -154,7 +289,8 @@ export class Engine {
     return safe;
   }
 
-  async log(level, msg) {
+  async log(level, raw) {
+    const msg = this.scrub(raw);
     try { await this.store.addLog(level, msg); } catch (e) { console.warn('log failed', e); }
     (level === 'error' ? console.error : level === 'warn' ? console.warn : console.log)('[IntDeliv]', msg);
   }
@@ -176,6 +312,7 @@ export class Engine {
       }
       if (p.pollSeconds !== undefined) next.della.pollSeconds = num(p.pollSeconds, cur.della.pollSeconds, 30, 3600);
       if (p.pagesPerPoll !== undefined) next.della.pagesPerPoll = Math.round(num(p.pagesPerPoll, cur.della.pagesPerPoll, 1, 20));
+      if (p.contacts !== undefined) next.della.contacts = !!p.contacts;
     }
     if (patch.filters) {
       const p = patch.filters;
@@ -229,10 +366,201 @@ export class Engine {
         await this.checkAccount(i);
       }
     }
+    if (!!next.della.contacts !== !!cur.della.contacts) {
+      await this.log('info', next.della.contacts ? 'Della: увімкнено запит телефону за «Докладніше» (до 10 за збір, лише нові заявки)' : 'Della: запит телефону за «Докладніше» вимкнено');
+    }
     if (next.lardi.dryRun !== cur.lardi.dryRun) {
       await this.log('info', next.lardi.dryRun ? 'Увімкнено DRY RUN — на Lardi нічого не публікується' : 'DRY RUN вимкнено — публікація на Lardi увімкнена');
     }
-    return maskSettings(await this.getSettings());
+    return this.maskedSettings();
+  }
+
+  /** Налаштування для адмінки: токени — ••••XXXX, сесія Della — лише {set, state, checkedAt, updatedAt}. */
+  async maskedSettings(sIn) {
+    const s = sIn || (await this.getSettings());
+    const [raw, st] = await Promise.all([this.store.getKV(SESSION_KEY, null), this.dellaSessionState()]);
+    const stored = !!(raw && raw.cookie);
+    return maskSettings(s, { set: stored, state: st.state, checkedAt: st.checkedAt, updatedAt: stored ? raw.updatedAt || null : null });
+  }
+
+  // ---------- сесія Della ----------
+
+  /** Діюча сесія: з адмінки (база) → DELLA_COOKIE → null (без входу). {cookie, id, stored} */
+  async dellaSession() {
+    const raw = await this.store.getKV(SESSION_KEY, null);
+    let sess = null;
+    if (raw && raw.cookie) sess = { cookie: String(raw.cookie), id: raw.id || String(raw.updatedAt || ''), stored: true };
+    else if (this.env && this.env.DELLA_COOKIE) {
+      let cookie = '';
+      try { cookie = normalizeDellaCookie(this.env.DELLA_COOKIE); } catch { /* непридатна — як без неї */ }
+      if (cookie) sess = { cookie, id: 'env', stored: false };
+    }
+    if (sess) this.secrets.add(sess.cookie);
+    return sess;
+  }
+
+  /** Збережений стан сесії без запиту до Della: {state, checkedAt, customerSeen, has, phoneSeen, cards}. */
+  async dellaSessionState(sessIn) {
+    const sess = sessIn === undefined ? await this.dellaSession() : sessIn;
+    const m = sess ? await this.store.getMeta(SESSION_META, null) : null;
+    if (!m || m.id !== sess.id || !SESSION_STATES.includes(m.state)) {
+      return { state: 'none', checkedAt: null, customerSeen: false, has: null, phoneSeen: null, cards: null };
+    }
+    return {
+      state: m.state, checkedAt: m.checkedAt ?? null, customerSeen: !!m.customerSeen,
+      has: m.has || null, phoneSeen: typeof m.phoneSeen === 'boolean' ? m.phoneSeen : null, cards: m.cards || null,
+    };
+  }
+
+  /**
+   * Записати стан сесії (після перевірки чи збору); рядок журналу — лише коли стан змінився.
+   * Збір зі старою сесією, що закінчився вже після збереження нової, стану нової не чіпає (id).
+   */
+  async noteDellaSession(id, info) {
+    const cur = await this.dellaSession();
+    if (!cur || cur.id !== id) return null;
+    const prev = await this.store.getMeta(SESSION_META, null);
+    const was = prev && prev.id === id ? prev.state : 'none';
+    const noPhone = info.state === 'alive' && info.phoneSeen === false;
+    await this.store.setMeta(SESSION_META, {
+      id, state: info.state, checkedAt: this.now(), customerSeen: !!info.customerSeen,
+      has: info.has || null, phoneSeen: typeof info.phoneSeen === 'boolean' ? info.phoneSeen : null, cards: info.cards || null,
+      message: info.message,
+    });
+    const line = SESSION_LOG[info.state];
+    if (was !== info.state && line) await this.log(line[0], line[1](info));
+    // у живому чорному списку самі телефони: замовник без телефону = ці записи не спрацюють — сказати раз
+    if (noPhone && !(was === 'alive' && prev.phoneSeen === false)) {
+      await this.log('warn', 'Della: у картках немає телефону — записи чорного списку за телефоном не спрацюють, додавайте замовника за назвою компанії');
+    }
+    return info;
+  }
+
+  /** Перевірка: ОДНА сторінка першого пошуку з сесією → {state, customerSeen, sample, cards, message}. */
+  async checkDellaSession() {
+    const sess = await this.dellaSession();
+    if (!sess) {
+      return { state: 'none', customerSeen: false, sample: null, cards: null, message: 'Сесію Della не задано — збір іде без входу, замовника в заявках не видно.' };
+    }
+    const s = await this.getSettings();
+    const url = buildPageUrl(dellaSearchUrl(s.della.searchUrls[0], s.filters.directOnly), 0);
+    let r;
+    try {
+      const cm = await this.store.getMeta(CONTACTS_META, null);
+      const contactsRefused = !!(cm && cm.id === sess.id && cm.refused);
+      r = judgeDellaPage(await this.fetchDella(url, sess), { url, now: kyivWall(this.now()), contactsRefused });
+    } catch (e) {
+      const reason = this.scrub(e.message || e);
+      r = { state: 'error', customerSeen: false, sample: null, cards: null, reason, message: `Не вдалося перевірити сесію: ${reason}.` };
+    }
+    await this.noteDellaSession(sess.id, r);
+    return { state: r.state, customerSeen: r.customerSeen, sample: r.sample, cards: r.cards, message: this.scrub(r.message) };
+  }
+
+  /** Зберегти (і одразу перевірити) або стерти сесію. → {state} */
+  async setDellaSession(raw) {
+    const cookie = normalizeDellaCookie(raw);
+    const had = await this.store.getKV(SESSION_KEY, null);
+    await this.store.setMeta(SESSION_META, null);
+    if (!cookie) {
+      await this.store.setKV(SESSION_KEY, null);
+      // запасна DELLA_COOKIE (секрет репозиторію) лишається в ділі — кажемо це й одразу перевіряємо саме її
+      const fallback = await this.dellaSession();
+      if (had && had.cookie) {
+        await this.log('info', fallback
+          ? 'Della: сесію з адмінки видалено — далі вхід із запасної DELLA_COOKIE (секрет репозиторію); прибрати її може лише власник у GitHub'
+          : 'Della: сесію видалено — збір іде без входу');
+      }
+      return { state: fallback ? (await this.checkDellaSession()).state : 'none' };
+    }
+    this.secrets.add(cookie);
+    const now = this.now();
+    await this.store.setKV(SESSION_KEY, { cookie, updatedAt: now, id: `${now}-${Math.random().toString(36).slice(2, 8)}` });
+    await this.log('info', 'Della: збережено нову сесію — перевіряю');
+    return { state: (await this.checkDellaSession()).state };
+  }
+
+  /**
+   * Стан сесії за сторінками одного збору: усі «без входу» — expired; є картки — alive/blind за замовником;
+   * карток немає (капча, верстка) — судити нема з чого, стан не міняємо. pages: [{login, cards, withCustomer}]
+   */
+  async notePollSession(sess, pages) {
+    if (!pages.length) return null;
+    const inPages = pages.filter((p) => p.login !== 'out');
+    if (!inPages.length) return this.noteDellaSession(sess.id, { state: 'expired', customerSeen: false });
+    const cards = { withCustomer: inPages.reduce((n, p) => n + p.withCustomer, 0), total: inPages.reduce((n, p) => n + p.cards, 0) };
+    if (!cards.total) return null;
+    const has = Object.fromEntries(IDS.map(([k]) => [k, inPages.some((p) => p.has[k])]));
+    const state = sessionVerdict(cards);
+    return this.noteDellaSession(sess.id, { state, customerSeen: state === 'alive', has, phoneSeen: has.phone, cards });
+  }
+
+  /** POST на Della з сесією (запит контактів) → JSON або null (не JSON). */
+  async postDella(path, body, sess) {
+    const headers = {
+      ...BROWSER_HEADERS,
+      Accept: 'application/json, text/javascript, */*; q=0.01',
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      'X-Requested-With': 'XMLHttpRequest',
+      Origin: DELLA_ORIGIN,
+      Referer: DELLA_ORIGIN + '/',
+      Cookie: sess.cookie,
+    };
+    let res;
+    try {
+      res = await this.fetch(DELLA_ORIGIN + path, { method: 'POST', headers, body });
+    } catch (e) {
+      throw new Error(`Della: ${scrubSecret((e && e.message) || String(e), sess.cookie)} для ${path}`);
+    }
+    if (!res.ok) throw new Error(`Della ${res.status} для ${path}`);
+    const text = await res.text();
+    try { return JSON.parse(text); } catch { return null; }
+  }
+
+  /**
+   * Телефон за «Докладніше» для НОВИХ заявок без телефону (della.contacts, сесія прийнята). Жорсткі межі: один запит
+   * на нову заявку (повторів немає — наступного збору вона вже не нова), не більше CONTACTS_PER_POLL за збір,
+   * послідовно; перша відмова Della (капча, доступ, незрозуміла відповідь) зупиняє запити до збереження нової сесії.
+   * Чорного замовника, що виявився за телефоном, одразу ховаємо — у чергу він не стає. → {asked, phones, refused}
+   */
+  async fetchContacts(sess, loads, calls, s) {
+    const prev = await this.store.getMeta(CONTACTS_META, null);
+    if (prev && prev.id === sess.id && prev.refused) return { asked: 0, phones: 0, refused: prev.refused };
+    let asked = 0; let phones = 0; let refused = null;
+    for (const l of loads) {
+      if (asked >= CONTACTS_PER_POLL) break;
+      const call = calls.get(l.dellaRequestId);
+      if (!call || customerKeys(l).some((k) => k.startsWith('tel:'))) continue;
+      asked++;
+      let r;
+      try {
+        r = parseDellaContacts(await this.postDella(CONTACTS_PATH, contactsBody(call), sess));
+      } catch (e) {
+        // 403/429/5xx чи мережа — теж відмова: повторювати з сесією клієнтки щозбору не можна
+        r = { refused: 'http', desc: this.scrub(e.message || e).slice(0, 200) };
+      }
+      if (r.refused) { refused = r; break; }
+      if (!r.phone && !r.edrpou) continue;
+      const next = await this.store.updateLoad(l.id, (x) => ({
+        ...x, ...(x.phone ? {} : r.phone ? { phone: r.phone } : {}), ...(x.edrpou ? {} : r.edrpou ? { edrpou: r.edrpou } : {}),
+      }));
+      if (r.phone) phones++;
+      if (await this.isBlackLoad(next)) await this.markInactive(l.id, BLACK_REASON, 'blacklist', s);
+    }
+    if (refused) {
+      const why = {
+        captcha: 'Della вимагає капчу з браузера',
+        access: `«${refused.desc || 'Обмеження доступу до інформації'}» — потрібна верифікація акаунта`,
+        format: 'незрозуміла відповідь',
+        http: `помилка запиту: ${refused.desc}`,
+      }[refused.refused];
+      await this.store.setMeta(CONTACTS_META, { id: sess.id, refused: refused.refused, at: this.now() });
+      await this.log('warn', `Della: телефон за «Докладніше» не віддала (${why}) — запити контактів для цієї сесії зупинено; блокуйте за назвою компанії`);
+    } else if (phones && !(prev && prev.id === sess.id && prev.ok)) {
+      await this.store.setMeta(CONTACTS_META, { id: sess.id, ok: true, at: this.now() });
+      await this.log('info', 'Della: телефон за «Докладніше» отримано — чорний список за телефоном працює');
+    }
+    return { asked, phones, refused: refused ? refused.refused : null };
   }
 
   /** Перевірити токен акаунта й записати стан (ok / invalid). Повертає результат LardiClient.test(). */
@@ -319,7 +647,7 @@ export class Engine {
 
   async getStatus() {
     const s = await this.getSettings();
-    const [counts, today, lastPollAt, lastError, lastPollOkAt, busy, accounts] = await Promise.all([
+    const [counts, today, lastPollAt, lastError, lastPollOkAt, busy, accounts, sess, custCoverage] = await Promise.all([
       this.store.countByStatus(STATUSES),
       this.getToday(s.lardi.accounts.length),
       this.store.getMeta('lastPollAt', null),
@@ -327,6 +655,8 @@ export class Engine {
       this.store.getMeta('lastPollOkAt', null),
       this.store.lockActive(),
       this.accountsStats(s),
+      this.dellaSessionState(),
+      this.store.custCoverage(),
     ]);
     return {
       running: true,
@@ -344,6 +674,12 @@ export class Engine {
       autoPublish: s.lardi.autoPublish,
       mode: s.lardi.mode,
       accounts,
+      // з останньої перевірки чи збору — без запиту до Della (адмінці не треба щоразу кликати check)
+      della: {
+        session: sess.state, checkedAt: sess.checkedAt, customerSeen: sess.customerSeen,
+        has: sess.has, phoneSeen: sess.phoneSeen, cards: sess.cards,
+      },
+      custCoverage, // {withCustomer, total}: у скількох заявок є замовник — без нього чорний список сліпий
       version: VERSION,
       archiveDays: ARCHIVE_DAYS,
     };
@@ -391,21 +727,32 @@ export class Engine {
 
   // ---------- збір Della ----------
 
-  async fetchDella(url) {
-    // DELLA_COOKIE — сесія залогіненого акаунта Della (тоді в картках є код компанії). Значення ніде не логується.
-    const cookie = this.env && this.env.DELLA_COOKIE ? String(this.env.DELLA_COOKIE).trim() : '';
-    const headers = cookie ? { ...BROWSER_HEADERS, Cookie: cookie } : BROWSER_HEADERS;
-    const res = await this.fetch(url, { headers, redirect: 'follow' });
+  /**
+   * Сторінка Della. Сесія (тоді в картках є замовник): з адмінки → DELLA_COOKIE → без входу.
+   * sess — уже визначена сесія (один збір — одна сесія на всі сторінки) або null. Значення ніде не логується.
+   */
+  async fetchDella(url, sessIn) {
+    const sess = sessIn === undefined ? await this.dellaSession() : sessIn;
+    const headers = sess ? { ...BROWSER_HEADERS, Cookie: sess.cookie } : BROWSER_HEADERS;
+    let res;
+    try {
+      res = await this.fetch(url, { headers, redirect: 'follow' });
+    } catch (e) {
+      // undici пише значення невірного заголовка в текст помилки — вичищаємо
+      throw new Error(`Della: ${scrubSecret((e && e.message) || String(e), sess && sess.cookie)} для ${url}`);
+    }
     if (!res.ok) throw new Error(`Della ${res.status} для ${url}`);
     return res.text();
   }
 
-  filterVerdict(p, f) {
+  /** Фільтри + чорний список (isBlack(p) — за будь-яким ключем: код, ЄДРПОУ, телефон чи назва). */
+  filterVerdict(p, f, isBlack = () => false) {
     // дата — за Києвом; maxAgeHours рахуємо від реального часу
     const v = applyFilters(p, { ...f, maxAgeHours: 0 }, kyivWall(this.now()));
     if (!v.pass) return v;
     const maxAge = Number(f.maxAgeHours) || 0;
     if (maxAge > 0 && p.postedAt && this.now() - p.postedAt > maxAge * 3600e3) return { pass: false, reason: `старша за ${maxAge} год` };
+    if (isBlack(p)) return { pass: false, reason: BLACK_REASON };
     return v;
   }
 
@@ -421,9 +768,12 @@ export class Engine {
       for (const searchUrl of s.della.searchUrls) {
         for (let page = 0; page < s.della.pagesPerPoll; page++) jobs.push({ url: buildPageUrl(dellaSearchUrl(searchUrl, s.filters.directOnly), page), page });
       }
-      const pages = await Promise.allSettled(jobs.map((j) => this.fetchDella(j.url)));
+      const sess = await this.dellaSession();
+      const pages = await Promise.allSettled(jobs.map((j) => this.fetchDella(j.url, sess)));
       const byId = new Map();
       const wall = kyivWall(now);
+      const sessPages = []; // що показала Della з сесією: [{login, cards, withCustomer, has}]
+      const contactCalls = new Map(); // dellaRequestId → поля запиту контактів (лише з сесією й della.contacts)
       for (let i = 0; i < jobs.length; i++) {
         const r = pages[i];
         if (r.status === 'rejected') {
@@ -436,16 +786,20 @@ export class Engine {
           await this.log('warn', `Della: карток не знайдено (${jobs[i].url}) — можливо, змінилась верстка, капча або блокування IP`);
         }
         for (const p of parsed) if (!byId.has(p.id)) byId.set(p.id, p);
+        if (sess) {
+          const login = dellaLoginState(r.value);
+          const keys = parsed.map((p) => customerKeys(p));
+          sessPages.push({ login, cards: parsed.length, withCustomer: keys.filter((k) => k.length).length, has: hasOf(parsed) });
+          if (s.della.contacts && login !== 'out') for (const [rid, call] of contactsCalls(r.value)) contactCalls.set(rid, call);
+        }
       }
+      if (sess) await this.notePollSession(sess, sessPages);
       const parsed = [...byId.values()];
       seen = parsed.length;
       const black = await this.store.keysOfList('black');
       const isBlack = (l) => black.size > 0 && customerKeys(l).some((k) => black.has(k));
       const verdict = new Map();
-      for (const p of parsed) {
-        const v = this.filterVerdict(p, s.filters);
-        verdict.set(p.id, v.pass && isBlack(p) ? { pass: false, reason: BLACK_REASON } : v);
-      }
+      for (const p of parsed) verdict.set(p.id, this.filterVerdict(p, s.filters, isBlack));
       const res = await this.store.upsertSeen(parsed, (p) => verdict.get(p.id).pass, now);
       const updatedIds = new Set(res.updated.map((u) => u.after.id));
       for (const p of parsed) {
@@ -457,6 +811,7 @@ export class Engine {
         }
       }
       inserted = res.inserted.length;
+      if (sess && contactCalls.size && inserted) await this.fetchContacts(sess, res.inserted, contactCalls, s);
       for (const u of res.updated) {
         if (u.after.dellaDeleted && !u.before.dellaDeleted) {
           await this.markInactive(u.after.id, 'видалена на Della', 'deleted_on_della', s);
@@ -693,6 +1048,8 @@ export class Engine {
     const today = kyivDay(this.now());
     // якщо збір ще жодного разу не вдався — «не видно в Della» не рахуємо
     const seenBefore = lastOk ? lastOk - staleMs : -1;
+    // чорний список — і до заявок, чий замовник став відомий після збору; їхні живі публікації знімає добір нижче
+    await this.catchUpBlack(s);
     // спершу добір того, що не вдалося зняти раніше; щойно неактуальні знімаються в markInactive нижче
     await this.sweepLardi(s);
     const cands = await this.store.staleCandidates(['new', 'queued', 'published', 'needs_review', 'error'], today, seenBefore, 200);
@@ -711,11 +1068,11 @@ export class Engine {
   /**
    * Добір зняття з Lardi: неактуальні й чорні заявки з живими публікаціями (попереднє зняття впало — 503, мережа).
    * Не більше limit публікацій за прохід, пакетами по акаунтах; акаунт зі збоєм у цьому проході далі не чіпаємо.
-   * Знята публікація стає removed — повторно не знімається.
+   * Знята публікація стає removed — повторно не знімається. rowsIn — готові рядки {id, lardi[]} (customers.reapply).
    */
-  async sweepLardi(s, limit = SWEEP_LIMIT) {
+  async sweepLardi(s, limit = SWEEP_LIMIT, rowsIn = null) {
     // заявок беремо із запасом: публікації акаунтів без токена пропускаються й не мають забирати ліміт
-    const rows = await this.store.pendingRemovals(limit * 10);
+    const rows = rowsIn || (await this.store.pendingRemovals(limit * 10));
     const byAcc = new Map(); // account → [[loadId, lardiId]]
     const seen = new Set();
     for (const r of rows) {
@@ -764,10 +1121,16 @@ export class Engine {
   // ---------- RPC ----------
 
   async rpc(method, p = {}) {
-    const h = this.handlers[method];
-    if (!h) throw new Error(`невідомий метод ${method}`);
+    // лише власні обробники: valueOf / constructor / __proto__ з Object.prototype віддали б увесь рушій разом з env
+    const h = typeof method === 'string' && Object.hasOwn(this.handlers, method) ? this.handlers[method] : null;
+    if (typeof h !== 'function') throw new Error(`невідомий метод ${method}`);
     await this.ready();
-    return h.call(this, p || {});
+    try {
+      return await h.call(this, p || {});
+    } catch (e) {
+      if (e && e.message && this.secrets.size) e.message = this.scrub(e.message);
+      throw e;
+    }
   }
 
   // ---------- чорний / білий список ----------
@@ -792,11 +1155,14 @@ export class Engine {
     return { keys, label: f.name || f.phone || f.edrpou || f.dellaId };
   }
 
-  /** Чорний список: зняти з Lardi живі публікації й приховати заявки. Повторно не знімає вже знятих. */
-  async applyBlack(keys, s) {
+  /**
+   * Чорний список: зняти з Lardi живі публікації й приховати заявки. Повторно не знімає вже знятих.
+   * rows — готові легкі рядки замість пошуку за keys; remove: false — лише приховати (зніме sweepLardi пакетами).
+   */
+  async applyBlack(keys, s, { rows, remove = true } = {}) {
     let hidden = 0; let removed = 0; let failed = 0;
-    for (const r of await this.store.loadsByKeys(keys)) {
-      const live = r.lardi.filter((e) => e.id && e.status === 'published');
+    for (const r of rows || (await this.store.loadsByKeys(keys))) {
+      const live = remove ? r.lardi.filter((e) => e.id && e.status === 'published') : [];
       if (live.length) {
         const after = await this.removeFromLardi(r.id, s);
         for (const e of (after && after.lardi) || []) {
@@ -813,6 +1179,22 @@ export class Engine {
       if (changed) hidden++;
     }
     return { hidden, removed, failed };
+  }
+
+  /**
+   * Догін чорного списку (staleCheck): робочі заявки замовника з чорного списку, до яких список не застосовано, —
+   * замовник став відомий після збору (з'явилась сесія Della, повторний збір дописав телефон/компанію).
+   * Не більше limit за прохід; приховані більше не кандидати — кожна заявка лише раз. Живі публікації знімає
+   * sweepLardi тим самим проходом, пакетами.
+   */
+  async catchUpBlack(s, limit = SWEEP_LIMIT) {
+    const rows = await this.store.blackPending({ active: true, limit });
+    if (!rows.length) return { hidden: 0 };
+    const { hidden } = await this.applyBlack(null, s, { rows, remove: false });
+    if (hidden) {
+      await this.log('info', `Чорний список: догнано ${hidden} заявок — замовник став відомий після збору${rows.length >= limit ? ` (по ${limit} за прохід, решта — наступним)` : ''}`);
+    }
+    return { hidden };
   }
 
   /** Після зняття з чорного списку: актуальні — у new (+ черга), минулі — лишаються в архіві. */
@@ -986,7 +1368,7 @@ Engine.prototype.handlers = {
     return { ok: true };
   },
 
-  async 'settings.get'() { return maskSettings(await this.getSettings()); },
+  async 'settings.get'() { return this.maskedSettings(); },
   async 'settings.set'(p) { return this.setSettings(p || {}); },
   async 'status.get'() { return this.getStatus(); },
 
@@ -1091,6 +1473,20 @@ Engine.prototype.handlers = {
     return c;
   },
 
+  /**
+   * Застосувати чорний список до всіх заявок, що вже в базі (замовника внесли чи побачили після збору):
+   * приховати (applyBlack) і зняти живі публікації пакетами по 50 (sweepLardi) — не по одній, щоб не впертися в час відповіді.
+   * Що не вдалося зняти — добере staleCheck.
+   */
+  async 'customers.reapply'() {
+    const s = await this.getSettings();
+    const rows = await this.store.blackPending();
+    const { hidden } = await this.applyBlack(null, s, { rows, remove: false });
+    const { removed, failed } = await this.sweepLardi(s, Infinity, rows);
+    await this.log('info', `Чорний список: застосовано до наявних заявок — приховано ${hidden}, знято з Lardi ${removed}${failed ? `, не вдалося зняти ${failed}` : ''}`);
+    return { hidden, removed, failed };
+  },
+
   async 'customers.remove'({ id } = {}) {
     const c = await this.store.removeCustomer(id);
     if (!c) throw new Error('замовника не знайдено');
@@ -1099,6 +1495,14 @@ Engine.prototype.handlers = {
     await this.log('info', `${c.list === 'black' ? 'Чорний список' : 'Обрані'}: прибрано «${c.label || c.keys[0]}»${r.restored ? `, повернуто заявок ${r.restored}` : ''}`);
     return r;
   },
+
+  // ---------- сесія Della ----------
+
+  /** {cookie} — рядок Cookie з DevTools (порожньо — стерти). → {state}. Значення не повертається ніколи. */
+  async 'della.session.set'({ cookie } = {}) { return this.setDellaSession(cookie); },
+
+  /** Одна сторінка Della з сесією → {state, customerSeen, sample, message}. */
+  async 'della.session.check'() { return this.checkDellaSession(); },
 
   async 'log.list'({ limit = 200 } = {}) { return this.store.listLog(Math.min(2000, Number(limit) || 200)); },
 };

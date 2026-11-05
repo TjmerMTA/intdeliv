@@ -34,6 +34,19 @@ async function injectTokens(env, cfg, log) {
   if (changed) await engine.store.setKV('settings', s);
 }
 
+/**
+ * Рядок про вхід у Della — з того самого джерела, що й рушій (Engine.dellaSession: база → DELLA_COOKIE → без входу)
+ * і зі станом останньої перевірки чи збору (без запиту до Della). Значення сесії не друкується жодним шматком.
+ */
+export async function dellaSessionLine(engine, env) {
+  const sess = await engine.dellaSession();
+  if (!sess) {
+    return `della session: anonymous${env.DELLA_COOKIE ? ' (DELLA_COOKIE is set but is not a Cookie line, ignored)' : ''}`;
+  }
+  const { state } = await engine.dellaSessionState(sess);
+  return `della session: ${sess.stored ? 'database (set in admin)' : 'DELLA_COOKIE (repository secret)'}, last check: ${state}`;
+}
+
 function toRequest(req, port) {
   const headers = new Headers();
   for (const [k, v] of Object.entries(req.headers)) {
@@ -79,12 +92,13 @@ export async function startServer({ env: cfg = process.env, fetchImpl, log = def
   if (cfg.DELLA_COOKIE) env.DELLA_COOKIE = String(cfg.DELLA_COOKIE);
   if (fetchImpl) env.__engineOpts = { fetch: fetchImpl };
   if (!env.ADMIN_KEY) log('warn: ADMIN_KEY is not set — admin RPC will answer 401');
-  log(`della session: ${env.DELLA_COOKIE ? 'cookie set' : 'anonymous'}`);
   // міграція схеми до першого запиту (лише додає колонку/таблиці — наявні дані не змінюються)
   const loadsBefore = (await db.prepare('SELECT COUNT(*) AS n FROM loads').first()).n;
-  await makeEngine(env, null).ready();
+  const engine = makeEngine(env, null);
+  await engine.ready();
   const loadsAfter = (await db.prepare('SELECT COUNT(*) AS n FROM loads').first()).n;
   log(`migrate: ok, loads ${loadsBefore} → ${loadsAfter}`);
+  log(await dellaSessionLine(engine, env));
   await injectTokens(env, cfg, log);
 
   const inflight = new Set();

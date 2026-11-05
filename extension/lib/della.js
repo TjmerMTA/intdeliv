@@ -114,16 +114,62 @@ export function parsePrice(priceHtml) {
   return { price, currency };
 }
 
+const PHONE_RE = /\+?38\s?\(?0\d{2}\)?[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}/g;
+
+/**
+ * Чи віддала Della сторінку як залогіненому: 'out' | 'in' | 'unknown'.
+ * Доведено лише ознаки «без входу» (анонімна видача, tests/fixtures/della-search.html, і жива 05.11.2026):
+ * у шапці <div id="unlogged_div" style="display:block;"> із кнопкою «Вхід», а «Докладніше» в картці —
+ * onclick="register();". Залогіненої сторінки ми не бачили, тож 'in' — це «блок без входу є, але схований»;
+ * якщо немає жодної з ознак — 'unknown' (верстку змінили, капча тощо), а не здогадка.
+ */
+export function dellaLoginState(html) {
+  const h = String(html || '');
+  const head = h.match(/<div\b[^>]*\bid=["']unlogged_div["'][^>]*>/i);
+  if (head) {
+    const style = (head[0].match(/\bstyle=["']([^"']*)["']/i) || [])[1] || '';
+    return /display\s*:\s*none/i.test(style) ? 'in' : 'out';
+  }
+  if (/class=["']show_request_info_btn["'][^>]*\bonclick=["']\s*register\(/i.test(h)) return 'out';
+  return 'unknown';
+}
+
+/**
+ * Код і назва компанії поза карткою: JS Della («сховати компанію», hideRequestOrCompany, живий 05.11.2026) бере їх
+ * з елемента #hide_request_or_company_hidden_<request_code> атрибутами data-company-code / data-company-name;
+ * request_code = data-request_id картки. На анонімній сторінці цих елементів немає. → Map(request_code → {code, name})
+ */
+function hiddenCompanies(html) {
+  const out = new Map();
+  for (const m of html.matchAll(/<[a-z]+\b[^>]*\bid=["']hide_request_or_company_hidden_([^"']+)["'][^>]*>/gi)) {
+    const code = (m[0].match(/data-company-code=["']([\w-]+)["']/i) || [])[1];
+    const name = (m[0].match(/data-company-name="([^"]*)"/i) || m[0].match(/data-company-name='([^']*)'/i) || [])[1];
+    if (code || name) out.set(m[1], { code, name });
+  }
+  return out;
+}
+
+/** Що йде одразу після списку карток (фікстура й жива сторінка 05.11.2026; усередині карток не трапляється). */
+const AFTER_LIST = ['is_subscription_pending', 'id="deny_info"', 'class="pages"', 'class="footer'];
+
 /** Ищем все карточки: возвращает [{start, end, html, tail}] */
 function splitCards(html) {
   const re = /<div class="request_card(\s[^"]*)?"\s+data-request_id="([^"]*)"/g;
   const starts = [];
   let m;
   while ((m = re.exec(html))) starts.push({ index: m.index, cls: m[1] || '', rid: m[2] });
+  let longest = 0;
   return starts.map((s, i) => {
     const next = i + 1 < starts.length ? starts[i + 1].index : html.length;
     const seg = html.slice(s.index, next);
-    const cut = seg.indexOf('requests_cards_delimiter');
+    let cut = seg.indexOf('requests_cards_delimiter');
+    // остання картка без роздільника: інакше до неї потрапив би низ сторінки (телефони, data-company-* інших карток)
+    if (cut < 0 && i === starts.length - 1) {
+      cut = Math.min(...AFTER_LIST.map((k) => seg.indexOf(k)).filter((x) => x > 0), seg.length);
+      // маркерів немає (змінилась верстка) — не довше за найдовшу попередню картку вдвічі
+      if (cut === seg.length && longest) cut = Math.min(cut, longest * 2);
+    }
+    if (i < starts.length - 1) longest = Math.max(longest, cut > 0 ? cut : seg.length);
     return {
       cls: s.cls,
       rid: s.rid,
@@ -153,8 +199,11 @@ export function parseDellaSearch(html, opts = {}) {
   const now = opts.now instanceof Date ? opts.now : new Date(opts.now || Date.now());
   const dellaUrl = opts.url;
   const out = [];
-  for (const card of splitCards(String(html || ''))) {
+  const page = String(html || '');
+  const hidden = page.includes('hide_request_or_company_hidden_') ? hiddenCompanies(page) : new Map();
+  for (const card of splitCards(page)) {
     const c = card.html;
+    const hid = hidden.get(card.rid) || {};
     const { dateFrom, dateTo } = parseDateRange(inner(c, 'date_add'), now);
 
     // маршрут
@@ -233,14 +282,19 @@ export function parseDellaSearch(html, opts = {}) {
     }
 
     // компания/телефон — видны только в залогиненной сессии (вёрстка может отличаться)
-    const company = textOf(inner(c, 'company_name') || inner(c, 'firm_name')) || undefined;
-    const phoneM = textOf(c).match(/\+?38\s?\(?0\d{2}\)?[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}/);
+    const cardText = textOf(c);
+    const company = textOf(inner(c, 'company_name') || inner(c, 'firm_name')).slice(0, 200) || undefined;
+    // усі телефони картки (у чорному списку здебільшого телефони — кожен має стати ключем)
+    const phones = [...new Set([...cardText.matchAll(PHONE_RE)].map((m) => m[0]))].slice(0, 5);
     // стабільний id компанії та ЄДРПОУ — для чорного/білого списку замовників (якщо Della їх показала)
     // у залогіненій сесії картка має data-company-code / data-company-name (ними ж працює «сховати компанію» Della)
     // і посилання на профіль /company/<code>/ — перевірено по JS Della 28.09.2026, на анонімній видачі їх немає
-    const firmM = c.match(/data-company-code="([\w-]+)"/i) || c.match(/href="[^"]*\/company\/([\w-]+)\/?"/i);
-    const firmNameM = c.match(/data-company-name="([^"]*)"/i);
-    const edrpouM = textOf(c).match(/(?:ЄДРПОУ|ЕДРПОУ|ІПН)\s*:?\s*(\d{8}(?:\d{2})?)(?!\d)/i);
+    // (живу залогінену картку не бачили — лапки атрибутів приймаємо будь-які, решту не вгадуємо)
+    // точний збіг за request_code — першим
+    const firmM = (hid.code ? [null, hid.code] : null) || c.match(/data-company-code=["']([\w-]+)["']/i)
+      || c.match(/href=["'][^"']*\/company\/([\w-]+)\/?["']/i);
+    const firmNameM = (hid.name ? [null, hid.name] : null) || c.match(/data-company-name="([^"]*)"/i) || c.match(/data-company-name='([^']*)'/i);
+    const edrpouM = cardText.match(/(?:ЄДРПОУ|ЕДРПОУ|ІПН)\s*:?\s*(\d{8}(?:\d{2})?)(?!\d)/i);
 
     const load = {
       source: 'della',
@@ -263,9 +317,9 @@ export function parseDellaSearch(html, opts = {}) {
       payment,
       tags,
       directCustomer: /is_zirka_img/.test(c),
-      phone: phoneM ? phoneM[0] : undefined,
+      phone: phones.length ? phones.join(', ') : undefined,
       dellaCompanyId: firmM ? firmM[1] : undefined,
-      company: company || (firmNameM ? decodeEntities(firmNameM[1]).trim() || undefined : undefined),
+      company: company || (firmNameM ? decodeEntities(firmNameM[1]).trim().slice(0, 200) || undefined : undefined),
       edrpou: edrpouM ? edrpouM[1] : undefined,
       dellaUrl,
       dellaRequestId: card.rid ? card.rid.slice(0, 32) : undefined,
@@ -310,4 +364,152 @@ export function buildPageUrl(searchUrl, pageIndex = 0) {
   if (!m) return u;
   const offset = Math.max(0, pageIndex | 0) * 25;
   return `${m[1]}${offset > 0 ? `r${offset}l25` : ''}.html${m[3] || ''}`;
+}
+
+// ---------- контакти «Докладніше» (лише з входом) ----------
+// Доказ — JS самої Della (живий, 05.11.2026, /script/combined/39070d1e824110454b9d5bfa2730403749c3c73c.js):
+//   companyDrawContacts(modes, em, fromSearch, isInList, neCfp, neE, neIs, cC, rC, rL, ri, shouldCheckByHCaptcha)
+//   → POST /ajax_private_list_card.php {modes[], token, botdResponse, from_search, is_in_list, ne_cfp, ne_e, ne_is,
+//     c_c, r_c, r_l, ri, em, is_hcaptcha_loaded}; token — СВІЖИЙ токен reCAPTCHA v3 (дія «companyDrawContactsAction»)
+//     або BotD + hCaptcha, з браузера. Відповідь: {error} — капча не пройшла («Сталася помилка! Будь ласка, оновіть
+//     сторінку»); {contact_error_alert, error_desc} — «Обмеження доступу до інформації»; {contact_modules: {id: html}}.
+//   Контакти Della показує лише верифікованому акаунту: вікно toshowcontactsveriffmwnd («щоб переглянути контактну
+//   інформацію, потрібно пройти верифікацію» — документ + веб-камера; Дія.ID / BankID / ЕЦП / Veriff),
+//   showPrivateListDenyInfoWnd — ще й підписка/оплата.
+// Сервер токена капчі не має і обходити капчу не буде — запит іде з порожнім token, Della вправі відмовити.
+// Де саме в залогіненій картці стоїть виклик companyDrawContacts і з якими аргументами — не бачили (сесії немає):
+// шукаємо вбудований виклик у картці; немає — запиту немає.
+
+export const CONTACTS_PATH = '/ajax_private_list_card.php';
+/** Номер України в довільному записі: +38 (067) 111-22-33, +380 67 111 22 33, 067 111 22 33, 0671112233. */
+const UA_PHONE_RE = /(?<![\d+])(?:\+?38[\s(.-]*)?\(?0\s?\d{2}\)?[\s.-]*\d{3}[\s.-]*\d{2}[\s.-]*\d{2}(?!\d)/g;
+const CONTACT_ARGS = ['modes', 'em', 'from_search', 'is_in_list', 'ne_cfp', 'ne_e', 'ne_is', 'c_c', 'r_c', 'r_l', 'ri'];
+
+/** Аргументи виклику JS з простих літералів (рядки, числа, true/false/!0/!1, null, масиви). Вираз — null, не здогадка. */
+export function parseJsArgs(src) {
+  const s = String(src);
+  let i = 0;
+  const ws = () => { while (i < s.length && /\s/.test(s[i])) i++; };
+  const val = () => {
+    ws();
+    const ch = s[i];
+    if (ch === '"' || ch === "'") {
+      let out = '';
+      for (i++; i < s.length && s[i] !== ch; i++) out += s[i] === '\\' ? s[++i] ?? '' : s[i];
+      if (s[i] !== ch) throw new Error('рядок');
+      i++;
+      return out;
+    }
+    if (ch === '[') {
+      const arr = [];
+      i++;
+      ws();
+      if (s[i] === ']') { i++; return arr; }
+      for (;;) {
+        arr.push(val());
+        ws();
+        if (s[i] === ',') { i++; continue; }
+        if (s[i] === ']') { i++; return arr; }
+        throw new Error('масив');
+      }
+    }
+    if (ch === '!' && (s[i + 1] === '0' || s[i + 1] === '1')) { i += 2; return s[i - 1] === '0'; }
+    const m = s.slice(i).match(/^(?:-?\d+(?:\.\d+)?|true|false|null|undefined)(?![\w$])/);
+    if (!m) throw new Error('вираз');
+    i += m[0].length;
+    if (m[0] === 'true' || m[0] === 'false') return m[0] === 'true';
+    return m[0] === 'null' || m[0] === 'undefined' ? null : Number(m[0]);
+  };
+  try {
+    const out = [];
+    ws();
+    if (i >= s.length) return out;
+    for (;;) {
+      out.push(val());
+      ws();
+      if (i >= s.length) return out;
+      if (s[i] !== ',') return null;
+      i++;
+    }
+  } catch {
+    return null;
+  }
+}
+
+/** Вбудований виклик companyDrawContacts(...) у HTML картки → поля запиту {modes, em, from_search, …} або null. */
+export function contactsCallOf(cardHtml) {
+  const h = String(cardHtml || '');
+  const at = h.indexOf('companyDrawContacts(');
+  if (at < 0) return null;
+  let i = at + 'companyDrawContacts('.length;
+  const start = i;
+  let depth = 0;
+  let q = '';
+  for (; i < h.length; i++) {
+    const ch = h[i];
+    if (q) { if (ch === '\\') i++; else if (ch === q) q = ''; continue; }
+    if (ch === "'" || ch === '"') q = ch;
+    else if (ch === '(' || ch === '[') depth++;
+    else if (ch === ']') depth--;
+    else if (ch === ')') { if (!depth) break; depth--; }
+  }
+  if (i >= h.length) return null;
+  const args = parseJsArgs(decodeEntities(h.slice(start, i)));
+  if (!args || args.length < CONTACT_ARGS.length || !Array.isArray(args[0]) || !args[0].length) return null;
+  return Object.fromEntries(CONTACT_ARGS.map((k, n) => [k, args[n]]));
+}
+
+/** Виклики контактів на сторінці: Map(dellaRequestId → поля запиту). */
+export function contactsCalls(html) {
+  const out = new Map();
+  for (const card of splitCards(String(html || ''))) {
+    const call = contactsCallOf(card.html);
+    if (call && card.rid) out.set(card.rid.slice(0, 32), call);
+  }
+  return out;
+}
+
+/** Тіло POST, як його будує jQuery ($.param): масив — modes[]=…; token порожній — капчі сервер не має. */
+export function contactsBody(p, token = '') {
+  const fields = {
+    modes: p.modes, token, botdResponse: '', from_search: p.from_search, is_in_list: p.is_in_list, ne_cfp: p.ne_cfp,
+    ne_e: p.ne_e, ne_is: p.ne_is, c_c: p.c_c, r_c: p.r_c, r_l: p.r_l, ri: p.ri, em: p.em, is_hcaptcha_loaded: false,
+  };
+  const out = [];
+  const add = (k, v) => out.push(`${encodeURIComponent(k)}=${encodeURIComponent(v == null ? '' : String(v))}`);
+  for (const [k, v] of Object.entries(fields)) {
+    if (Array.isArray(v)) for (const x of v) add(`${k}[]`, x);
+    else add(k, v);
+  }
+  return out.join('&').replace(/%20/g, '+');
+}
+
+/**
+ * Відповідь /ajax_private_list_card.php → {phone?, edrpou?} або {refused: 'captcha'|'access'|'format', desc?}.
+ * Формат HTML блоків контактів не бачили: телефон — будь-який номер України (10 цифр з 0 або 12 з 380) у тексті
+ * чи в href="tel:…".
+ */
+export function parseDellaContacts(r) {
+  if (!r || typeof r !== 'object') return { refused: 'format' };
+  if (r.error) return { refused: 'captcha' };
+  if (r.contact_error_alert) return { refused: 'access', desc: textOf(r.error_desc || '').slice(0, 200) || undefined };
+  const mods = r.contact_modules;
+  if (!mods || typeof mods !== 'object') return { refused: 'format' };
+  const html = Object.values(mods).map((x) => String(x ?? '')).join(' ');
+  const text = textOf(html);
+  const raw = [...[...text.matchAll(UA_PHONE_RE)].map((m) => m[0]),
+    ...[...html.matchAll(/href=["']tel:([^"']+)["']/gi)].map((m) => decodeEntities(m[1]))];
+  const phones = [];
+  const seen = new Set();
+  for (const x of raw) {
+    const d = x.replace(/\D/g, '');
+    if (!((d.length === 10 && d[0] === '0') || (d.length === 12 && d.startsWith('380')))) continue;
+    if (seen.has(d.slice(-9))) continue;
+    seen.add(d.slice(-9));
+    phones.push(x.trim());
+  }
+  const edrpouM = text.match(/(?:ЄДРПОУ|ЕДРПОУ|ІПН)\s*:?\s*(\d{8}(?:\d{2})?)(?!\d)/i);
+  const out = { phone: phones.slice(0, 5).join(', ') || undefined, edrpou: edrpouM ? edrpouM[1] : undefined };
+  for (const k of Object.keys(out)) if (out[k] === undefined) delete out[k];
+  return out;
 }
