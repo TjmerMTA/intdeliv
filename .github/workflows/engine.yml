@@ -72,13 +72,14 @@ jobs:
           successor() { GITHUB_TOKEN="$GH_T" node server/successor.mjs "$@" || true; }
           node server/run.mjs > server.log 2>&1 &
           echo $! > server.pid
-          for i in $(seq 1 60); do curl -fs localhost:$PORT/ >/dev/null && break; sleep 1; done
+          for i in $(seq 1 180); do curl -fs localhost:$PORT/ >/dev/null && break; sleep 1; done
+          curl -fs localhost:$PORT/ >/dev/null && echo "сервер відповів за ${i} с" || { echo "::warning::сервер не відповів за 180 с"; tail -n 30 server.log; }
           URL=""
           for attempt in 1 2 3; do
             cloudflared tunnel --no-autoupdate --url http://localhost:$PORT > tunnel.log 2>&1 &
             echo $! > tunnel.pid
             for i in $(seq 1 60); do
-              URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
+              URL=$(grep -aoE 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
               [ -n "$URL" ] && break; sleep 1
             done
             if [ -n "$URL" ]; then
@@ -86,7 +87,7 @@ jobs:
             fi
             kill $(cat tunnel.pid) 2>/dev/null || true; URL=""
           done
-          [ -n "$URL" ] || { echo "тунель не піднявся"; cat tunnel.log; exit 1; }
+          [ -n "$URL" ] || { echo "тунель не піднявся"; tr -d '\000' < tunnel.log; echo "--- server.log"; tail -n 40 server.log; exit 1; }
           bash server/persist.sh publish-url "$URL"
           echo "API: $URL"
           # сервер і тунель працюють — ставимо в чергу наступника (він чекатиме, доки цей запуск не завершиться)
@@ -99,7 +100,7 @@ jobs:
             if ! kill -0 $(cat tunnel.pid) 2>/dev/null; then
               cloudflared tunnel --no-autoupdate --url http://localhost:$PORT > tunnel.log 2>&1 &
               echo $! > tunnel.pid; sleep 15
-              URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
+              URL=$(grep -aoE 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
               [ -n "$URL" ] && bash server/persist.sh publish-url "$URL" || true
             fi
             # кожні 5 хв — база в гілку data; невдача не зупиняє рушій, але й не мовчить
