@@ -14,3 +14,12 @@ test('dellaSearchUrl: адреса без z21 і з іншими z2x не лам
   const v = 'https://della.com.ua/search/a204z21.html';
   assert.equal(dellaSearchUrl(v, false), 'https://della.com.ua/search/a204z2.html');
 });
+
+test('dellaSearchUrl: «Тільки актуальні» (z11) знято завжди — інакше закриті на Della заявки висять на Lardi', () => {
+  const u = 'https://della.com.ua/search/a204bd204eflolz11z41z51h0ilk0m1.html';
+  assert.equal(dellaSearchUrl(u, true), 'https://della.com.ua/search/a204bd204eflolz1z41z51h0ilk0m1.html');
+  assert.equal(dellaSearchUrl(u, false), 'https://della.com.ua/search/a204bd204eflolz1z41z51h0ilk0m1.html');
+  const v = 'https://della.com.ua/search/a204bd204eflolz11z21z3z4z51z6h0ilk0m1.html';
+  assert.equal(dellaSearchUrl(v, false), 'https://della.com.ua/search/a204bd204eflolz1z2z3z4z51z6h0ilk0m1.html');
+  assert.equal(dellaSearchUrl(DEFAULT_SEARCH_URL, true), DEFAULT_SEARCH_URL); // z1 без значення не чіпаємо
+});

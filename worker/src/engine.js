@@ -33,7 +33,10 @@ export const DEFAULT_SEARCH_URL = 'https://della.com.ua/search/a204bd204eflolz1z
  * Увімкнена галочка адреси не змінює — непрямих відкидає наш фільтр (extension/lib/filters.js).
  */
 export function dellaSearchUrl(url, directOnly) {
-  return directOnly ? url : String(url).replace(/z21(?=[a-z.])/, 'z2');
+  // «Тільки актуальні (без закритих)» (`z11`) знімаємо завжди: закриту заявку ми впізнаємо лише за карткою
+  // «закрита» у видачі Della; з цим фільтром вона просто зникає, і з Lardi її знімає тільки staleHours (19.11).
+  const u = String(url).replace(/z11(?=[a-z.])/, 'z1');
+  return directOnly ? u : u.replace(/z21(?=[a-z.])/, 'z2');
 }
 
 export const DEFAULT_SETTINGS = {
