@@ -384,8 +384,6 @@ let h = '';
 if (demo) h += `<div class="banner warn"><span class="tag-demo">ДЕМО</span>Показано демонстраційні дані — дії нічого не змінюють. <a href="#" data-logout>Вийти з демо</a></div>`;
 if (S.settings?.lardi?.dryRun) h += `<div class="banner info">🧪 <b>Тестовий режим — нічого не публікується.</b> Заявки проходять усі перевірки, але на Lardi не відправляються. Вимкніть перемикач «Тестовий режим», коли будете готові.</div>`;
 if (S.settings?.lardi?.cashCardOnly) h += `<div class="banner info">💳 <b>Лише готівка/картка.</b> На Lardi йдуть тільки заявки з оплатою готівкою або на картку (і ті, що ви опублікували вручну). Решта чекає в черзі й піде, щойно вимкнете перемикач.</div>`;
-// сесія, що вже працювала, тихо закінчилась — видно на будь-якій вкладці (на «Замовниках» про це каже своя строка)
-if (S.status?.della?.session === 'expired' && S.view !== 'customers') h += `<div class="banner warn">Сесія Della закінчилась — вставте нову. Поки її немає, заявки збираються без замовника, і чорний список їх не впізнає. <a href="#" data-go-sess>Налаштувати вхід у Della</a></div>`;
 if (S.status?.lastError) h +=`<div class="banner warn">Остання помилка: ${esc(S.status.lastError)}</div>`;
 $('#banners').innerHTML = h;
 }
